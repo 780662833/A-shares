@@ -33,26 +33,39 @@ func buildReviewRunner(cfg appConfig, gdb *gorm.DB) reviewRunner {
 		}
 	}
 
-	runnable, err := graph.BuildReviewGraph(context.Background(), graph.Config{
+	runFn, err := buildFunnelRunner(cfg, gdb, cm)
+	if err != nil {
+		// Graph 编译失败属致命装配错误：同样降级并打日志，不让进程起不来
+		log.Printf("ERROR: build funnel graph failed: %v; review runs in DEGRADED mode", err)
+		return func(_ context.Context, _ string, _ []string) (map[string]any, error) {
+			return nil, fmt.Errorf("funnel graph unavailable: %w", err)
+		}
+	}
+	return runFn
+}
+
+// buildFunnelRunner 构建漏斗模型 Layer2 Graph（FetchPool -> FetchNews ->
+// ManagerDecision -> SaveDecision）的执行器。
+//
+// 长期方案 C 适配：Graph 的 FetchPool 节点内部调用 ScreenPoolTool，
+// 网关侧已改为缓存优先（每日 15:10 refresh 预计算），因此 15:30 复盘时
+// 粗筛为毫秒级返回；若当日 refresh 未跑成功，网关会自动回源补齐，不阻断流程。
+func buildFunnelRunner(cfg appConfig, gdb *gorm.DB, cm model.BaseChatModel) (reviewRunner, error) {
+	runnable, err := graph.BuildFunnelGraph(context.Background(), graph.FunnelConfig{
 		ChatModel:  cm,
 		DB:         gdb,
 		GatewayURL: cfg.GatewayURL,
 	})
 	if err != nil {
-		// Graph 编译失败属致命装配错误：同样降级并打日志，不让进程起不来
-		log.Printf("ERROR: build review graph failed: %v; review runs in DEGRADED mode", err)
-		return func(_ context.Context, _ string, _ []string) (map[string]any, error) {
-			return nil, fmt.Errorf("review graph unavailable: %w", err)
-		}
+		return nil, err
 	}
-
 	return func(ctx context.Context, tradeDate string, watchlist []string) (map[string]any, error) {
-		state, err := runnable.Invoke(ctx, graph.ReviewInput{TradeDate: tradeDate, Watchlist: watchlist})
+		state, err := runnable.Invoke(ctx, graph.FunnelInput{TradeDate: tradeDate, Symbols: watchlist})
 		if err != nil {
 			return nil, err
 		}
 		return state, nil
-	}
+	}, nil
 }
 
 // ---------------------------------------------------------------------------

@@ -298,7 +298,7 @@ func managerDecision(ctx context.Context, state map[string]any, cm model.BaseCha
 		if attempt > 0 {
 			// 错误回灌：把上一轮的脏输出与解析错误告知模型，要求其修正格式
 			history = append(history,
-				schema.AssistantMessage(lastRawContent(history), nil),
+				schema.AssistantMessage(lastAssistantContent(history), nil),
 				schema.UserMessage(fmt.Sprintf(
 					"你上一次的输出无法解析为规定的 JSON 数组（错误：%v）。请只重新输出合法的 JSON 数组，不要任何其他文字。", lastErr)))
 		}

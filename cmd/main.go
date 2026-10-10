@@ -21,10 +21,12 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -55,6 +57,7 @@ type appConfig struct {
 	Watchlist  []string
 	CronReview string // 日终复盘 cron 表达式
 	CronSimul  string // 次日撮合 cron 表达式
+	CronRefresh string // 收盘后 czsc 缓存预计算 cron 表达式（长期方案 C）
 }
 
 func loadConfig() appConfig {
@@ -63,8 +66,12 @@ func loadConfig() appConfig {
 		DBPath:     envOr("ASHARE_DB_PATH", filepath.Join(cwd, "data", "trading.db")),
 		GatewayURL: envOr("ASHARE_GATEWAY_URL", "http://127.0.0.1:8000"),
 		HTTPAddr:   envOr("ASHARE_HTTP_ADDR", ":8080"),
-		CronReview: "30 15 * * 1-5",
-		CronSimul:  "25 9 * * 1-5",
+		CronReview:  "30 15 * * 1-5",
+		CronSimul:   "25 9 * * 1-5",
+		CronRefresh: "10 15 * * 1-5", // 先于复盘 20 分钟，保证 15:30 粗筛全部命中缓存
+	}
+	if v := strings.TrimSpace(os.Getenv("ASHARE_CRON_REFRESH")); v != "" {
+		cfg.CronRefresh = v
 	}
 	for _, s := range strings.Split(envOr("ASHARE_WATCHLIST", ""), ",") {
 		if s = strings.TrimSpace(s); s != "" {
@@ -259,6 +266,87 @@ func (a *app) runSimulation(trigger string) error {
 }
 
 // ---------------------------------------------------------------------------
+// 任务 3（长期方案 C）：收盘后 czsc 缓存预计算（15:10）
+// ---------------------------------------------------------------------------
+
+const flowRefresh = "refresh"
+
+// refreshCachePayload 与 Python 网关 POST /api/czsc/refresh 的请求体对齐。
+type refreshCachePayload struct {
+	Symbols []string `json:"symbols"`
+	Period  string   `json:"period"`
+	Force   bool     `json:"force"`
+}
+
+// runCzscRefresh 调用数据网关把「自选股 ∪ 持仓股」的缠论分析结果批量预计算并落盘。
+//
+// 意义：AKShare 限速导致的分钟级扫描全部挪到本时段离线完成；20 分钟后 (15:30)
+// 复盘 Graph 的 FetchPool/screen_pool 直接命中当日缓存，毫秒级返回且不再实时联网。
+// force=true 全量重拉可顺带消除增量拼接在除权日引入的 qfq 漂移近似。
+func (a *app) runCzscRefresh(trigger string) error {
+	if !a.tryLock(flowRefresh) {
+		return errors.New("czsc cache refresh already running, skip")
+	}
+	defer a.unlock(flowRefresh)
+
+	start := time.Now()
+	symbols := a.syncSymbols() // 自选股 ∪ 持仓股，与复盘前行情同步同一集合
+	if len(symbols) == 0 {
+		log.Printf("[refresh] no symbols (watchlist & positions both empty), skip czsc cache refresh")
+		return nil
+	}
+	log.Printf("[refresh] ===== czsc 缓存预计算开始 trigger=%s symbols=%d =====", trigger, len(symbols))
+
+	payload, err := json.Marshal(refreshCachePayload{Symbols: symbols, Period: "daily", Force: true})
+	if err != nil {
+		return fmt.Errorf("marshal refresh payload: %w", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, a.cfg.GatewayURL+"/api/czsc/refresh", bytes.NewReader(payload))
+	if err != nil {
+		return fmt.Errorf("build refresh request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		log.Printf("[refresh] FAILED gateway unreachable: %v", err)
+		return fmt.Errorf("call gateway /api/czsc/refresh: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	if err != nil {
+		return fmt.Errorf("read refresh response: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("[refresh] FAILED status=%d body=%.512s", resp.StatusCode, body)
+		return fmt.Errorf("gateway returned HTTP %d: %.256s", resp.StatusCode, string(body))
+	}
+
+	// 解析统计字段做结构化日志（total/stats/elapsed_seconds），失败不影响成功判定
+	var parsed struct {
+		Code int `json:"code"`
+		Data struct {
+			Total          int            `json:"total"`
+			Stats          map[string]int `json:"stats"`
+			ElapsedSeconds float64        `json:"elapsed_seconds"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		log.Printf("[refresh] WARN cannot parse stats (%v), raw=%.256s", err, body)
+	} else {
+		log.Printf("[refresh] done total=%d stats=%v gateway_elapsed=%.2fs",
+			parsed.Data.Total, parsed.Data.Stats, parsed.Data.ElapsedSeconds)
+	}
+	log.Printf("[refresh] ===== 预计算完成 elapsed=%s =====", time.Since(start))
+	return nil
+}
+
+// ---------------------------------------------------------------------------
 // HTTP 手动触发接口（白天调试用）
 // ---------------------------------------------------------------------------
 
@@ -291,6 +379,18 @@ func (a *app) newHTTPServer() *http.Server {
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "message": "simulation finished"})
+	})
+
+	mux.HandleFunc("/trigger/refresh", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"ok": false, "error": "use POST"})
+			return
+		}
+		if err := a.runCzscRefresh("manual"); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"ok": false, "error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "message": "czsc cache refresh finished"})
 	})
 
 	return &http.Server{
@@ -342,8 +442,17 @@ func main() {
 	}); err != nil {
 		log.Fatalf("FATAL: add simulate cron (%q): %v", cfg.CronSimul, err)
 	}
+	// 长期方案 C：收盘后 15:10 预计算 czsc 缓存，15:30 复盘的粗筛环节直接命中缓存
+	if _, err := c.AddFunc(cfg.CronRefresh, func() {
+		if err := appInstance.runCzscRefresh("cron"); err != nil {
+			log.Printf("cron czsc refresh job error: %v", err)
+		}
+	}); err != nil {
+		log.Fatalf("FATAL: add czsc refresh cron (%q): %v", cfg.CronRefresh, err)
+	}
 	c.Start()
-	log.Printf("cron registered: review=%q simulate=%q (Asia/Shanghai)", cfg.CronReview, cfg.CronSimul)
+	log.Printf("cron registered: review=%q simulate=%q czsc_refresh=%q (Asia/Shanghai)",
+		cfg.CronReview, cfg.CronSimul, cfg.CronRefresh)
 
 	// ---- HTTP 调试接口 ----
 	var httpSrv *http.Server
