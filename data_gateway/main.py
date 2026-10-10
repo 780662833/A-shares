@@ -533,74 +533,8 @@ def get_financial_indicator(
 # ---------------------------------------------------------------------------
 _CZSC_PERIODS = {"daily", "weekly", "monthly"}
 
-
-@app.get("/api/czsc/analyze")
-def get_czsc_analysis(
-    symbol: str = Query(..., description="6位股票代码, 如 000001"),
-    period: str = Query("daily", description="周期: daily/weekly/monthly"),
-    start_date: Optional[str] = Query(None, description="开始日期 YYYYMMDD, 默认近一年半"),
-    end_date: Optional[str] = Query(None, description="结束日期 YYYYMMDD, 默认今天"),
-) -> Dict[str, Any]:
-    """
-    获取指定股票的缠论结构与三类买卖点信号 (AKShare 行情 + czsc 核心库)。
-
-    返回 data.summary 为自然语言摘要, Go/Eino 侧可直接喂给 LLM;
-    data.structures 含笔/分型/中枢, data.signals 含 1B/2B/3B 与 1S/2S/3S。
-    """
-    symbol = _validate_symbol(symbol)
-    if not _CZSC_AVAILABLE:
-        raise HTTPException(status_code=503, detail="czsc 未安装, 请执行 pip install czsc 后重启网关")
-    if period not in _CZSC_PERIODS:
-        raise HTTPException(status_code=400, detail=f"非法周期: '{period}', 需为 daily/weekly/monthly")
-    start_date = _validate_date(start_date, "start_date")
-    end_date = _validate_date(end_date, "end_date")
-
-    # 默认取最近约 500 个交易日 (专家建议: 日线 500 根足够定位当前中枢与买卖点)
-    if not end_date:
-        end_date = datetime.now().strftime(_DATE_FMT)
-    if not start_date:
-        start_date = (datetime.now() - timedelta(days=550)).strftime(_DATE_FMT)
-
-    try:
-        df: pd.DataFrame = _retry_call(
-            lambda: ak.stock_zh_a_hist(
-                symbol=symbol,
-                period=period,
-                start_date=start_date,
-                end_date=end_date,
-                adjust="qfq",   # 前复权, 保证跨除权日的笔/中枢不被价格跳空打断
-            )
-        )
-    except Exception as exc:  # noqa: BLE001
-        raise _gateway_error(500, "akshare(stock_zh_a_hist)", exc)
-
-    if df is None or df.empty:
-        logger.warning("czsc_analyze: symbol=%s 区间[%s,%s]无行情数据", symbol, start_date, end_date)
-        return {"code": 0, "message": "no_data", "symbol": symbol, "data": None}
-
-    try:
-        bars = akshare_to_czsc_bars(df, symbol=symbol, period=period)
-        result = analyze_czsc(bars)
-    except Exception as exc:  # noqa: BLE001 - czsc 计算异常统一转 500
-        raise _gateway_error(500, "czsc(analyze)", exc)
-
-    if "error" in result:
-        return {"code": 0, "message": "insufficient_data", "symbol": symbol, "data": result}
-
-    logger.info(
-        "czsc_analyze: symbol=%s period=%s bi=%d zs=%d buys=%d sells=%d",
-        symbol, period,
-        result["structures"]["bi_count"], result["structures"]["zs_count"],
-        len(result["signals"]["buy_points"]), len(result["signals"]["sell_points"]),
-    )
-    return {
-        "code": 0,
-        "message": "success",
-        "symbol": symbol,
-        "period": period,
-        "adjust": "qfq",
-        "data": result,
-    }
+# 注: /api/czsc/analyze 的缓存优先实现见下方 "长期方案 C" 区块
+# (同名函数覆盖注册, FastAPI 以最后注册的版本为准), 此处不再保留旧版实时实现。
 
 
 # ---------------------------------------------------------------------------
