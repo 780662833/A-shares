@@ -1,0 +1,7 @@
+# Compressed archives
+*.tar.gz
+*.zip
+# 打包产物不入库
+*.zip
+*.tar.gz
+*.bundle
