@@ -39,6 +39,23 @@ type ScreenPoolInput struct {
 	StartDate string   `json:"start_date"` // YYYYMMDD 或 YYYY-MM-DD, 可空
 	EndDate   string   `json:"end_date"`   // 同上, 可空
 	Period    string   `json:"period"`     // daily(默认)/weekly/monthly
+	// CacheOnly=true 时网关只读磁盘缓存不回源 AKShare（配合每日 refresh 秒级出池）。
+	CacheOnly *bool `json:"cache_only,omitempty"`
+	// MineSweep=false 可关闭财务排雷（默认开启，被拦截股票移入 blocked）。
+	MineSweep *bool `json:"mine_sweep,omitempty"`
+	// EdgeCheck=true 时对候选股追加 vectorbt 历史正期望检验（默认关闭以保响应速度）。
+	EdgeCheck *bool `json:"edge_check,omitempty"`
+	// DropNegativeEdge=true 且 EdgeCheck=true 时，把回测负期望的股票从 pool 硬拦截进 blocked。
+	DropNegativeEdge *bool `json:"drop_negative_edge,omitempty"`
+}
+
+// ScreenPoolEdge 是该候选股缠论规则集在 vectorbt 历史回测中的期望收益摘要。
+// 仅当请求 edge_check=true 且回测成功时由网关附带；指针类型区分"未提供"与"提供但为零"。
+type ScreenPoolEdge struct {
+	AvgTradeReturnPct *float64 `json:"avg_trade_return_pct"`
+	WinRatePct        *float64 `json:"win_rate_pct"`
+	TradeCount        int      `json:"trade_count"`
+	PositiveEdge      bool     `json:"positive_edge"`
 }
 
 // ScreenPoolHit 一只通过粗筛的候选股摘要。
@@ -51,6 +68,10 @@ type ScreenPoolHit struct {
 	BiCount        int          `json:"bi_count"`
 	TrendDirection string       `json:"trend_direction"`
 	Summary        string       `json:"summary"`
+	// BlockedReasons 财务排雷/负期望拦截理由（出现在 blocked 列表中的记录）。
+	BlockedReasons []string `json:"blocked_reasons,omitempty"`
+	// Edge vectorbt 正期望检验结论（edge_check=true 时附加）。
+	Edge *ScreenPoolEdge `json:"edge,omitempty"`
 }
 
 type screenPoolData struct {
@@ -60,7 +81,9 @@ type screenPoolData struct {
 	TotalRequested int             `json:"total_requested"`
 	TotalScanned   int             `json:"total_scanned"`
 	PoolSize       int             `json:"pool_size"`
+	BlockedSize    int             `json:"blocked_size"`
 	Pool           []ScreenPoolHit `json:"pool"`
+	Blocked        []ScreenPoolHit `json:"blocked"` // 财务排雷/负期望拦截清单
 	Errors         []struct {
 		Symbol string `json:"symbol"`
 		Error  string `json:"error"`
@@ -194,6 +217,19 @@ func (t *ScreenPoolTool) InvokableRun(ctx context.Context, argumentsInJSON strin
 		}
 		body[d.key] = strings.ReplaceAll(norm, "-", "") // 网关要求 YYYYMMDD
 	}
+	// 可选开关透传（指针非 nil 才写入，保留网关默认值语义）
+	if in.CacheOnly != nil {
+		body["cache_only"] = *in.CacheOnly
+	}
+	if in.MineSweep != nil {
+		body["mine_sweep"] = *in.MineSweep
+	}
+	if in.EdgeCheck != nil {
+		body["edge_check"] = *in.EdgeCheck
+	}
+	if in.DropNegativeEdge != nil {
+		body["drop_negative_edge"] = *in.DropNegativeEdge
+	}
 	payload, err := json.Marshal(body)
 	if err != nil {
 		return errorResult(fmt.Sprintf("marshal request failed: %v", err)), nil
@@ -239,10 +275,10 @@ func (t *ScreenPoolTool) InvokableRun(ctx context.Context, argumentsInJSON strin
 	}
 
 	d := env.Data
-	log.Printf("screen_pool: scanned=%d pool=%d errors=%d window=%s",
-		d.TotalScanned, d.PoolSize, len(d.Errors), d.Window)
+	log.Printf("screen_pool: scanned=%d pool=%d blocked=%d errors=%d window=%s",
+		d.TotalScanned, d.PoolSize, d.BlockedSize, len(d.Errors), d.Window)
 
-	// 透传候选池 + 一句人类可读总结，方便 LLM 直接进入排雷环节
+	// 透传候选池 + 排雷/负期望拦截清单 + 一句人类可读总结，方便 LLM 直接进入排雷环节
 	out := map[string]any{
 		"trade_date":    d.TradeDate,
 		"window":        d.Window,
@@ -252,6 +288,16 @@ func (t *ScreenPoolTool) InvokableRun(ctx context.Context, argumentsInJSON strin
 		"scan_errors":   d.Errors,
 		"summary": fmt.Sprintf("共扫描 %d 只股票，%d 只通过缠论粗筛进入候选池（交易日 %s）。",
 			d.TotalScanned, d.PoolSize, d.TradeDate),
+	}
+	if d.BlockedSize > 0 || len(d.Blocked) > 0 {
+		blockedN := d.BlockedSize
+		if len(d.Blocked) > blockedN {
+			blockedN = len(d.Blocked)
+		}
+		out["blocked_size"] = d.BlockedSize
+		out["blocked"] = d.Blocked
+		out["summary"] = fmt.Sprintf("%s 另有 %d 只被财务排雷/负期望检验拦截（见 blocked，含理由），不建议交易。",
+			out["summary"].(string), blockedN)
 	}
 	return marshalOK("pool", out), nil
 }

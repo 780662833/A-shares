@@ -200,7 +200,12 @@ def run_backtest(
     trades = pf.trades
     recs = trades.records if trades.count() > 0 else pd.DataFrame(
         columns=["entry_idx", "exit_idx", "pnl", "return", "status"])
-    closed = recs[recs["status"] == "closed"] if len(recs) else recs
+    # 兼容 vectorbt 版本差异: status 列可能是字符串枚举 ("closed"/"open"),
+    # 也可能是整数编码 (Trade.Status.Closed == 1), 直接 == "closed" 会静默全滤空。
+    def _is_closed_row(v: Any) -> bool:
+        s = str(v).lower()
+        return s in ("closed", "1") or "closed" in s and "open" not in s
+    closed = recs[recs["status"].map(_is_closed_row)] if len(recs) else recs
     wins = int((closed["pnl"] > 0).sum()) if len(closed) else 0
     total_ret = float(pf.total_return())
     bench_ret = float(close.iloc[-1] / close.iloc[0] - 1) if close.iloc[0] else 0.0
