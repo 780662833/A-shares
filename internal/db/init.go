@@ -77,8 +77,11 @@ func InitDB(dbPath string) (*gorm.DB, error) {
 func autoMigrate(gdb *gorm.DB) error {
 	models := []interface{}{
 		&model.Stock{},
-		// DailyKline 已废弃（漏斗模型：K线全在 Python 端即时计算，Go 不再落库原始K线）。
-		// 保留注释行以便历史数据库文件仍可被旧版本读取；新库不再建此表。
+		// DailyKline：模型与 internal/sync 落库链路仍在使用（MockBroker 撮合依赖
+		// daily_klines 的开盘/涨跌停价，复盘前由 SyncDailyKlines 从网关行情落库），
+		// 因此新库仍需建表。漏斗模型仅表示"AI 分析不再消费 Go 端原始 K 线"，
+		// 不代表撮合层可以脱离行情数据。
+		&model.DailyKline{},
 		&model.Position{},
 		&model.Account{},
 		&model.Order{},
