@@ -1,6 +1,8 @@
-(empty)node_modules/
+# Compressed archives and bundles
+*.zip
+*.tar.gz
+*.bundlenode_modules/
 .next/
 dist/
 build/
 *.log
-node_modules/
