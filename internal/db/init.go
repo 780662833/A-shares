@@ -77,10 +77,13 @@ func InitDB(dbPath string) (*gorm.DB, error) {
 func autoMigrate(gdb *gorm.DB) error {
 	models := []interface{}{
 		&model.Stock{},
-		&model.DailyKline{},
+		// DailyKline 已废弃（漏斗模型：K线全在 Python 端即时计算，Go 不再落库原始K线）。
+		// 保留注释行以便历史数据库文件仍可被旧版本读取；新库不再建此表。
 		&model.Position{},
 		&model.Account{},
 		&model.Order{},
+		&model.CandidatePool{},
+		&model.AIDecisionLog{},
 	}
 	if err := gdb.AutoMigrate(models...); err != nil {
 		return fmt.Errorf("db: automigrate: %w", err)

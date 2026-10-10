@@ -105,6 +105,102 @@ type DailyKline struct {
 func (DailyKline) TableName() string { return "daily_klines" }
 
 // ---------------------------------------------------------------------------
+// CandidatePool 候选股票池表（漏斗模型 Layer1 -> Layer2 的交接数据）
+// ---------------------------------------------------------------------------
+
+// 候选池信号类型常量（与 Python 网关 /api/czsc/screen_pool 的 signal_type 对齐）。
+const (
+	SignalObservation = "Observation" // 观察池: >=2 中枢且最后一笔向上
+	SignalBuy1        = "1B"          // 第一类买点(疑似底背驰)
+	SignalBuy2        = "2B"          // 第二类买点
+	SignalBuy3        = "3B"          // 第三类买点
+	SignalSell1       = "1S"          // 第一类卖点(疑似顶背驰)
+	SignalSell2       = "2S"          // 第二类卖点
+	SignalSell3       = "3S"          // 第三类卖点
+)
+
+// IsValidSignalType 校验 czsc 信号类型合法性。
+func IsValidSignalType(s string) bool {
+	switch s {
+	case SignalObservation, SignalBuy1, SignalBuy2, SignalBuy3,
+		SignalSell1, SignalSell2, SignalSell3:
+		return true
+	default:
+		return false
+	}
+}
+
+// CandidatePool 每日粗筛产出的候选股票池条目。
+//
+// 由 15:30 流水线调用 Python 网关 POST /api/czsc/screen_pool 后写入；
+// Layer2 的 Eino Master Agent 读取当日记录进行新闻排雷与精选。
+// (TradeDate, Code) 唯一：同日重跑流水线时覆盖旧记录而非重复插入。
+type CandidatePool struct {
+	ID        uint64 `gorm:"primaryKey;autoIncrement" json:"id"`
+	TradeDate string `gorm:"type:varchar(10);not null;uniqueIndex:uk_pool_date_code" json:"trade_date"` // "YYYY-MM-DD", 哪一天筛选出的
+	Code      string `gorm:"type:varchar(10);not null;uniqueIndex:uk_pool_date_code" json:"code"`       // 股票代码
+
+	SignalType     string `gorm:"type:varchar(16);not null;index:idx_pool_signal" json:"signal_type"` // 3B/1B/Observation 等
+	CzscSummary    string `gorm:"type:text" json:"czsc_summary"`                                      // czsc 自然语言摘要, 直接可喂 LLM
+	ZsCount        int    `gorm:"type:integer;not null;default:0" json:"zs_count"`                    // 中枢数量
+	TrendDirection string `gorm:"type:varchar(8);not null" json:"trend_direction"`                    // up/down/unknown
+
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// TableName 固定表名。
+func (CandidatePool) TableName() string { return "candidate_pools" }
+
+// ---------------------------------------------------------------------------
+// AIDecisionLog AI 决策日志表（漏斗模型 Layer2 产出）
+// ---------------------------------------------------------------------------
+
+// AI 决策动作常量。
+const (
+	ActionBuy  = "BUY"  // 技术买点 + 新闻面共振
+	ActionSell = "SELL" // 技术卖点 + 新闻面平庸/偏空
+	ActionDrop = "DROP" // 排雷放弃: 业绩预亏/减持/立案调查/行业利空等
+)
+
+// IsValidAction 校验 AI 决策动作合法性（大小写不敏感，入库前归一化为大写）。
+func IsValidAction(a string) bool {
+	switch strings.ToUpper(strings.TrimSpace(a)) {
+	case ActionBuy, ActionSell, ActionDrop:
+		return true
+	default:
+		return false
+	}
+}
+
+// NormalizeAction 归一化 AI 动作字符串; 非法返回 ("", error)。
+func NormalizeAction(a string) (string, error) {
+	a = strings.ToUpper(strings.TrimSpace(a))
+	if !IsValidAction(a) {
+		return "", fmt.Errorf("model: invalid ai action %q", a)
+	}
+	return a, nil
+}
+
+// AIDecisionLog Eino Master Agent 对每只候选股的最终决策留痕。
+//
+// ConfidenceScore 约定 0-100：<60 的 BUY 建议会被风控层降级为观察。
+type AIDecisionLog struct {
+	ID        uint64 `gorm:"primaryKey;autoIncrement" json:"id"`
+	TradeDate string `gorm:"type:varchar(10);not null;index:idx_decision_date_code" json:"trade_date"`
+	Code      string `gorm:"type:varchar(10);not null;index:idx_decision_date_code" json:"code"`
+
+	Action          string `gorm:"type:varchar(8);not null;index:idx_decision_action" json:"action"` // BUY/SELL/DROP
+	Reason          string `gorm:"type:text" json:"reason"`                                          // AI 给出的排雷/买入理由
+	ConfidenceScore int    `gorm:"type:integer;not null;default:0" json:"confidence_score"`          // 0-100 信心分数
+
+	CreatedAt time.Time `json:"created_at"`
+}
+
+// TableName 固定表名。
+func (AIDecisionLog) TableName() string { return "ai_decision_logs" }
+
+// ---------------------------------------------------------------------------
 // Position 持仓表
 // ---------------------------------------------------------------------------
 

@@ -11,6 +11,7 @@ A股日线级别 AI 模拟交易系统 - Python 数据网关服务
     GET /api/stock_list                A股正常上市股票列表 (AKShare)
     GET /api/financial_indicator       最新一期 ROE / 净利润率 (Baostock)
     GET /api/czsc/analyze             缠论结构+三类买卖点信号 (AKShare + czsc)
+    POST /api/czsc/screen_pool        漏斗模型 Layer1: 批量粗筛候选股票池
 
 启动方式:
     uvicorn main:app --host 0.0.0.0 --port 8000
@@ -28,6 +29,7 @@ import akshare as ak
 import baostock as bs
 import pandas as pd
 from fastapi import FastAPI, HTTPException, Query
+from pydantic import BaseModel, Field
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
@@ -540,6 +542,147 @@ def get_czsc_analysis(
         "period": period,
         "adjust": "qfq",
         "data": result,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 漏斗模型 Layer1: 批量粗筛 (screen_pool)
+# ---------------------------------------------------------------------------
+
+# 单次批量扫描的股票数量上限 (AKShare 免费接口限流保护)
+_SCREEN_MAX_SYMBOLS = 100
+# 每只股票之间的请求间隔 (秒), 防止被封 IP
+_SCREEN_SLEEP_SECONDS = 0.5
+
+
+class ScreenPoolRequest(BaseModel):
+    """POST /api/czsc/screen_pool 的请求体。"""
+
+    symbols: List[str] = Field(..., description="股票代码列表, 如 ['603236', '000001']")
+    start_date: Optional[str] = Field(None, description="开始日期 YYYYMMDD, 默认近一年半")
+    end_date: Optional[str] = Field(None, description="结束日期 YYYYMMDD, 默认今天")
+    period: str = Field("daily", description="周期: daily/weekly/monthly")
+
+
+def _fetch_czsc_result(symbol: str, period: str, start_date: str, end_date: str) -> Dict[str, Any]:
+    """拉取单只股票的前复权日线并执行 czsc 分析 (供 analyze / screen_pool 复用)。"""
+    df: pd.DataFrame = _retry_call(
+        lambda: ak.stock_zh_a_hist(
+            symbol=symbol,
+            period=period,
+            start_date=start_date,
+            end_date=end_date,
+            adjust="qfq",   # 前复权, 保证跨除权日的笔/中枢不被价格跳空打断
+        )
+    )
+    if df is None or df.empty:
+        return {"error": "no_data"}
+    bars = akshare_to_czsc_bars(df, symbol=symbol, period=period)
+    return analyze_czsc(bars)
+
+
+def _match_screen_rule(result: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """核心过滤规则: 返回命中的候选记录, 未命中返回 None。
+
+    a) signals.buy_points 非空  -> 缠论买点 (signal_type 取第一个买点的 type)
+    b) signals.sell_points 非空  -> 缠论卖点 (signal_type 取第一个卖点的 type)
+    c) structures.zs_count >= 2 且最后一笔向上 -> 趋势观察池 (Observation)
+    """
+    signals = result.get("signals") or {}
+    structures = result.get("structures") or {}
+    buys = signals.get("buy_points") or []
+    sells = signals.get("sell_points") or []
+
+    signal_type: Optional[str] = None
+    if buys:
+        signal_type = buys[0]["type"]
+    elif sells:
+        signal_type = sells[0]["type"]
+    elif structures.get("zs_count", 0) >= 2 and (structures.get("last_bi") or {}).get("direction") == "up":
+        signal_type = "Observation"
+
+    if signal_type is None:
+        return None
+    return {
+        "symbol": result["symbol"],
+        "signal_type": signal_type,
+        "buy_points": buys,
+        "sell_points": sells,
+        "zs_count": structures.get("zs_count", 0),
+        "bi_count": structures.get("bi_count", 0),
+        "trend_direction": (structures.get("last_bi") or {}).get("direction", "unknown"),
+        "summary": result.get("summary", ""),
+    }
+
+
+@app.post("/api/czsc/screen_pool")
+def post_screen_pool(req: ScreenPoolRequest) -> Dict[str, Any]:
+    """批量粗筛: 遍历自选股, 只保留出现缠论买卖点或趋势向上的候选股票池。
+
+    输出 pool 直接供 Go/Eino Layer2 (AI 排雷精选) 消费;
+    单只股票失败仅记入 errors, 不影响整体扫描。
+    """
+    if not _CZSC_AVAILABLE:
+        raise HTTPException(status_code=503, detail="czsc 未安装, 请执行 pip install czsc 后重启网关")
+    if req.period not in _CZSC_PERIODS:
+        raise HTTPException(status_code=400, detail=f"非法周期: '{req.period}', 需为 daily/weekly/monthly")
+    if not req.symbols:
+        raise HTTPException(status_code=400, detail="symbols 不能为空")
+    if len(req.symbols) > _SCREEN_MAX_SYMBOLS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"单次最多扫描 {_SCREEN_MAX_SYMBOLS} 只股票 (AKShare 限流保护), 当前 {len(req.symbols)} 只",
+        )
+
+    # 逐只校验代码格式, 非法代码记入 errors 而不是整体报错
+    valid_symbols: List[str] = []
+    errors: List[Dict[str, str]] = []
+    for s in req.symbols:
+        try:
+            valid_symbols.append(_validate_symbol(str(s)))
+        except HTTPException as exc:
+            errors.append({"symbol": str(s), "error": str(exc.detail)})
+
+    end_date = _validate_date(req.end_date, "end_date") or datetime.now().strftime(_DATE_FMT)
+    start_date = _validate_date(req.start_date, "start_date") or (
+        datetime.now() - timedelta(days=550)
+    ).strftime(_DATE_FMT)
+
+    pool: List[Dict[str, Any]] = []
+    scanned = 0
+    for symbol in valid_symbols:
+        try:
+            result = _fetch_czsc_result(symbol, req.period, start_date, end_date)
+            scanned += 1
+            if "error" in result or "structures" not in result:
+                errors.append({"symbol": symbol, "error": result.get("error", "insufficient_data")})
+            else:
+                hit = _match_screen_rule(result)
+                if hit is not None:
+                    pool.append(hit)
+        except Exception as exc:  # noqa: BLE001 - 单只失败不影响整体
+            logger.warning("screen_pool: symbol=%s 失败: %s", symbol, exc)
+            errors.append({"symbol": symbol, "error": str(exc)})
+        # 性能优化: AKShare 免费接口防封, 每只股票之间限速
+        time.sleep(_SCREEN_SLEEP_SECONDS)
+
+    logger.info(
+        "screen_pool: scanned=%d pool=%d errors=%d window=[%s,%s]",
+        scanned, len(pool), len(errors), start_date, end_date,
+    )
+    return {
+        "code": 0,
+        "message": "success",
+        "data": {
+            "trade_date": datetime.now().strftime("%Y-%m-%d"),
+            "period": req.period,
+            "window": f"{start_date}~{end_date}",
+            "total_requested": len(req.symbols),
+            "total_scanned": scanned,
+            "pool_size": len(pool),
+            "pool": pool,
+            "errors": errors,
+        },
     }
 
 
