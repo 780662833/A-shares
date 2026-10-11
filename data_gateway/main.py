@@ -289,19 +289,17 @@ def get_daily_kline(
     if not start_date:
         start_date = (datetime.now() - timedelta(days=365)).strftime(_DATE_FMT)
 
+    # 防弹衣链路: 本地缓存优先 -> BaoStock(主) -> AKShare(备) -> 旧缓存兜底。
+    # Go 撮合引擎依赖该接口落库 daily_klines, 必须与 czsc 分析走同一份缓存,
+    # 否则会出现 "czsc 用缓存、撮合用实时" 的数据不一致。
+    # 注: 取数辅助函数 (_fetch_kline_df/_kline_cache) 定义于本文件后段,
+    #     FastAPI 路由在请求时才执行函数体, 届时模块已加载完毕, 引用安全。
     try:
-        # AKShare 东财接口, adjust="qfq" 即前复权 (带指数退避重试)
-        df: pd.DataFrame = _retry_call(
-            lambda: ak.stock_zh_a_hist(
-                symbol=symbol,
-                period="daily",
-                start_date=start_date,
-                end_date=end_date,
-                adjust="qfq",
-            )
-        )
+        df, meta = _fetch_kline_df(symbol, "daily", start_date, end_date)
     except Exception as exc:  # noqa: BLE001 - 数据源异常统一转 500
-        raise _gateway_error(500, "akshare(stock_zh_a_hist)", exc)
+        raise _gateway_error(500, "daily_kline(防弹衣链路)", exc)
+    if meta.get("is_stale_data"):
+        logger.warning("daily_kline: symbol=%s 返回陈旧缓存 (stale), 请核查上游数据源", symbol)
 
     if df is None or df.empty:
         logger.warning("daily_kline: symbol=%s 区间[%s,%s]无数据", symbol, start_date, end_date)
