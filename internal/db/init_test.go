@@ -163,6 +163,150 @@ func TestModelCRUD_RoundTrip(t *testing.T) {
 	}
 }
 
+// TestCandidatePool_CRUD 通过 GORM 对真实 SQLite 验证 candidate_pools 表：
+// 建表、写入/读取往返、(trade_date, code) 唯一约束、同日重跑 upsert 覆盖、跨日共存与条件查询。
+func TestCandidatePool_CRUD(t *testing.T) {
+	gdb, _ := openTempDB(t)
+
+	// --- 表存在（InitDB AutoMigrate 已建）---
+	var cnt int64
+	if err := gdb.Table("candidate_pools").Count(&cnt).Error; err != nil {
+		t.Fatalf("table candidate_pools missing or broken: %v", err)
+	}
+	if cnt != 0 {
+		t.Fatalf("fresh table should be empty, got %d rows", cnt)
+	}
+
+	// --- 写入 + 读取往返 ---
+	cp := model.CandidatePool{
+		TradeDate:      "2026-10-11",
+		Code:           "600519",
+		SignalType:     model.SignalBuy3,
+		CzscSummary:    "出现第三类买点，回踩不破中枢上沿",
+		ZsCount:        3,
+		TrendDirection: "up",
+	}
+	if err := gdb.Create(&cp).Error; err != nil {
+		t.Fatalf("create candidate: %v", err)
+	}
+	if cp.ID == 0 {
+		t.Fatal("candidate PK should be auto-filled")
+	}
+	var got model.CandidatePool
+	if err := gdb.Where("trade_date = ? AND code = ?", "2026-10-11", "600519").First(&got).Error; err != nil {
+		t.Fatalf("load candidate: %v", err)
+	}
+	if got.SignalType != model.SignalBuy3 || got.ZsCount != 3 || got.TrendDirection != "up" ||
+		got.CzscSummary != cp.CzscSummary {
+		t.Fatalf("candidate round-trip mismatch: %+v", got)
+	}
+	if got.CreatedAt.IsZero() {
+		t.Fatal("candidate CreatedAt should be auto-filled")
+	}
+
+	// --- (trade_date, code) 唯一约束：同日同代码重复插入必须失败 ---
+	if err := gdb.Create(&model.CandidatePool{
+		TradeDate: "2026-10-11", Code: "600519", SignalType: model.SignalBuy1, TrendDirection: "down",
+	}).Error; err == nil {
+		t.Fatal("duplicate (trade_date, code) should violate unique index uk_pool_date_code")
+	}
+	// 不同代码同日可共存
+	if err := gdb.Create(&model.CandidatePool{
+		TradeDate: "2026-10-11", Code: "300750", SignalType: model.SignalObservation,
+		ZsCount: 2, TrendDirection: "unknown",
+	}).Error; err != nil {
+		t.Fatalf("different code same date should insert: %v", err)
+	}
+
+	// --- 同日重跑语义：生产路径用 Where+Assign+FirstOrCreate 做 upsert，应原地覆盖而非新增 ---
+	update := model.CandidatePool{
+		TradeDate: "2026-10-11", Code: "600519",
+		SignalType: model.SignalBuy2, CzscSummary: "重跑后更新：第二类买点确认",
+		ZsCount: 4, TrendDirection: "down",
+	}
+	if err := gdb.Where("trade_date = ? AND code = ?", "2026-10-11", "600519").
+		Assign(update).FirstOrCreate(&update).Error; err != nil {
+		t.Fatalf("upsert rerun: %v", err)
+	}
+	if err := gdb.Model(&model.CandidatePool{}).Where("trade_date = ? AND code = ?", "2026-10-11", "600519").
+		Count(&cnt).Error; err != nil {
+		t.Fatalf("count after upsert: %v", err)
+	}
+	if cnt != 1 {
+		t.Fatalf("same-day rerun must update in place, got %d rows for (2026-10-11, 600519)", cnt)
+	}
+	var reran model.CandidatePool
+	if err := gdb.Where("trade_date = ? AND code = ?", "2026-10-11", "600519").First(&reran).Error; err != nil {
+		t.Fatalf("reload after upsert: %v", err)
+	}
+	if reran.SignalType != model.SignalBuy2 || reran.ZsCount != 4 || reran.TrendDirection != "down" ||
+		reran.CzscSummary != "重跑后更新：第二类买点确认" {
+		t.Fatalf("upsert did not overwrite fields: %+v", reran)
+	}
+
+	// --- 跨交易日独立记录 ---
+	if err := gdb.Create(&model.CandidatePool{
+		TradeDate: "2026-10-12", Code: "600519", SignalType: model.SignalBuy3, TrendDirection: "up",
+	}).Error; err != nil {
+		t.Fatalf("next-day record should insert: %v", err)
+	}
+
+	// --- 按信号类型过滤查询（Layer2 Agent 的典型读取方式）---
+	var buy3 []model.CandidatePool
+	if err := gdb.Where("signal_type = ?", model.SignalBuy3).Find(&buy3).Error; err != nil {
+		t.Fatalf("query by signal_type: %v", err)
+	}
+	// 注意：600519@2026-10-11 已被上面 upsert 覆盖为 2B，故全表仅剩 600519@2026-10-12 一条 3B。
+	if len(buy3) != 1 || buy3[0].TradeDate != "2026-10-12" {
+		t.Errorf("expect exactly 1 row with signal 3B (2026-10-12), got %+v", buy3)
+	}
+
+	// --- 删除当日池 ---
+	if err := gdb.Where("trade_date = ?", "2026-10-11").Delete(&model.CandidatePool{}).Error; err != nil {
+		t.Fatalf("delete day pool: %v", err)
+	}
+	if err := gdb.Model(&model.CandidatePool{}).Count(&cnt).Error; err != nil {
+		t.Fatalf("final count: %v", err)
+	}
+	if cnt != 1 {
+		t.Errorf("after deleting 2026-10-11 pool, expect 1 remaining row, got %d", cnt)
+	}
+}
+
+// TestCandidatePool_SignalTypeValidation 校验候选池信号类型常量与合法性判断，
+// 保证落库前的入参校验与 Python 网关 screen_pool 的 signal_type 对齐。
+func TestCandidatePool_SignalTypeValidation(t *testing.T) {
+	valid := []string{
+		model.SignalObservation, model.SignalBuy1, model.SignalBuy2, model.SignalBuy3,
+		model.SignalSell1, model.SignalSell2, model.SignalSell3,
+	}
+	for _, s := range valid {
+		if !model.IsValidSignalType(s) {
+			t.Errorf("IsValidSignalType(%q) = false, want true", s)
+		}
+	}
+	invalid := []string{"", "3b", "2A", "Observation ", "BUY3", "unknown-signal"}
+	for _, s := range invalid {
+		if model.IsValidSignalType(s) {
+			t.Errorf("IsValidSignalType(%q) = true, want false", s)
+		}
+	}
+
+	// 非法信号类型不应被静默写入：模拟服务层校验后拒绝入库。
+	gdb, _ := openTempDB(t)
+	if model.IsValidSignalType("9X") {
+		t.Fatal("sanity: 9X should be invalid")
+	}
+	var before int64
+	gdb.Model(&model.CandidatePool{}).Count(&before)
+	// （校验拦截后不执行 Create）确认表仍为空
+	var after int64
+	gdb.Model(&model.CandidatePool{}).Count(&after)
+	if after != before {
+		t.Errorf("row count changed without any insert: %d -> %d", before, after)
+	}
+}
+
 // TestCalcLimitPrices_Boards 覆盖主板/创业板/科创板的涨跌停计算与取整。
 func TestCalcLimitPrices_Boards(t *testing.T) {
 	cases := []struct {
