@@ -201,6 +201,52 @@ type AIDecisionLog struct {
 func (AIDecisionLog) TableName() string { return "ai_decision_logs" }
 
 // ---------------------------------------------------------------------------
+// WatchlistItem 动态自选股池表（漏斗四层架构的 Layer 0.5）
+// ---------------------------------------------------------------------------
+
+// 自选股来源类型常量（与 Python watchlist_generator.py 严格对齐）。
+const (
+	WatchSourceManual = "MANUAL"        // 人工白名单: 永不被自动清理/过期剔除
+	WatchSourceSector = "SECTOR_LEADER" // 行业龙头: 资金净流入 Top 板块的大市值成分股
+	WatchSourceETF    = "ETF_MOMENTUM"  // ETF 动量: 20 日涨幅 Top N 的行业/跨境 ETF
+	WatchSourceFund   = "FUND_FLOW"     // 资金异动: 龙虎榜机构席位净买入
+)
+
+// 自选股状态常量。
+const (
+	WatchStatusActive    = "ACTIVE"    // 生效中, 参与每日 czsc 粗筛
+	WatchStatusInactive  = "INACTIVE"  // 已过期/跌出动态池, 保留历史但不参与粗筛
+	WatchStatusBlacklist = "BLACKLIST" // 人工屏蔽, 任何自动逻辑不得恢复
+)
+
+// WatchlistItem 动态自选股池条目。
+//
+// 数据来源优先级: MANUAL > ETF_MOMENTUM > SECTOR_LEADER > FUND_FLOW（同日去重时保留高优先来源）。
+// 生命周期规则:
+//   - SourceType == MANUAL 的记录永不自动失效（人类保留一票否决/偏好权）；
+//   - 非 MANUAL 记录 ExpireDate 到期且未再被生成器命中 -> Status 置 INACTIVE；
+//   - BLACKLIST 为人工终态, UpdateWatchlist 节点只读不写。
+type WatchlistItem struct {
+	ID   uint64 `gorm:"primaryKey;autoIncrement" json:"id"`
+	Code string `gorm:"type:varchar(10);not null;uniqueIndex:uk_watchlist_code" json:"code"` // 股票/ETF 代码
+	Name string `gorm:"type:varchar(64)" json:"name"`                                        // 名称, 可为空(网关补齐)
+
+	SourceType string `gorm:"type:varchar(16);not null;index:idx_watch_source;default:MANUAL" json:"source_type"` // MANUAL/SECTOR_LEADER/ETF_MOMENTUM/FUND_FLOW
+	SectorName string `gorm:"type:varchar(64)" json:"sector_name"`                                                // 所属行业板块或 ETF 名称
+	Status     string `gorm:"type:varchar(16);not null;index:idx_watch_status;default:ACTIVE" json:"status"`      // ACTIVE/INACTIVE/BLACKLIST
+
+	AddedDate  time.Time  `gorm:"not null" json:"added_date"`                              // 加入池子的日期
+	ExpireDate *time.Time `gorm:"type:datetime;index:idx_watch_expire" json:"expire_date"` // 过期时间; MANUAL 为 NULL(永不过期)
+	LastSeenAt *time.Time `json:"last_seen_at"`                                            // 最近一次被动态生成器命中的时间
+
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// TableName 固定表名。
+func (WatchlistItem) TableName() string { return "watchlist_items" }
+
+// ---------------------------------------------------------------------------
 // Position 持仓表
 // ---------------------------------------------------------------------------
 

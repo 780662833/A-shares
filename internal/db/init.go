@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/glebarez/sqlite" // 纯 Go SQLite 驱动（modernc.org/sqlite，无 CGO 依赖）
 	"gorm.io/gorm"
@@ -23,6 +24,12 @@ var globalDB *gorm.DB
 //
 // 幂等性：可安全重复调用；已存在的默认账户不会被重置。
 func InitDB(dbPath string) (*gorm.DB, error) {
+	return InitDBWithWatchlist(dbPath, nil)
+}
+
+// InitDBWithWatchlist 在 InitDB 基础上，若 watchlist_items 表为空则用传入的
+// 人工自选股代码播种 MANUAL 记录（永不过期）。symbols 为空时行为与 InitDB 一致。
+func InitDBWithWatchlist(dbPath string, manualSymbols []string) (*gorm.DB, error) {
 	if dbPath == "" {
 		return nil, errors.New("db: dbPath is empty")
 	}
@@ -68,6 +75,11 @@ func InitDB(dbPath string) (*gorm.DB, error) {
 		return nil, err
 	}
 
+	// 5. 首次建库时播种人工自选股池（幂等，表非空即跳过）。
+	if err := ensureDefaultWatchlist(gdb, manualSymbols); err != nil {
+		return nil, err
+	}
+
 	globalDB = gdb
 	log.Printf("db: initialized sqlite at %q (default account ready)", dbPath)
 	return gdb, nil
@@ -87,6 +99,7 @@ func autoMigrate(gdb *gorm.DB) error {
 		&model.Order{},
 		&model.CandidatePool{},
 		&model.AIDecisionLog{},
+		&model.WatchlistItem{},
 	}
 	if err := gdb.AutoMigrate(models...); err != nil {
 		return fmt.Errorf("db: automigrate: %w", err)
@@ -114,6 +127,44 @@ func ensureDefaultAccount(gdb *gorm.DB) error {
 		return fmt.Errorf("db: create default account: %w", err)
 	}
 	log.Printf("db: created default account id=%d with capital %.2f", acc.ID, model.DefaultInitialCapital)
+	return nil
+}
+
+// ensureDefaultWatchlist 若 watchlist_items 表为空（首次建库），把传入的人工自选股
+// 以 SourceType=MANUAL / Status=ACTIVE / ExpireDate=NULL（永不过期）写入，
+// 保证 UpdateWatchlist 动态节点上线前系统即拥有一个可用的手工白名单池。
+//
+// 幂等：表非空时直接跳过，绝不覆盖已有池子（包括人工 BLACKLIST/INACTIVE 记录）。
+func ensureDefaultWatchlist(gdb *gorm.DB, symbols []string) error {
+	var count int64
+	if err := gdb.Model(&model.WatchlistItem{}).Count(&count).Error; err != nil {
+		return fmt.Errorf("db: count watchlist: %w", err)
+	}
+	if count > 0 || len(symbols) == 0 {
+		return nil
+	}
+	now := time.Now()
+	items := make([]model.WatchlistItem, 0, len(symbols))
+	for _, code := range symbols {
+		if code == "" {
+			continue
+		}
+		c := code
+		items = append(items, model.WatchlistItem{
+			Code:       c,
+			SourceType: model.WatchSourceManual,
+			SectorName: "人工自选",
+			Status:     model.WatchStatusActive,
+			AddedDate:  now,
+		})
+	}
+	if len(items) == 0 {
+		return nil
+	}
+	if err := gdb.CreateInBatches(&items, 100).Error; err != nil {
+		return fmt.Errorf("db: seed watchlist: %w", err)
+	}
+	log.Printf("db: seeded %d MANUAL watchlist items (never expire)", len(items))
 	return nil
 }
 

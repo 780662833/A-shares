@@ -56,6 +56,9 @@ except ImportError:  # pragma: no cover
 # czsc 结果磁盘缓存 (长期方案 C)。纯标准库实现, 恒可导入。
 from czsc_cache import cache as _czsc_cache, _compact as _date_compact  # noqa: E402
 
+# 动态自选股池生成器 (Layer 0.5): ETF动量 + 行业龙头 + 资金异动 + 人工白名单
+import watchlist_generator  # noqa: E402
+
 # vectorbt 回测层 (基石验证): 粗筛规则历史正期望检验, 可选依赖
 try:
     from czsc_backtest import (
@@ -1438,6 +1441,48 @@ def get_sentiment_summary(
     symbol = _validate_symbol(symbol)
     result = _sentiment_summary(symbol, include_lhb=include_lhb)
     return {"code": 0, "message": "success", "symbol": symbol, "data": result}
+
+
+# ---------------------------------------------------------------------------
+# 动态自选股池生成 (漏斗四层架构的 Layer 0.5, 供 Go UpdateWatchlist 节点消费)
+# ---------------------------------------------------------------------------
+
+class WatchlistGenerateRequest(BaseModel):
+    manual_symbols: List[str] = Field(
+        default_factory=list,
+        description="人工白名单 (MANUAL), Python 只透传标记; Go 端保证永不被自动清理",
+    )
+
+
+@app.post("/api/watchlist/generate")
+def post_watchlist_generate(req: WatchlistGenerateRequest) -> Dict[str, Any]:
+    """生成今日动态自选股池: ETF动量 + 行业龙头 + 龙虎榜资金异动 + 人工白名单。
+
+    弱依赖设计: 任一 AKShare 数据源失败仅记入 warnings 并跳过该来源,
+    其余来源结果照常返回, 接口几乎永不整体失败。
+    """
+    valid_manual: List[str] = []
+    errors: List[Dict[str, str]] = []
+    for s in req.manual_symbols:
+        try:
+            sym = _validate_symbol(str(s))
+            if sym not in valid_manual:
+                valid_manual.append(sym)
+        except HTTPException as exc:
+            errors.append({"symbol": str(s), "error": str(exc.detail)})
+
+    started = time.monotonic()
+    result = watchlist_generator.generate_watchlist(manual_symbols=valid_manual)
+    elapsed = round(time.monotonic() - started, 2)
+    logger.info(
+        "watchlist/generate: total=%d by_source=%s warnings=%d elapsed=%.2fs",
+        result["total"], result["by_source"], len(result["warnings"]), elapsed,
+    )
+    return {
+        "code": 0,
+        "message": "success",
+        "data": {**result, "elapsed_seconds": elapsed, "manual_errors": errors},
+    }
 
 
 # ---------------------------------------------------------------------------
