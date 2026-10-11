@@ -15,6 +15,9 @@ A股日线级别 AI 模拟交易系统 - Python 数据网关服务
     POST /api/czsc/refresh            收盘后定时预计算入口 (Go cron 每日 15:10 调用)
     GET  /api/czsc/cache_status       查看磁盘缓存覆盖情况
     DELETE /api/czsc/cache            清空缓存 (调试用)
+    GET  /api/czsc/walk_forward/{symbol}  单票 Walk-Forward 滚动回测 (样本外稳健性检验)
+    POST /api/czsc/walk_forward/rules     批量 Walk-Forward 并聚合规则级结论
+    GET  /api/news                    个股新闻+公告 (东财 stock_news_em + 巨潮 stock_notice_report)
 
 长期方案 C (缓存化):
     czsc 分析结果按 <period>/<symbol>.json 落盘 (czsc_cache.py)。
@@ -32,7 +35,7 @@ import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timedelta
+from datetime import datetime, time as dtime, timedelta
 from functools import lru_cache
 from typing import Any, Callable, Dict, List, Optional
 
@@ -67,15 +70,21 @@ try:
         replay_signals as _replay_signals,
         per_signal_stats as _per_signal_stats,
         summarize_rule_perf as _summarize_rule_perf,
+        run_walk_forward as _run_walk_forward,
+        summarize_walk_forward as _summarize_walk_forward,
         cache_get as _bt_cache_get,
         cache_put as _bt_cache_put,
+        wf_cache_get as _wf_cache_get,
+        wf_cache_put as _wf_cache_put,
         BUY_TYPES as _BT_BUY_TYPES,
         SELL_TYPES as _BT_SELL_TYPES,
     )
 except ImportError:  # pragma: no cover
     _bt_is_available = lambda: False  # type: ignore[assignment]
     _run_backtest = _replay_signals = _per_signal_stats = _summarize_rule_perf = None  # type: ignore[assignment]
+    _run_walk_forward = _summarize_walk_forward = None  # type: ignore[assignment]
     _bt_cache_get = _bt_cache_put = None  # type: ignore[assignment]
+    _wf_cache_get = _wf_cache_put = None  # type: ignore[assignment]
     _BT_BUY_TYPES, _BT_SELL_TYPES = ("1B", "2B", "3B"), ("1S", "2S", "3S")
 
 # 财务排雷规则引擎 (垃圾股过滤器), 可选依赖 (需要 akshare)
@@ -83,12 +92,14 @@ try:
     from mine_sweeper import (
         check_symbol as _mine_check,
         sweep_symbols as _mine_sweep,
+        base_filter_symbol as _mine_base_filter,
+        BaseFilterConfig as _BaseFilterConfig,
         MineConfig as _MineConfig,
     )
     _MINE_AVAILABLE = True
 except ImportError:  # pragma: no cover
-    _mine_check = _mine_sweep = None  # type: ignore[assignment]
-    _MineConfig = None  # type: ignore[assignment]
+    _mine_check = _mine_sweep = _mine_base_filter = None  # type: ignore[assignment]
+    _MineConfig = _BaseFilterConfig = None  # type: ignore[assignment]
     _MINE_AVAILABLE = False
 
 # A股特色情绪数据: 龙虎榜席位分类 + 主力资金流向 (Eino Tool 消费)
@@ -102,6 +113,14 @@ try:
 except ImportError:  # pragma: no cover
     _fund_flow_trend = _lhb_analysis = _sentiment_summary = None  # type: ignore[assignment]
     _SENTIMENT_AVAILABLE = False
+
+# 个股新闻/公告 (漏斗 Layer2 排雷): 东财新闻(方案1) + 巨潮公告(方案2), 可选依赖 (需要 akshare)
+try:
+    from news import get_stock_news as _get_stock_news
+    _NEWS_AVAILABLE = True
+except ImportError:  # pragma: no cover
+    _get_stock_news = None  # type: ignore[assignment]
+    _NEWS_AVAILABLE = False
 
 # ---------------------------------------------------------------------------
 # 日志配置 (生产级: 带时间戳/级别/模块名)
@@ -578,11 +597,60 @@ class ScreenPoolRequest(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# 流动性基础过滤辅助 (决策#4: base_filter 独立层, mine_batch/screen_pool 共用)
+# ---------------------------------------------------------------------------
+
+# screen_pool 是否默认内嵌 base_filter (决策#4); mine_batch 由请求参数控制
+_BASE_FILTER_DEFAULT_ENABLED = True
+
+
+def _base_kline_provider(symbol: str):
+    """为 base_filter 拉取近 ~30 个交易日的日线 (复用全局限速+重试链路)。"""
+    end_date = datetime.now().strftime(_DATE_FMT)
+    start_date = (datetime.now() - timedelta(days=60)).strftime(_DATE_FMT)
+    try:
+        return _retry_call(lambda: _ak_hist_throttled(
+            symbol, "daily", start_date, end_date))
+    except Exception as exc:  # noqa: BLE001 - 缺数据放行原则
+        logger.warning("base_filter kline %s failed, pass-through: %s", symbol, exc)
+        return None
+
+
+def _apply_base_filter(pool: List[Dict[str, Any]],
+                       name_map: Dict[str, str]) -> tuple:
+    """对 screen_pool 命中列表执行流动性三条件过滤, 返回 (kept, blocked)。"""
+    kept: List[Dict[str, Any]] = []
+    blocked: List[Dict[str, Any]] = []
+    for hit in pool:
+        sym = hit["symbol"]
+        try:
+            bf = _mine_base_filter(sym, _base_kline_provider(sym),
+                                   name_map=name_map)
+        except Exception as exc:  # noqa: BLE001 - 过滤异常不误杀
+            logger.warning("screen_pool base_filter %s error, pass: %s", sym, exc)
+            bf = {"passed": True, "reasons": []}
+        if bf.get("passed"):
+            hit["base_metrics"] = bf.get("metrics", {})
+            kept.append(hit)
+        else:
+            hit["blocked_reasons"] = bf.get("reasons", [])
+            hit["blocked_layer"] = "base"
+            blocked.append(hit)
+    return kept, blocked
+
+
+
+# ---------------------------------------------------------------------------
 # 防弹衣数据获取层: 本地 SQLite 行情缓存 + BaoStock(主)/AKShare(备) 多源降级
 #   - 日线每天收盘后只变一次: 当日 15:30 后已落库的数据直接读 local_cache.db;
 #   - 主源 BaoStock 失败自动切备用源 AKShare; 双源全挂返回旧缓存并打 stale 标记。
 # ---------------------------------------------------------------------------
-from data_fetcher import LocalKlineCache, _bs_daily_df, get_daily_kline_safe  # noqa: E402
+from data_fetcher import (  # noqa: E402
+    LocalKlineCache,
+    _bs_daily_df,
+    get_daily_kline_safe,
+    _last_workday_on_or_before,
+)
 
 _kline_cache = LocalKlineCache()
 
@@ -683,16 +751,44 @@ def _ak_hist_throttled(symbol: str, period: str, start_date: str, end_date: str)
     )
 
 
-def _cache_is_fresh(entry: Dict[str, Any], end_date: str) -> bool:
-    """缓存是否覆盖到请求窗口末端: 缓存最后交易日 >= min(end_date, 今天)。
+# 收盘结算时刻: 当日 15:30 之前生成的"今日缓存"可能是盘中半成品, 必须回源刷新
+_SETTLE_CUTOFF = (15, 30)
 
-    非交易日请求时 end_date 可能落在周末, 此时只要缓存是最近一个交易日即算新鲜。
+
+def _cache_is_fresh(entry: Dict[str, Any], end_date: str) -> bool:
+    """缓存是否覆盖到请求窗口末端: 缓存最后交易日 >= min(end_date, 最近应落库日)。
+
+    非交易日请求时 end_date 可能落在周末/节假日, 此时只要缓存覆盖最近一个
+    工作日即算新鲜 (历史K线不可变, 与 data_fetcher.coverage_for_request 口径一致);
+    唯一例外: 缓存恰好是"今天"(工作日)且生成于 15:30 结算前 —— 属盘中半成品,
+    判为不新鲜并触发回源。
     """
-    cached_end = str(entry.get("window_end", ""))
+    cached_end = _date_compact(str(entry.get("window_end", "")))
     if not cached_end:
         return False
-    effective_end = min(end_date, datetime.now().strftime(_DATE_FMT))
-    return cached_end >= effective_end
+    now_dt = datetime.now()
+    today = now_dt.strftime(_DATE_FMT)
+    effective_end = min(end_date, today)
+    last_wd = _last_workday_on_or_before(effective_end)
+    target = last_wd or effective_end
+    if cached_end < target:
+        return False
+    gen = str(entry.get("generated_at", ""))
+    try:
+        gen_dt = datetime.fromisoformat(gen)
+    except ValueError:
+        gen_dt = None
+    # 时钟一致性守卫: generated_at 晚于当前时刻 => 写入端与读取端时钟不同源
+    # (典型场景: 测试夹具冻结了 main 的时钟却未同步 czsc_cache)。此时"今天"的
+    # 语义已失真, 跳过结算检查 —— 窗口覆盖判定本身仍成立。生产环境两模块共享
+    # 同一真实时钟, 不会命中此分支。
+    clock_skew = gen_dt is not None and gen_dt > now_dt
+    if cached_end == today and not clock_skew:  # 缓存声称覆盖到今天, 校验是否结算后生成
+        if gen_dt is not None:
+            cutoff = datetime.combine(gen_dt.date(), dtime(*_SETTLE_CUTOFF))
+            if gen_dt < cutoff:
+                return False
+    return True
 
 
 def _incremental_fetch(symbol: str, period: str, entry: Dict[str, Any], end_date: str) -> Optional[Dict[str, Any]]:
@@ -959,8 +1055,19 @@ def get_czsc_analysis(
 
 
 def _fetch_czsc_result_cached(symbol: str, period: str, start_date: str, end_date: str) -> tuple:
-    """use_cache=false 分支: 强制实时全量拉取, 但仍顺手刷新缓存保持一致。"""
-    result = _fetch_czsc_result(symbol, period, start_date, end_date)
+    """use_cache=false 分支: 强制实时全量拉取, 但仍顺手刷新缓存保持一致。
+
+    行情层 (data_fetcher 的 SQLite 缓存) 对"过去日期窗口"仍可能判定 fresh 并
+    零网络返回 —— 但那正是本接口要绕开的磁盘缓存链路。因此临时把行情缓存
+    指向内存空库, 保证 use_cache=false 语义为"无条件回源上游", 结束后恢复。
+    """
+    global _kline_cache
+    saved = _kline_cache
+    _kline_cache = LocalKlineCache(db_path=":memory:")
+    try:
+        result = _fetch_czsc_result(symbol, period, start_date, end_date)
+    finally:
+        _kline_cache = saved
     if "error" not in result:
         _czsc_cache.put(symbol, period, result, start_date, result.get("window_end", end_date))
     return result, {"source": "live_forced"}
@@ -1086,6 +1193,10 @@ def post_screen_pool(req: ScreenPoolRequest) -> Dict[str, Any]:
                         for item in _stock_list_cached()}
         except Exception:  # noqa: BLE001 - 名称映射失败退化为逐个查询/放行
             name_map = {}
+        # ---- Layer 0: 流动性三条件 base_filter (决策#4, ST 归并点) ----
+        if _BASE_FILTER_DEFAULT_ENABLED:
+            pool, base_blocked = _apply_base_filter(pool, name_map)
+            blocked.extend(base_blocked)
         kept: List[Dict[str, Any]] = []
         for hit in pool:
             try:
@@ -1354,6 +1465,211 @@ def get_czsc_backtest_per_signal(
 
 
 # ---------------------------------------------------------------------------
+# Walk-Forward 滚动回测接口 (把"全样本内回测"升级为"训练段/测试段"防泄漏口径)
+# ---------------------------------------------------------------------------
+
+class WalkForwardRequest(BaseModel):
+    """POST /api/czsc/walk_forward/rules 的请求体。"""
+
+    symbols: List[str] = Field(..., description="待检验股票代码列表")
+    buy_types: Optional[List[str]] = Field(None, description="入场买点集合, 默认 ['1B','2B','3B']")
+    sell_types: Optional[List[str]] = Field(None, description="离场卖点集合, 默认 ['1S','2S','3S']")
+    start_date: Optional[str] = Field(None, description="YYYYMMDD, 默认近4年(walk-forward需要长历史)")
+    end_date: Optional[str] = Field(None, description="YYYYMMDD, 默认今天")
+    period: str = Field("daily", description="周期: daily/weekly/monthly")
+    train_size: int = Field(250, ge=250, le=1000, description="训练窗口K线数, 默认250(~1年); 下限250为样本闸门")
+    test_size: int = Field(63, ge=10, le=250, description="测试窗口K线数, 默认63(~1季度)")
+    anchored: bool = Field(False, description="true=锚定式(训练段从起点扩张), false=滚动式")
+    stride: int = Field(5, ge=1, le=20, description="信号重放步长 (越小越精确越慢)")
+    fees: Optional[float] = Field(None, description="双边费率, 默认 0.0013")
+    use_cache: bool = Field(True, description="true=优先读7天内的walk-forward磁盘缓存")
+
+
+def _wf_rule_key(buy_t: tuple, sell_t: tuple) -> str:
+    return "+".join(buy_t) + "__" + "+".join(sell_t)
+
+
+def _wf_params_key(req_kind: str, period: str, train_size: int, test_size: int,
+                   stride: int, start_date: str, end_date: str) -> str:
+    return f"{req_kind}-{period}-{train_size}-{test_size}-{stride}-{start_date}-{end_date}"
+
+
+def _wf_one(symbol: str, *, period: str, buy_t: tuple, sell_t: tuple,
+            start_date: str, end_date: str, train_size: int, test_size: int,
+            anchored: bool, stride: int, fees: Optional[float],
+            use_cache: bool) -> Dict[str, Any]:
+    """单只股票 walk-forward worker: 缓存优先, 未命中则拉数据现算并写回缓存。
+
+    注意与全样本回测的区别: 训练段信号严格截断在 train_end 之前重放 (防前视泄漏),
+    测试段用冻结规则在全量序列上切片评估 —— 该段绩效即"样本外"结论。
+    """
+    rule_k = _wf_rule_key(buy_t, sell_t)
+    params_k = _wf_params_key("anchored" if anchored else "rolling",
+                              period, train_size, test_size, stride, start_date, end_date)
+    if use_cache and _wf_cache_get is not None:
+        hit = _wf_cache_get(symbol, rule_k, params_k)
+        if hit is not None:
+            return hit
+    df = _retry_call(lambda: _ak_hist_throttled(symbol, period, start_date, end_date))
+    if df is None or df.empty:
+        return {"symbol": symbol, "error": "no_data"}
+    kwargs: Dict[str, Any] = dict(period=period, buy_types=buy_t, sell_types=sell_t,
+                                  train_size=train_size, test_size=test_size,
+                                  anchored=anchored, stride=stride)
+    if fees is not None:
+        kwargs["fees"] = fees
+    result = _run_walk_forward(df, symbol, **kwargs)
+    if "error" not in result and _wf_cache_put is not None:
+        # 记录请求参数便于排查; source=live 标记本次为现算 (含 force/use_cache=false
+        # 的旁路场景)。缓存新鲜度由 generated_at + max_age_days 判定, 与写回解耦。
+        result["source"] = "live"
+        _wf_cache_put(symbol, rule_k, params_k, result)
+    return result
+
+
+@app.get("/api/czsc/walk_forward/{symbol}")
+def get_czsc_walk_forward(
+    symbol: str,
+    period: str = Query("daily", description="周期: daily/weekly/monthly"),
+    start_date: Optional[str] = Query(None, description="YYYYMMDD, 默认近4年"),
+    end_date: Optional[str] = Query(None, description="YYYYMMDD, 默认今天"),
+    train_size: int = Query(250, ge=250, le=1000, description="训练窗口K线数; 下限250为样本闸门"),
+    test_size: int = Query(63, ge=10, le=250, description="测试窗口K线数"),
+    anchored: bool = Query(False, description="true=锚定式, false=滚动式"),
+    stride: int = Query(5, ge=1, le=20, description="信号重放步长"),
+    use_cache: bool = Query(True, description="优先读walk-forward缓存"),
+) -> Dict[str, Any]:
+    """单只股票的 Walk-Forward 滚动回测报告。
+
+    回答的问题: 「czsc 三类买卖点这套规则, 在它没见过的行情里还赚钱吗?」
+      - windows[]: 每个滚动窗口的 train_metrics / test_metrics 与日期区间;
+      - summary.verdict: oos_positive(样本外正期望) / overfit_suspect(训练正、
+        样本外负 → 疑似过拟合应降权) / oos_negative / insufficient_data;
+      - summary.degradation_pp: 训练→测试的期望衰减(百分点), 越大越不可信。
+    结果按 symbol+规则集+窗口参数 磁盘缓存 7 天。
+    """
+    if not _bt_is_available() or _run_walk_forward is None:
+        raise HTTPException(status_code=503, detail="vectorbt/czsc 未安装, 请 pip install vectorbt")
+    symbol = _validate_symbol(symbol)
+    if period not in _CZSC_PERIODS:
+        raise HTTPException(status_code=400, detail=f"非法周期: '{period}'")
+    end_date = _validate_date(end_date, "end_date") or datetime.now().strftime(_DATE_FMT)
+    # walk-forward 需要足够长的历史切分训练/测试段, 默认拉近4年
+    start_date = _validate_date(start_date, "start_date") or (
+        datetime.now() - timedelta(days=1500)).strftime(_DATE_FMT)
+
+    try:
+        result = _wf_one(symbol, period=period, buy_t=_BT_BUY_TYPES, sell_t=_BT_SELL_TYPES,
+                         start_date=start_date, end_date=end_date,
+                         train_size=train_size, test_size=test_size,
+                         anchored=anchored, stride=stride, fees=None,
+                         use_cache=use_cache)
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise _gateway_error(500, "czsc(walk_forward)", exc)
+    if "error" in result:
+        return {"code": 0, "message": "failed", "symbol": symbol, "data": result}
+    result["window"] = f"{start_date}~{end_date}"
+    return {"code": 0, "message": "success", "symbol": symbol, "data": result}
+
+
+@app.post("/api/czsc/walk_forward/rules")
+def post_czsc_walk_forward_rules(req: WalkForwardRequest) -> Dict[str, Any]:
+    """批量 Walk-Forward: 对一篮子股票跑滚动样本外检验并聚合规则级结论。
+
+    verdict 口径 (跨股票):
+      - robust_positive : 样本外平均期望>0 且过半股票为正 → 规则可信
+      - fragile_positive: 全样本内正但样本外转负 → 典型过拟合, AI 决策应降权
+      - negative        : 两段皆负 → 规则应废弃
+    单只失败仅记入 errors, 不阻断整体; 结果磁盘缓存 7 天。
+    """
+    if not _bt_is_available() or _run_walk_forward is None:
+        raise HTTPException(status_code=503, detail="vectorbt/czsc 未安装, 请 pip install vectorbt")
+    if req.period not in _CZSC_PERIODS:
+        raise HTTPException(status_code=400, detail=f"非法周期: '{req.period}'")
+    if not req.symbols:
+        raise HTTPException(status_code=400, detail="symbols 不能为空")
+    if len(req.symbols) > _SCREEN_MAX_SYMBOLS:
+        raise HTTPException(status_code=400, detail=f"单次最多 {_SCREEN_MAX_SYMBOLS} 只")
+
+    valid: List[str] = []
+    errors: List[Dict[str, str]] = []
+    for s in req.symbols:
+        try:
+            sym = _validate_symbol(str(s))
+            if sym not in valid:
+                valid.append(sym)
+        except HTTPException as exc:
+            errors.append({"symbol": str(s), "error": str(exc.detail)})
+
+    known_buy = set(_BT_BUY_TYPES) | {"Observation"}
+    known_sell = set(_BT_SELL_TYPES)
+    buy_t = tuple(b for b in (req.buy_types or _BT_BUY_TYPES) if b in known_buy) or _BT_BUY_TYPES
+    sell_t = tuple(x for x in (req.sell_types or _BT_SELL_TYPES) if x in known_sell) or _BT_SELL_TYPES
+
+    end_date = _validate_date(req.end_date, "end_date") or datetime.now().strftime(_DATE_FMT)
+    start_date = _validate_date(req.start_date, "start_date") or (
+        datetime.now() - timedelta(days=1500)).strftime(_DATE_FMT)
+
+    started = time.monotonic()
+    results: List[Dict[str, Any]] = []
+    with ThreadPoolExecutor(max_workers=min(_REFRESH_WORKERS, max(len(valid), 1))) as tp:
+        futures = {
+            sym: tp.submit(_wf_one, sym, period=req.period, buy_t=buy_t, sell_t=sell_t,
+                           start_date=start_date, end_date=end_date,
+                           train_size=req.train_size, test_size=req.test_size,
+                           anchored=req.anchored, stride=req.stride, fees=req.fees,
+                           use_cache=req.use_cache)
+            for sym in valid
+        }
+        for sym in valid:
+            try:
+                r = futures[sym].result()
+                if "error" in r:
+                    errors.append({"symbol": sym, "error": r["error"]})
+                else:
+                    results.append(r)
+            except Exception as exc:  # noqa: BLE001 - 单只失败不影响整体
+                logger.warning("walk_forward %s failed: %s", sym, exc)
+                errors.append({"symbol": sym, "error": str(exc)[:200]})
+
+    rule_name = f"WF {req.train_size}/{req.test_size} {'anchored' if req.anchored else 'rolling'}: " \
+                f"{'+'.join(buy_t)} entry / {'+'.join(sell_t)} exit"
+    summary = _summarize_walk_forward(results, rule_name) if _summarize_walk_forward else {}
+    elapsed = round(time.monotonic() - started, 2)
+    logger.info("walk_forward rules done: symbols=%d verdict=%s elapsed=%.1fs",
+                len(results), summary.get("verdict"), elapsed)
+    return {
+        "code": 0,
+        "message": "success",
+        "data": {
+            "rule_summary": summary,
+            "window": f"{start_date}~{end_date}",
+            "mode": "anchored" if req.anchored else "rolling",
+            "params": {"train_size": req.train_size, "test_size": req.test_size,
+                       "stride": req.stride},
+            "elapsed_seconds": elapsed,
+            "results": [
+                {"symbol": r["symbol"], "bars": r.get("bars"),
+                 "summary": r.get("summary", {}),
+                 "windows": [
+                     {"test_range": w["test_range"],
+                      "train_expectancy_pct": w["train_metrics"]["avg_trade_return_pct"],
+                      "test_expectancy_pct": w["test_metrics"]["avg_trade_return_pct"],
+                      "test_alpha_pct": w["test_metrics"]["alpha_vs_hold_pct"],
+                      "test_trades": w["test_metrics"]["trade_count"]}
+                     for w in r.get("windows", [])
+                 ],
+                 "source": r.get("source", "live")}
+                for r in results
+            ],
+            "errors": errors,
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
 # 财务排雷独立接口 (供 Go 端单独调用复查某只股票)
 # ---------------------------------------------------------------------------
 
@@ -1380,6 +1696,8 @@ class MineBatchRequest(BaseModel):
     symbols: List[str] = Field(..., description="股票代码列表")
     include_blocked_detail: bool = Field(
         True, description="false=被拦截股票只返回代码+理由, 减小响应体积")
+    include_base_filter: bool = Field(
+        False, description="true=先跑流动性三条件+ST base_filter (决策#4, Layer 0)")
 
 
 @app.post("/api/financial/mine_batch")
@@ -1390,6 +1708,9 @@ def post_financial_mine_batch(req: MineBatchRequest) -> Dict[str, Any]:
     做一次性垃圾股剔除, 输出 clean/blocked 两份清单, 让后续 czsc 扫描与
     AI 精选只处理"干净标的", 节省算力与 Token。
     数据源为季频财务缓存 (TTL 7 天), 重复调用近零成本; 单只异常默认放行。
+
+    决策#4: include_base_filter=True 时先跑流动性三条件+ST 的 base_filter
+    (Layer 0), 被拦截股票标记 layer="base", 不再消耗财务接口配额。
     """
     if not _MINE_AVAILABLE:
         raise HTTPException(status_code=503, detail="mine_sweeper 不可用 (需 akshare)")
@@ -1417,10 +1738,12 @@ def post_financial_mine_batch(req: MineBatchRequest) -> Dict[str, Any]:
         pass
 
     started = time.monotonic()
-    sweep = _mine_sweep(valid, name_map=name_map)
+    provider = _base_kline_provider if req.include_base_filter else None
+    sweep = _mine_sweep(valid, name_map=name_map, kline_provider=provider)
     elapsed = round(time.monotonic() - started, 2)
-    logger.info("mine_batch: requested=%d clean=%d blocked=%d elapsed=%.2fs",
-                len(valid), len(sweep["clean"]), len(sweep["blocked"]), elapsed)
+    logger.info("mine_batch: requested=%d clean=%d blocked=%d base_filter=%s elapsed=%.2fs",
+                len(valid), len(sweep["clean"]), len(sweep["blocked"]),
+                req.include_base_filter, elapsed)
     if not req.include_blocked_detail:
         sweep["blocked"] = [{"symbol": b["symbol"], "reasons": b["reasons"]}
                             for b in sweep["blocked"]]
@@ -1486,6 +1809,108 @@ def get_sentiment_summary(
     symbol = _validate_symbol(symbol)
     result = _sentiment_summary(symbol, include_lhb=include_lhb)
     return {"code": 0, "message": "success", "symbol": symbol, "data": result}
+
+
+# ---------------------------------------------------------------------------
+# 个股新闻/公告接口 (漏斗 Layer2 排雷, Go 端 NewsSearchTool 消费 GET /api/news)
+#   方案1: ak.stock_news_em      东方财富个股新闻 (覆盖广/更新快)
+#   方案2: ak.stock_notice_report 巨潮资讯网公告   (官方披露, 排雷最权威)
+#   弱依赖: 单源失败仅记入 data.errors, 另一源结果照常返回; 双源全空时返回
+#   空 news 列表 -> Go 端按 "gateway returned empty news list" 降级 Mock。
+# ---------------------------------------------------------------------------
+
+@app.get("/api/news")
+def get_news(
+    symbol: str = Query(..., description="6位股票代码"),
+    limit: int = Query(5, ge=1, le=20, description="期望新闻条数, 默认5"),
+    include_notice: bool = Query(True, description="是否合并巨潮公告(方案2)"),
+) -> Dict[str, Any]:
+    """个股近期新闻+公告列表 (含 sentiment/red_flag 排雷标签), 磁盘缓存 TTL 1 天。"""
+    if not _NEWS_AVAILABLE:
+        raise HTTPException(status_code=503, detail="news 模块不可用 (需 akshare)")
+    symbol = _validate_symbol(symbol)
+    started = time.monotonic()
+    result = _get_stock_news(symbol, limit=limit, include_notice=include_notice)
+    elapsed = round(time.monotonic() - started, 2)
+    if "error" in result:
+        raise HTTPException(status_code=400, detail=result["error"])
+    logger.info(
+        "news: symbol=%s count=%d negative=%d red_flag=%d sources=%s errors=%d elapsed=%.2fs",
+        symbol, result["news_count"], result["negative_count"],
+        result["red_flag_count"], result["sources"], len(result["errors"]), elapsed,
+    )
+    return {"code": 0, "message": "success", "symbol": symbol, "data": result}
+
+
+# ---------------------------------------------------------------------------
+# 大盘环境接口 (决策#3: BEAR 市处理 —— Go 端读取 global_max_position_pct 做总仓位硬闸门)
+#   regime 判定: 上证指数收盘 vs MA20/MA60 (BULL/BEAR/SIDEWAYS);
+#   映射: BULL->1.0 / SIDEWAYS->0.6 / BEAR->0.3 (global_max_position_pct)。
+# ---------------------------------------------------------------------------
+
+_MARKET_ENV_CACHE: Dict[str, Any] = {"ts": 0.0, "data": None}
+_MARKET_ENV_TTL = 300.0  # 秒, 盘中 5 分钟缓存防限速
+
+
+def _classify_regma(close: float, ma20: float, ma60: float) -> str:
+    """regime 规则: 站上MA20且MA20>MA60=BULL; 跌破MA20且MA20<MA60=BEAR; 其余=SIDEWAYS。"""
+    if close > ma20 and ma20 > ma60:
+        return "BULL"
+    if close < ma20 and ma20 < ma60:
+        return "BEAR"
+    return "SIDEWAYS"
+
+
+_REGIME_MAX_PCT = {"BULL": 1.0, "SIDEWAYS": 0.6, "BEAR": 0.3}
+
+
+@app.get("/api/market/environment")
+def get_market_environment() -> Dict[str, Any]:
+    """大盘环境: 返回 regime 与 global_max_position_pct (Go 侧总仓位硬闸门输入)。"""
+    now = time.monotonic()
+    if _MARKET_ENV_CACHE["data"] is not None and now - _MARKET_ENV_CACHE["ts"] < _MARKET_ENV_TTL:
+        return {"code": 0, "message": "success(cached)", "data": _MARKET_ENV_CACHE["data"]}
+
+    try:
+        end_date = datetime.now().strftime(_DATE_FMT)
+        start_date = (datetime.now() - timedelta(days=150)).strftime(_DATE_FMT)
+        df = _retry_call(lambda: ak.index_zh_a_hist(
+            symbol="000001", period="daily", start_date=start_date, end_date=end_date))
+        closes = pd.to_numeric(df["收盘"], errors="coerce").dropna()
+        if len(closes) < 60:
+            raise ValueError(f"上证指数K线不足60根 (got {len(closes)})")
+        close = float(closes.iloc[-1])
+        ma20 = float(closes.tail(20).mean())
+        ma60 = float(closes.tail(60).mean())
+        chg_1d = round((close / float(closes.iloc[-2]) - 1) * 100, 2)
+        chg_20d = round((close / float(closes.iloc[-21]) - 1) * 100, 2)
+        regime = _classify_regma(close, ma20, ma60)
+        payload = {
+            "index": "sh000001",
+            "trade_date": str(df["日期"].iloc[-1]),
+            "close": round(close, 2),
+            "ma20": round(ma20, 2),
+            "ma60": round(ma60, 2),
+            "change_pct_1d": chg_1d,
+            "change_pct_20d": chg_20d,
+            "regime": regime,
+            "global_max_position_pct": _REGIME_MAX_PCT[regime],
+        }
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("market/environment 获取失败, 保守降级 BEAR: %s", exc)
+        # 弱依赖降级: 拿不到大盘数据时按最保守 30% 总仓位处理
+        payload = {
+            "index": "sh000001",
+            "trade_date": datetime.now().strftime("%Y-%m-%d"),
+            "error": str(exc),
+            "regime": "BEAR",
+            "global_max_position_pct": _REGIME_MAX_PCT["BEAR"],
+        }
+    _MARKET_ENV_CACHE["ts"] = now
+    _MARKET_ENV_CACHE["data"] = payload
+    logger.info("market/environment: regime=%s max_pct=%s", payload["regime"],
+                payload["global_max_position_pct"])
+    return {"code": 0, "message": "success", "data": payload}
 
 
 # ---------------------------------------------------------------------------

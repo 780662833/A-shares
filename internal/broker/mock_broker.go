@@ -177,6 +177,18 @@ func (b *MockBroker) SimulateNextDayOpen(tradeDate string) (*SimulationSummary, 
 		log.Printf("broker: %s re-run detected, skip T+1 carry-over", tradeDate)
 	}
 
+	// 3.5 Step 6：持仓止损监控 —— 先于常规撮合生成市价 SELL 单（loadPendingOrders
+	//     的 SELL 优先排序保证止损单在同批中最先成交，释放资金兜底）。
+	//     系统性失败不阻断常规撮合：记 CRITICAL 日志后继续。
+	stopRes, stopErr := b.EnforceStops(tradeDate)
+	if stopErr != nil {
+		log.Printf("broker: CRITICAL stop-loss enforcement failed on %s: %v", tradeDate, stopErr)
+	}
+	if stopRes.Triggered > 0 {
+		log.Printf("broker: stop-loss summary[%s]: triggered=%d skipped_no_quote=%d no_stop_line=%d t_plus_1=%d already_queued=%d",
+			tradeDate, stopRes.Triggered, stopRes.SkippedNoQuote, stopRes.SkippedNoStop, stopRes.SkippedTPlus1, stopRes.SkippedAlreadyQueued)
+	}
+
 	// 4. 加载待撮合订单（SELL 优先，其次 BUY；组内按创建时间正序，保证可回放）
 	pending, err := b.loadPendingOrders(tradeDate)
 	if err != nil {
@@ -499,6 +511,13 @@ func (b *MockBroker) fillSell(ord model.Order, fillPrice float64) (FillResult, e
 		}
 		if newQty == 0 {
 			updates["cost_price"] = 0.0 // 清仓后成本归零
+			// Step 6：清仓复位风控线，防止残留止损影响未来同代码重新建仓的 ratchet 比较
+			updates["stop_price"] = 0.0
+			updates["stop_set_date"] = ""
+		} else if pos.StopPrice > 0 && ord.StopPrice > 0 && ord.StopPrice > pos.StopPrice {
+			// SELL 单若携带更高的新止损线（移动止盈场景）则上移；本系统 SELL 默认不带，no-op
+			updates["stop_price"] = ord.StopPrice
+			updates["stop_set_date"] = ord.TradeDate
 		}
 		if err := tx.Model(&model.Position{}).Where("id = ?", pos.ID).Updates(updates).Error; err != nil {
 			return fmt.Errorf("update position: %w", err)
@@ -533,6 +552,11 @@ func applyBuyToPosition(tx *gorm.DB, ord model.Order, fillPrice float64) error {
 			AvailableQuantity: 0, // T+1：当日买入不可卖
 			CostPrice:         fillPrice,
 			BuyDate:           ord.TradeDate,
+			// Step 6：建仓即写入实际风控线（PlaceOrders 透传 effective_stop）。
+			// StopSetDate=成交归属日：T 日建仓的仓，止损监控从 T+1 日起生效
+			// （判据 StopSetDate < checkDate），天然满足 T+1「当日买入不可卖」。
+			StopPrice:   ord.StopPrice,
+			StopSetDate: stopSetDateOf(ord),
 		}
 		if err := tx.Create(&pos).Error; err != nil {
 			return fmt.Errorf("create position for %s: %w", ord.Code, err)
@@ -553,10 +577,25 @@ func applyBuyToPosition(tx *gorm.DB, ord model.Order, fillPrice float64) error {
 		"cost_price": newCost,
 		"buy_date":   ord.TradeDate,
 	}
+	// Step 6 加仓风控线：只升不降（ratchet）。新单带有效止损且高于旧线才覆盖——
+	// 结构推进后止损上移是 Phase A 语义；新单无止损（人工/历史链路）则保留旧线。
+	if ord.StopPrice > 0 && ord.StopPrice > pos.StopPrice {
+		updates["stop_price"] = ord.StopPrice
+		updates["stop_set_date"] = stopSetDateOf(ord)
+	}
 	if err := tx.Model(&model.Position{}).Where("id = ?", pos.ID).Updates(updates).Error; err != nil {
 		return fmt.Errorf("update position on buy: %w", err)
 	}
 	return nil
+}
+
+// stopSetDateOf BUY 单的止损设定日期 = 订单归属交易日（成交解锁日为其次一交易日，
+// 监控判据 StopSetDate < checkDate 保证建仓当日绝不触发止损卖出）。
+func stopSetDateOf(ord model.Order) string {
+	if ord.StopPrice <= 0 {
+		return "" // 未设置风控线的持仓不留设定日期，避免误导审计
+	}
+	return ord.TradeDate
 }
 
 // settleBuyCash 买入成交后的资金结算（事务内调用）。

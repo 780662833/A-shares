@@ -61,13 +61,23 @@ type czscZS struct {
 	BiCount  int     `json:"bi_count"`
 }
 
+// CzscSignal 一个买/卖点信号（导出别名：供 graph 包在候选池 JSON 降级解析时使用，
+// 统一执行计划 Step 5 —— SaveDecision 回填止损契约字段）。
+type CzscSignal = czscSignal
+
 // czscSignal 一个买/卖点信号。
+// Phase A（Step 1 契约）扩展止损字段：stop_loss / invalidation / effective_stop /
+// pullback_low，供 Go 端 Layer3 仓位计算与持仓止损监控使用；旧网关响应缺省时为 0。
 type czscSignal struct {
-	Type    string  `json:"type"`     // 1B/2B/3B 或 1S/2S/3S
-	NameCn  string  `json:"name_cn"`  // 中文名，如 "第三类买点"
-	Price   float64 `json:"price"`
-	Dt      string  `json:"dt"`
-	Reason  string  `json:"reason"`
+	Type          string  `json:"type"`           // 1B/2B/3B 或 1S/2S/3S
+	NameCn        string  `json:"name_cn"`        // 中文名，如 "第三类买点"
+	Price         float64 `json:"price"`
+	Dt            string  `json:"dt"`
+	Reason        string  `json:"reason"`
+	PullbackLow   float64 `json:"pullback_low"`   // 回抽笔低点
+	StopLoss      float64 `json:"stop_loss"`      // 价格止损 = 回抽低点 × 0.99
+	Invalidation  float64 `json:"invalidation"`   // 结构失效线 = 最近中枢 ZG（null→0）
+	EffectiveStop float64 `json:"effective_stop"` // 实际风控线 = max(stop_loss, invalidation)
 }
 
 // czscGatewayData 网关 data 字段。

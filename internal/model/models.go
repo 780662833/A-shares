@@ -194,6 +194,16 @@ type AIDecisionLog struct {
 	Reason          string `gorm:"type:text" json:"reason"`                                          // AI 给出的排雷/买入理由
 	ConfidenceScore int    `gorm:"type:integer;not null;default:0" json:"confidence_score"`          // 0-100 信心分数
 
+	// --- Layer3 风控字段（统一执行计划 Step 5，决策 #1/#2）---
+	// 止损契约：stop_loss=回抽低点×0.99、invalidation=中枢ZG结构失效线、
+	// effective_stop=max(前两者)。由 SaveDecision 从候选池 czsc 信号回填。
+	PullbackLow    float64 `gorm:"type:real;not null;default:0" json:"pullback_low"`    // 买点确认笔(回抽)低点
+	StopLoss       float64 `gorm:"type:real;not null;default:0" json:"stop_loss"`       // 价格止损线
+	Invalidation   float64 `gorm:"type:real;not null;default:0" json:"invalidation"`    // 结构失效线(ZG)，0=无中枢参照
+	EffectiveStop  float64 `gorm:"type:real;not null;default:0" json:"effective_stop"`  // 实际风控线 = max(stop_loss, invalidation)
+	ComputedQty    int64   `gorm:"type:integer;not null;default:0" json:"computed_qty"` // Layer3 风险预算硬编码股数（LLM 无权输出数量）
+	RiskRejectNote string  `gorm:"type:varchar(255)" json:"risk_reject_note,omitempty"` // 仓位计算失败原因（降级 OBSERVE 留痕）
+
 	CreatedAt time.Time `json:"created_at"`
 }
 
@@ -265,6 +275,14 @@ type Position struct {
 	CostPrice         float64 `gorm:"type:real;not null;default:0" json:"cost_price"`            // 摊薄成本价（纯成交均价口径）
 	BuyDate           string  `gorm:"type:varchar(10);not null" json:"buy_date"`                 // 最近一次建仓/加仓日期 "YYYY-MM-DD"
 
+	// --- 持仓止损监控（统一执行计划 Step 6，决策 #1）---
+	// StopPrice 实际风控线 = max(stop_loss, invalidation)，建仓时写入；
+	// 0 表示未设置（人工单/历史数据），监控器跳过并告警。
+	StopPrice float64 `gorm:"type:real;not null;default:0" json:"stop_price"`
+	// StopSetDate 止损线设定日期；结转解锁判据用 StopSetDate < tradeDate，
+	// 不用 BuyDate —— 加仓会把 BuyDate 刷新为当日，但旧仓部分 T+1 早已解锁。
+	StopSetDate string `gorm:"type:varchar(10);not null;default:''" json:"stop_set_date"`
+
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
 }
@@ -325,6 +343,11 @@ type Order struct {
 	AvgPrice     float64 `gorm:"type:real;not null;default:0" json:"avg_price"`                                    // 成交均价（含滑点后）
 	Fee          float64 `gorm:"type:real;not null;default:0" json:"fee"`                                          // 总费用（佣金万2.5+印花税千0.5，印花税仅卖出）
 	RejectReason string  `gorm:"type:varchar(128)" json:"reject_reason,omitempty"`                                 // 废单原因
+
+	// --- Step 6：建仓止损线透传契约 ---
+	// StopPrice 由漏斗 PlaceOrders 节点写入（BUY 单的 effective_stop），
+	// MockBroker fillBuy 成交时据此落 Position.StopPrice；0=未设置。
+	StopPrice float64 `gorm:"type:real;not null;default:0" json:"stop_price"`
 
 	TradeDate string    `gorm:"type:varchar(10);not null;index:idx_order_code_date" json:"trade_date"` // 归属交易日
 	CreatedAt time.Time `gorm:"type:datetime;not null;autoCreateTime;index:idx_order_created" json:"created_at"`

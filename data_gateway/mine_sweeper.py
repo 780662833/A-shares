@@ -253,20 +253,125 @@ def check_symbol(
     }
 
 
+# ---------------------------------------------------------------------------
+# 基础过滤 base_filter (决策#4: 流动性三条件独立成层, ST 检查归并到此避免两处维护)
+#   Layer 0 技术粗筛前置闸门, 与财务四规则解耦:
+#   L1 日均成交额 >= min_avg_amount_yuan (默认 1 亿, 防滑点/出货难);
+#   L2 最新收盘价 >= min_price (默认 1.0 元, 防面值退市风险股);
+#   L3 非 ST/风险警示 (原 mine_sweeper 规则1 归并至此, 单一维护点)。
+#   数据源复用 /api/daily_kline 同款链路 (_ak_hist_throttled) 与 stock_list 缓存,
+#   任何数据缺失一律放行 (宁可漏杀不可误杀)。
+# ---------------------------------------------------------------------------
+
+class BaseFilterConfig:
+    def __init__(
+        self,
+        min_avg_amount_yuan: float = 1e8,  # 近 N 日日均成交额下限 (元)
+        min_price: float = 1.0,            # 最新收盘价下限 (元)
+        avg_window_days: int = 20,         # 成交额均值窗口 (交易日)
+        exclude_st: bool = True,           # ST 归并点: base_filter 统一执行
+    ) -> None:
+        self.min_avg_amount_yuan = min_avg_amount_yuan
+        self.min_price = min_price
+        self.avg_window_days = avg_window_days
+        self.exclude_st = exclude_st
+
+
+BASE_FILTER_CFG = BaseFilterConfig()
+
+
+def base_filter_symbol(
+    symbol: str,
+    kline_df: Any,
+    name_map: Optional[Dict[str, str]] = None,
+    cfg: BaseFilterConfig = BASE_FILTER_CFG,
+) -> Dict[str, Any]:
+    """对单只股票执行基础过滤, 返回 {passed, reasons[], metrics}。
+
+    kline_df: AKShare 日线 DataFrame (含 收盘/成交额 列, 可为 None=缺数据放行)。
+    """
+    reasons: List[str] = []
+    metrics: Dict[str, Any] = {}
+
+    # 条件 3 (归并): ST / 风险警示 —— 从 check_symbol 规则1 迁移到 base_filter
+    if cfg.exclude_st:
+        st, name = is_st_or_risk(symbol, name_map)
+        if st:
+            reasons.append(f"风险警示股: {name}")
+
+    if kline_df is not None and len(kline_df) > 0:
+        try:
+            closes = pd.to_numeric(kline_df["收盘"], errors="coerce").dropna()
+            amounts = pd.to_numeric(kline_df["成交额"], errors="coerce").dropna()
+            if not closes.empty:
+                last_close = float(closes.iloc[-1])
+                metrics["last_close"] = round(last_close, 3)
+                if last_close < cfg.min_price:
+                    reasons.append(
+                        f"最新收盘价 {last_close:.2f} < {cfg.min_price} 元 (面值退市风险)")
+            if not amounts.empty:
+                avg_amt = float(amounts.tail(cfg.avg_window_days).mean())
+                metrics["avg_amount_yuan_20d"] = round(avg_amt, 0)
+                if avg_amt < cfg.min_avg_amount_yuan:
+                    reasons.append(
+                        f"{cfg.avg_window_days}日均成交额 {avg_amt/1e8:.2f}亿 "
+                        f"< {cfg.min_avg_amount_yuan/1e8:.0f}亿 (流动性不足)")
+        except Exception as exc:  # noqa: BLE001 - 解析失败不误杀
+            logger.warning("base_filter %s parse failed, pass: %s", symbol, exc)
+    else:
+        metrics["kline"] = "missing(pass-through)"
+
+    return {"symbol": symbol, "passed": len(reasons) == 0,
+            "reasons": reasons, "metrics": metrics}
+
+
 def sweep_symbols(
     symbols: List[str],
     name_map: Optional[Dict[str, str]] = None,
     cfg: MineConfig = DEFAULT_CFG,
+    kline_provider: Optional[Any] = None,
+    base_cfg: Optional[BaseFilterConfig] = None,
 ) -> Dict[str, List[Dict[str, Any]]]:
-    """批量排雷: 返回 {"clean": [...], "blocked": [...]}。单只异常默认放行。"""
+    """批量排雷: 返回 {"clean": [...], "blocked": [...]}。单只异常默认放行。
+
+    决策#4 集成点: 若提供 kline_provider(symbol)->日线 DataFrame, 则先跑
+    base_filter (流动性三条件+ST), 未过关者直接进入 blocked (layer="base"),
+    不再消耗财务接口配额; 通过者再走财务四规则 (layer="financial")。
+    kline_provider 为 None 时行为与旧版完全一致 (向后兼容)。
+    """
     clean: List[Dict[str, Any]] = []
     blocked: List[Dict[str, Any]] = []
     for s in symbols:
+        # ---- Layer 0: 基础过滤 (流动性 + ST 归并点) ----
+        if kline_provider is not None:
+            try:
+                kdf = kline_provider(s)
+            except Exception as exc:  # noqa: BLE001 - K线获取失败不误杀
+                logger.warning("base_filter %s kline fetch failed, pass: %s", s, exc)
+                kdf = None
+            try:
+                bf = base_filter_symbol(s, kdf, name_map=name_map,
+                                        cfg=base_cfg or BASE_FILTER_CFG)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("base_filter %s error, pass: %s", s, exc)
+                bf = {"passed": True, "reasons": []}
+            if not bf.get("passed"):
+                blocked.append({"symbol": s, "layer": "base",
+                                "reasons": bf.get("reasons", []),
+                                "metrics": bf.get("metrics", {})})
+                continue
+        # ---- Layer 1: 财务四规则 ----
         try:
             r = check_symbol(s, name_map=name_map, cfg=cfg)
         except Exception as exc:  # noqa: BLE001 - 排雷自身失败不误杀
             logger.warning("mine_sweep %s error, pass-through: %s", s, exc)
             r = {"symbol": s, "passed": True, "reasons": [],
                  "snapshot": {"source": "error"}}
-        (clean if r["passed"] else blocked).append(r)
+        if r["passed"]:
+            if kline_provider is not None:
+                r["layer"] = "clean"
+            clean.append(r)
+        else:
+            r["layer"] = "financial"
+            blocked.append(r)
     return {"clean": clean, "blocked": blocked}
