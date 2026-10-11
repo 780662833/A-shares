@@ -39,19 +39,19 @@ import (
 // ---------------------------------------------------------------------------
 
 const (
-	NodeFetchPool        = "FetchPool"
-	NodeFetchNews        = "FetchNews"
-	NodeManagerDecision  = "ManagerDecision"
-	NodeSaveDecision     = "SaveDecision"
+	NodeFetchPool       = "FetchPool"
+	NodeFetchNews       = "FetchNews"
+	NodeManagerDecision = "ManagerDecision"
+	NodeSaveDecision    = "SaveDecision"
 )
 
 const (
-	keyPool        = "candidate_pool"        // []qtool.ScreenPoolHit
-	keyPoolJSON    = "candidate_pool_json"   // string: 候选池序列化 JSON（喂 LLM）
-	keyNewsCtx     = "news_context"          // map[string]string: symbol -> 新闻 JSON
-	keyNewsCtxJSON = "news_context_json"     // string: 新闻上下文序列化 JSON（喂 LLM）
-	keyDecisions   = "ai_decisions"          // []agent.DecisionItem: LLM 最终决策
-	keyDecisionIDs = "ai_decision_log_ids"   // []uint64: 落库主键（审计用）
+	keyPool        = "candidate_pool"      // []qtool.ScreenPoolHit
+	keyPoolJSON    = "candidate_pool_json" // string: 候选池序列化 JSON（喂 LLM）
+	keyNewsCtx     = "news_context"        // map[string]string: symbol -> 新闻 JSON
+	keyNewsCtxJSON = "news_context_json"   // string: 新闻上下文序列化 JSON（喂 LLM）
+	keyDecisions   = "ai_decisions"        // []agent.DecisionItem: LLM 最终决策
+	keyDecisionIDs = "ai_decision_log_ids" // []uint64: 落库主键（审计用）
 )
 
 // ---------------------------------------------------------------------------
@@ -66,11 +66,11 @@ type FunnelInput struct {
 
 // FunnelConfig 构建漏斗 Graph 所需的全部依赖。
 type FunnelConfig struct {
-	ChatModel    model.BaseChatModel // LLM（eino-ext openai 兼容），必填
-	DB           *gorm.DB            // 已 AutoMigrate 的数据库句柄，必填
-	GatewayURL   string              // Python 数据网关地址，必填
-	MaxLLMRetry  int                 // 决策 JSON 解析失败时的重试次数，默认 1
-	NewsConcurrency int             // 新闻抓取并发上限，默认 5（防网关/数据源压力）
+	ChatModel       model.BaseChatModel // LLM（eino-ext openai 兼容），必填
+	DB              *gorm.DB            // 已 AutoMigrate 的数据库句柄，必填
+	GatewayURL      string              // Python 数据网关地址，必填
+	MaxLLMRetry     int                 // 决策 JSON 解析失败时的重试次数，默认 1
+	NewsConcurrency int                 // 新闻抓取并发上限，默认 5（防网关/数据源压力）
 }
 
 // BuildFunnelGraph 按 START -> FetchPool -> FetchNews -> ManagerDecision -> SaveDecision -> END
