@@ -161,14 +161,42 @@ func BuildFunnelGraph(ctx context.Context, cfg FunnelConfig) (compose.Runnable[F
 
 // screenPoolResult 是 ScreenPoolTool 返回值中本节点关心的部分。
 type screenPoolResult struct {
-	OK       bool   `json:"ok"`
-	Error    string `json:"error"`
-	TradeDate string `json:"trade_date"`
-	PoolSize int    `json:"pool_size"`
-	Pool     []qtool.ScreenPoolHit `json:"pool"`
+	OK        bool                  `json:"ok"`
+	Error     string                `json:"error"`
+	Message   string                `json:"status"` // 上游 code!=0 时的状态说明
+	TradeDate string                `json:"trade_date"`
+	PoolSize  int                   `json:"pool_size"`
+	Pool      []qtool.ScreenPoolHit `json:"pool"`
+}
+
+// poolSaver 抽象候选池落库动作，便于单元测试注入 fake（生产实现 gormCandidateSaver）。
+type poolSaver interface {
+	SaveCandidate(date string, hit qtool.ScreenPoolHit) error
+}
+
+// gormCandidateSaver 生产实现：upsert by (trade_date, code)，同日重跑覆盖旧记录。
+type gormCandidateSaver struct{ gdb *gorm.DB }
+
+func (sv gormCandidateSaver) SaveCandidate(date string, hit qtool.ScreenPoolHit) error {
+	row := dbmodel.CandidatePool{
+		TradeDate:      date,
+		Code:           hit.Symbol,
+		SignalType:     hit.SignalType,
+		CzscSummary:    hit.Summary,
+		ZsCount:        hit.ZsCount,
+		TrendDirection: hit.TrendDirection,
+	}
+	return sv.gdb.Where("trade_date = ? AND code = ?", date, hit.Symbol).
+		Assign(row).FirstOrCreate(&row).Error
 }
 
 func fetchPool(ctx context.Context, screenTool *qtool.ScreenPoolTool, gdb *gorm.DB, in FunnelInput) (map[string]any, error) {
+	return fetchPoolWith(ctx, screenTool, gormCandidateSaver{gdb}, in)
+}
+
+// fetchPoolWith 是 FetchPool 节点的可测试内核：外部依赖仅有 ScreenPoolTool(HTTP)
+// 与 poolSaver(落库)，均可在单测中以 httptest / fake saver 替换。
+func fetchPoolWith(ctx context.Context, screenTool *qtool.ScreenPoolTool, saver poolSaver, in FunnelInput) (map[string]any, error) {
 	in.TradeDate = strings.TrimSpace(in.TradeDate)
 	if _, err := time.Parse("2006-01-02", in.TradeDate); err != nil {
 		return nil, fmt.Errorf("fetch_pool: invalid trade_date %q, expect YYYY-MM-DD", in.TradeDate)
@@ -190,19 +218,16 @@ func fetchPool(ctx context.Context, screenTool *qtool.ScreenPoolTool, gdb *gorm.
 	if !res.OK {
 		return nil, fmt.Errorf("fetch_pool: screening failed: %s", res.Error)
 	}
+	// 粗筛零入选视为硬失败: 空池继续跑只会让下游 Manager 空转 LLM,
+	// 直接中断流水线并把原因返回给调用方(API/调度器可感知降级)。
+	if len(res.Pool) == 0 {
+		return nil, fmt.Errorf("fetch_pool: empty pool after screening (date=%s scanned=%d status=%s)",
+			in.TradeDate, len(symbols), res.Message)
+	}
 
 	// 候选池落库（同日重跑覆盖旧记录：upsert by (trade_date, code)）
 	for _, hit := range res.Pool {
-		row := dbmodel.CandidatePool{
-			TradeDate:      in.TradeDate,
-			Code:           hit.Symbol,
-			SignalType:     hit.SignalType,
-			CzscSummary:    hit.Summary,
-			ZsCount:        hit.ZsCount,
-			TrendDirection: hit.TrendDirection,
-		}
-		if err := gdb.Where("trade_date = ? AND code = ?", in.TradeDate, hit.Symbol).
-			Assign(row).FirstOrCreate(&row).Error; err != nil {
+		if err := saver.SaveCandidate(in.TradeDate, hit); err != nil {
 			log.Printf("fetch_pool: WARN upsert candidate %s failed: %v", hit.Symbol, err)
 		}
 	}

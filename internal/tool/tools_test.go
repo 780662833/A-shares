@@ -315,3 +315,222 @@ func TestMockTradingTool_OrderIDUniqueUnderConcurrency(t *testing.T) {
 		seen[id] = true
 	}
 }
+
+// ---------------------------------------------------------------------------
+// T4.x ScreenPoolTool 单元测试（httptest 模拟网关 POST /api/czsc/screen_pool）
+// ---------------------------------------------------------------------------
+
+// fakeScreenGateway 返回一个固定候选池的假网关，并记录收到的请求体供断言。
+func fakeScreenGateway(t *testing.T, captured *string) *httptest.Server {
+t.Helper()
+return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+if r.URL.Path != "/api/czsc/screen_pool" || r.Method != http.MethodPost {
+w.WriteHeader(http.StatusNotFound)
+return
+}
+buf := make([]byte, 1<<20)
+n, _ := r.Body.Read(buf)
+if captured != nil {
+*captured = string(buf[:n])
+}
+w.Header().Set("Content-Type", "application/json")
+fmt.Fprint(w, `{
+"code": 0, "message": "success",
+"data": {
+"trade_date": "2026-10-11", "period": "daily", "window": "20250401~20261011",
+"total_requested": 3, "total_scanned": 3, "pool_size": 2, "blocked_size": 1,
+"pool": [
+{"symbol":"600519","signal_type":"3B","zs_count":2,"bi_count":15,
+ "trend_direction":"up","summary":"出现第三类买点"},
+{"symbol":"300750","signal_type":"Observation","zs_count":3,"bi_count":20,
+ "trend_direction":"up","summary":"3个中枢且趋势向上"}
+],
+"blocked": [
+{"symbol":"000001","signal_type":"3B","zs_count":2,"bi_count":12,
+ "trend_direction":"up","summary":"技术面通过但被排雷拦截",
+ "blocked_reasons":["资产负债率过高"]}
+],
+"errors": [{"symbol":"688981","error":"insufficient_data"}]
+}}`)
+}))
+}
+
+func newScreenTool(t *testing.T, url string) *ScreenPoolTool {
+t.Helper()
+tool, err := NewScreenPoolTool(ScreenPoolConfig{GatewayBaseURL: url})
+if err != nil {
+t.Fatalf("NewScreenPoolTool: %v", err)
+}
+return tool
+}
+
+func TestScreenPoolTool_Info(t *testing.T) { // T4.1 schema 元数据
+st := newScreenTool(t, "http://127.0.0.1:1") // 不实际发起请求
+info, err := st.Info(context.Background())
+if err != nil {
+t.Fatalf("Info: %v", err)
+}
+if info.Name != "screen_czsc_pool" {
+t.Errorf("name=%q", info.Name)
+}
+// 通过序列化后的 JSON Schema 断言参数存在（不同 eino 版本 ParamsOneOf 内部 API 有差异）
+js, err := info.ParamsOneOf.ToJSONSchema()
+if err != nil {
+t.Fatalf("ToJSONSchema: %v", err)
+}
+b, err := json.Marshal(js)
+if err != nil {
+t.Fatalf("marshal schema: %v", err)
+}
+if !strings.Contains(string(b), "\"symbols\"") {
+t.Errorf("schema missing required param 'symbols': %s", b)
+}
+}
+
+func TestScreenPoolTool_BadConfig(t *testing.T) { // T4.2 配置校验
+if _, err := NewScreenPoolTool(ScreenPoolConfig{}); err == nil {
+t.Error("empty GatewayBaseURL should fail")
+}
+if _, err := NewScreenPoolTool(ScreenPoolConfig{GatewayBaseURL: "127.0.0.1:8000"}); err == nil {
+t.Error("missing http:// scheme should fail")
+}
+}
+
+func TestScreenPoolTool_NormalInvoke(t *testing.T) { // T4.3 正常调用透传候选池
+var got string
+srv := fakeScreenGateway(t, &got)
+defer srv.Close()
+
+st := newScreenTool(t, srv.URL)
+raw, err := st.InvokableRun(context.Background(),
+`{"symbols":["600519","300750","000001"],"start_date":"2025-04-01","end_date":"2026-10-11"}`)
+if err != nil {
+t.Fatalf("InvokableRun err: %v", err)
+}
+var out struct {
+OK       bool   `json:"ok"`
+PoolSize int    `json:"pool_size"`
+Summary  string `json:"summary"`
+Pool     []struct {
+Symbol     string `json:"symbol"`
+SignalType string `json:"signal_type"`
+} `json:"pool"`
+Blocked []struct {
+Symbol         string   `json:"symbol"`
+BlockedReasons []string `json:"blocked_reasons"`
+} `json:"blocked"`
+}
+if err := json.Unmarshal([]byte(raw), &out); err != nil {
+t.Fatalf("decode result: %v raw=%.300s", err, raw)
+}
+if !out.OK || out.PoolSize != 2 || len(out.Pool) != 2 {
+t.Fatalf("unexpected pool passthrough: %+v", out)
+}
+if out.Pool[0].Symbol != "600519" || out.Pool[0].SignalType != "3B" {
+t.Errorf("pool[0]=%+v", out.Pool[0])
+}
+if len(out.Blocked) != 1 || out.Blocked[0].Symbol != "000001" ||
+len(out.Blocked[0].BlockedReasons) == 0 {
+t.Errorf("blocked not passed through: %+v", out.Blocked)
+}
+if !strings.Contains(out.Summary, "2 只通过缠论粗筛") || !strings.Contains(out.Summary, "1 只被财务排雷") {
+t.Errorf("summary=%q", out.Summary)
+}
+// 日期规范化: YYYY-MM-DD -> YYYYMMDD 传给网关
+if !strings.Contains(got, `"start_date":"20250401"`) || !strings.Contains(got, `"end_date":"20261011"`) {
+t.Errorf("date not normalized in request body: %s", got)
+}
+}
+
+func TestScreenPoolTool_OptionalFlagsPassthrough(t *testing.T) { // T4.4 cache_only/mine_sweep/edge_check/drop_negative_edge 透传
+var got string
+srv := fakeScreenGateway(t, &got)
+defer srv.Close()
+
+st := newScreenTool(t, srv.URL)
+yes, no := true, false
+in := ScreenPoolInput{
+Symbols:          []string{"600519"},
+CacheOnly:        &yes,
+MineSweep:        &no,
+EdgeCheck:        &yes,
+DropNegativeEdge: &yes,
+}
+args, _ := json.Marshal(in)
+if _, err := st.InvokableRun(context.Background(), string(args)); err != nil {
+t.Fatal(err)
+}
+for _, key := range []string{`"cache_only":true`, `"mine_sweep":false`, `"edge_check":true`, `"drop_negative_edge":true`} {
+if !strings.Contains(got, key) {
+t.Errorf("request body missing %s: %s", key, got)
+}
+}
+// 未设置开关时不应写入 body（保留网关默认值语义）
+got = ""
+if _, err := st.InvokableRun(context.Background(), `{"symbols":["600519"]}`); err != nil {
+t.Fatal(err)
+}
+for _, key := range []string{"cache_only", "edge_check", "drop_negative_edge"} {
+if strings.Contains(got, key) {
+t.Errorf("unset flag %q should be omitted, body=%s", key, got)
+}
+}
+}
+
+func TestScreenPoolTool_InvalidArgs(t *testing.T) { // T4.5 参数校验软失败
+st := newScreenTool(t, "http://127.0.0.1:1")
+cases := map[string]string{
+"bad json":       `{oops`,
+"empty symbols":  `{"symbols":[]}`,
+"invalid symbol": `{"symbols":["SH60051"]}`,
+"bad period":     `{"symbols":["600519"],"period":"15min"}`,
+}
+for name, args := range cases {
+raw, err := st.InvokableRun(context.Background(), args)
+if err != nil {
+t.Fatalf("%s: go error should be nil (soft-fail contract): %v", name, err)
+}
+var out struct {
+OK    bool   `json:"ok"`
+Error string `json:"error"`
+}
+if err := json.Unmarshal([]byte(raw), &out); err != nil {
+t.Fatalf("%s decode: %v", name, err)
+}
+if out.OK || out.Error == "" {
+t.Errorf("%s: expect ok=false with error msg, got %s", name, raw)
+}
+}
+}
+
+func TestScreenPoolTool_GatewayDown(t *testing.T) { // T4.6 网关宕机 -> 软失败不 panic
+srv := fakeScreenGateway(t, nil)
+url := srv.URL
+srv.Close() // 立即关闭模拟宕机
+
+st := newScreenTool(t, url)
+raw, err := st.InvokableRun(context.Background(), `{"symbols":["600519"]}`)
+if err != nil {
+t.Fatalf("must soft-fail, got go error: %v", err)
+}
+if !strings.Contains(raw, `"ok":false`) || !strings.Contains(raw, "unreachable") {
+t.Errorf("raw=%.200s", raw)
+}
+}
+
+func TestScreenPoolTool_GatewayHTTP500(t *testing.T) { // T4.7 上游 500 -> 契约与 MarketDataTool 一致
+srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+w.WriteHeader(http.StatusInternalServerError)
+fmt.Fprint(w, `{"detail":"internal error"}`)
+}))
+defer srv.Close()
+
+st := newScreenTool(t, srv.URL)
+raw, err := st.InvokableRun(context.Background(), `{"symbols":["600519"]}`)
+if err != nil {
+t.Fatalf("soft-fail expected: %v", err)
+}
+if !strings.Contains(raw, `"ok":false`) || !strings.Contains(raw, "HTTP 500") {
+t.Errorf("raw=%.200s", raw)
+}
+}
