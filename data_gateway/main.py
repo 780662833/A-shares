@@ -988,6 +988,21 @@ def _match_screen_rule(result: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
     if signal_type is None:
         return None
+
+    # Phase A: 提取命中信号的结构化风控字段, 供 Go Layer3 风险预算仓位计算。
+    # 取与 signal_type 匹配的第一个点（buys[0]/sells[0]）; Observation 无锚点则为 0。
+    ref_price, stop_loss, invalidation, confirmed_at = 0.0, 0.0, 0.0, ""
+    anchor = None
+    if buys and signal_type == buys[0]["type"]:
+        anchor = buys[0]
+    elif sells and signal_type == sells[0]["type"]:
+        anchor = sells[0]
+    if anchor is not None:
+        ref_price = float(anchor.get("price", 0) or 0)
+        stop_loss = float(anchor.get("stop_loss", 0) or 0)
+        invalidation = float(anchor.get("invalidation_line", 0) or 0)
+        confirmed_at = str(anchor.get("confirmed_at", "") or "")
+
     return {
         "symbol": result["symbol"],
         "signal_type": signal_type,
@@ -997,6 +1012,11 @@ def _match_screen_rule(result: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         "bi_count": structures.get("bi_count", 0),
         "trend_direction": (structures.get("last_bi") or {}).get("direction", "unknown"),
         "summary": result.get("summary", ""),
+        # ---- Phase A 增强字段（Go ScreenPoolHit 契约）----
+        "ref_price": ref_price,          # 信号参考价（预估买价口径）
+        "stop_loss": stop_loss,          # 价格止损线（回抽低点×0.99）
+        "invalidation_line": invalidation,  # 结构失效线（三买=ZG）
+        "confirmed_at": confirmed_at,    # 消前视确认时间 YYYY-MM-DD
     }
 
 

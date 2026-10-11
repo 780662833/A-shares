@@ -68,6 +68,13 @@ type ScreenPoolHit struct {
 	BiCount        int          `json:"bi_count"`
 	TrendDirection string       `json:"trend_direction"`
 	Summary        string       `json:"summary"`
+
+	// ---- Phase A: 命中信号的结构化风控字段（顶层透传, 供 Layer3 仓位计算）----
+	RefPrice         float64 `json:"ref_price"`          // 信号参考价（预估买价口径）
+	StopLoss         float64 `json:"stop_loss"`          // 价格止损线（回抽低点×0.99）
+	InvalidationLine float64 `json:"invalidation_line"`  // 结构失效线（三买=中枢ZG）
+	ConfirmedAt      string  `json:"confirmed_at"`       // 消前视确认时间 YYYY-MM-DD
+
 	// BlockedReasons 财务排雷/负期望拦截理由（出现在 blocked 列表中的记录）。
 	BlockedReasons []string `json:"blocked_reasons,omitempty"`
 	// Edge vectorbt 正期望检验结论（edge_check=true 时附加）。

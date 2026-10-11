@@ -62,12 +62,21 @@ type czscZS struct {
 }
 
 // czscSignal 一个买/卖点信号。
+//
+// Phase A（Step1 买点结构化增强）：每个买卖点附带双止损线与消前视确认时间。
+// 三个新字段均为指针语义的零值兼容设计——旧版网关不返回时保持 0/空串，
+// Go 端 risk.StopPlan 会把 0 视为"该线缺失"并自动降级到另一条线。
 type czscSignal struct {
 	Type    string  `json:"type"`     // 1B/2B/3B 或 1S/2S/3S
 	NameCn  string  `json:"name_cn"`  // 中文名，如 "第三类买点"
 	Price   float64 `json:"price"`
 	Dt      string  `json:"dt"`
 	Reason  string  `json:"reason"`
+
+	// ---- Phase A 增强字段（来自 Python czsc_engine 的结构化输出）----
+	StopLoss         float64 `json:"stop_loss"`          // 价格止损线（回抽低点×0.99；卖点时为反弹高点×1.01）
+	InvalidationLine float64 `json:"invalidation_line"`  // 结构失效线（三买=中枢ZG / 三卖=中枢ZD）
+	ConfirmedAt      string  `json:"confirmed_at"`       // 信号确认时间（笔末端+1根K线, ISO 格式），消除前视偏差
 }
 
 // czscGatewayData 网关 data 字段。

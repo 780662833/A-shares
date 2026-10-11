@@ -185,6 +185,14 @@ func (sv gormCandidateSaver) SaveCandidate(date string, hit qtool.ScreenPoolHit)
 		CzscSummary:    hit.Summary,
 		ZsCount:        hit.ZsCount,
 		TrendDirection: hit.TrendDirection,
+		// Phase A: 结构化风控字段落库（0/零值时间 = 上游未给出该线）
+		RefPrice:         hit.RefPrice,
+		InvalidationLine: hit.InvalidationLine,
+		PriceStopLine:    hit.StopLoss,
+	}
+	if ct, err := time.Parse("2006-01-02", hit.ConfirmedAt); err == nil {
+		row.ConfirmedAt = ct
+		row.HasConfirmedAt = true
 	}
 	return sv.gdb.Where("trade_date = ? AND code = ?", date, hit.Symbol).
 		Assign(row).FirstOrCreate(&row).Error

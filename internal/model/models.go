@@ -135,6 +135,9 @@ func IsValidSignalType(s string) bool {
 // 由 15:30 流水线调用 Python 网关 POST /api/czsc/screen_pool 后写入；
 // Layer2 的 Eino Master Agent 读取当日记录进行新闻排雷与精选。
 // (TradeDate, Code) 唯一：同日重跑流水线时覆盖旧记录而非重复插入。
+//
+// Phase A（Step 1）结构化增强字段：买点附带的双止损线，供 Layer3 风险预算仓位计算。
+// 均可为 0，表示上游未给出该线（如 Observation 信号无结构止损）。
 type CandidatePool struct {
 	ID        uint64 `gorm:"primaryKey;autoIncrement" json:"id"`
 	TradeDate string `gorm:"type:varchar(10);not null;uniqueIndex:uk_pool_date_code" json:"trade_date"` // "YYYY-MM-DD", 哪一天筛选出的
@@ -144,6 +147,13 @@ type CandidatePool struct {
 	CzscSummary    string `gorm:"type:text" json:"czsc_summary"`                                      // czsc 自然语言摘要, 直接可喂 LLM
 	ZsCount        int    `gorm:"type:integer;not null;default:0" json:"zs_count"`                    // 中枢数量
 	TrendDirection string `gorm:"type:varchar(8);not null" json:"trend_direction"`                    // up/down/unknown
+
+	// ---- Phase A: 买点结构化增强（来自 screen_pool 命中的 buy_points[0]）----
+	RefPrice         float64   `gorm:"type:real;not null;default:0" json:"ref_price"`           // 信号参考价（买点笔端点价，作预估买价）
+	InvalidationLine float64   `gorm:"type:real;not null;default:0" json:"invalidation_line"`   // 结构失效线（三买=中枢 ZG）
+	PriceStopLine    float64   `gorm:"type:real;not null;default:0" json:"price_stop_line"`     // 价格止损线（回抽低点×0.99）
+	ConfirmedAt      time.Time `gorm:"type:datetime" json:"confirmed_at"`                       // 信号确认时间（笔末端+1根K线，消前视）
+	HasConfirmedAt   bool      `gorm:"-" json:"has_confirmed_at,omitempty"`                      // 非持久化：标记上游是否给出合法 confirmed_at
 
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
@@ -185,6 +195,9 @@ func NormalizeAction(a string) (string, error) {
 // AIDecisionLog Eino Master Agent 对每只候选股的最终决策留痕。
 //
 // ConfidenceScore 约定 0-100：<60 的 BUY 建议会被风控层降级为观察。
+//
+// Phase B（Step 2）Layer3 回写：RiskCheckAndSize/PlaceOrders 节点把仓位计算结果
+// 与订单号回填到同一行，使「AI 决策 → 风控股数 → 实际订单」三段链路一表可查。
 type AIDecisionLog struct {
 	ID        uint64 `gorm:"primaryKey;autoIncrement" json:"id"`
 	TradeDate string `gorm:"type:varchar(10);not null;index:idx_decision_date_code" json:"trade_date"`
@@ -193,6 +206,13 @@ type AIDecisionLog struct {
 	Action          string `gorm:"type:varchar(8);not null;index:idx_decision_action" json:"action"` // BUY/SELL/DROP
 	Reason          string `gorm:"type:text" json:"reason"`                                          // AI 给出的排雷/买入理由
 	ConfidenceScore int    `gorm:"type:integer;not null;default:0" json:"confidence_score"`          // 0-100 信心分数
+
+	// ---- Phase B: Layer3 风险预算仓位回写（saveDecision 时为 0, RiskCheckAndSize 更新）----
+	Quantity       int64   `gorm:"type:integer;not null;default:0" json:"quantity"`           // 风控核定的委托股数（BUY 才有）
+	StopLossPrice  float64 `gorm:"type:real;not null;default:0" json:"stop_loss_price"`       // 实际采用的止损线
+	StopSource     string  `gorm:"type:varchar(16);not null;default:''" json:"stop_source"`   // invalidation / price_stop / ''
+	OrderID        string  `gorm:"type:varchar(32);not null;default:''" json:"order_id"`      // 生成的 PENDING 订单号（空=未下单）
+	RiskRejectNote string  `gorm:"type:text" json:"risk_reject_note,omitempty"`               // 风控拒单原因（若有）
 
 	CreatedAt time.Time `json:"created_at"`
 }

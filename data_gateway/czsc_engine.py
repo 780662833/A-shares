@@ -36,6 +36,9 @@ _PERIOD_TO_FREQ: Dict[str, Freq] = {
 _UP = "向上"
 _DOWN = "向下"
 
+# Phase A: 价格止损缓冲比例（回抽低点再下移 1% 触发, 防盘中毛刺）
+PRICE_STOP_BUFFER = 0.01
+
 
 def _first_present(row: pd.Series, *keys: str) -> Any:
     """按优先级返回第一个存在且非空的列值, 兼容中英文列名。"""
@@ -105,13 +108,82 @@ def _zs_dict(zs) -> Dict[str, Any]:
     }
 
 
-def _detect_buy_sell_points(c: CZSC) -> Dict[str, List[Dict[str, Any]]]:
+def _confirmed_at(bi, bars: list) -> str:
+    """信号确认时间 = 笔末端之后第一根 K 线的日期（消除前视偏差）。
+
+    缠论的一笔要等其末端之后再走出后续走势才被"确认"，若直接用笔末端日
+    期作为可交易时点即构成 look-ahead。本函数返回末端后第 1 根原始 K 线
+    的日期；末端已是最后一根 K 线时返回末端日 +1 自然日（近似下一交易日，
+    Go/回测侧只用作"最早可执行时间"下限，不做精确交易日对齐）。
+    """
+    edt = bi.edt
+    nxt = None
+    for b in reversed(bars):
+        if b.dt > edt:
+            nxt = b
+            break
+    if nxt is not None:
+        return f"{nxt.dt:%Y-%m-%d}"
+    from datetime import timedelta
+    return f"{edt + timedelta(days=1):%Y-%m-%d}"
+
+
+def _enrich_points(points: List[Dict[str, Any]], c: CZSC, bars: list) -> List[Dict[str, Any]]:
+    """Phase A: 为每个买卖点补充 stop_loss / invalidation_line / confirmed_at。
+
+    双止损线语义（与 Go 端 internal/risk.StopPlan 契约一致）：
+      - stop_loss(价格止损线): 买点=回调笔低点×0.99; 卖点=反弹笔高点×1.01
+      - invalidation_line(结构失效线): 3B=中枢ZG / 3S=中枢ZD /
+        1B,2B=前一上涨笔高点(跌破则转折假设死亡) / 1S,2S=前一下跌笔低点
+      - confirmed_at: 笔末端+1根K线, 消前视
+    Observation 等无结构锚的信号保持 0（Go 端按"该线缺失"降级处理）。
+    """
+    if not points:
+        return points
+    bis = c.bi_list
+    zss = c.zs_list
+    last = bis[-1]
+    prev2 = bis[-3] if len(bis) >= 3 else None
+    zs = zss[-1] if zss else None
+
+    for p in points:
+        ptype = p.get("type", "")
+        # ---- 价格止损线 ----
+        if ptype.endswith("B"):
+            p["stop_loss"] = round(float(last.low) * (1 - PRICE_STOP_BUFFER), 3)
+        elif ptype.endswith("S"):
+            p["stop_loss"] = round(float(last.high) * (1 + PRICE_STOP_BUFFER), 3)
+        else:
+            p["stop_loss"] = 0.0
+
+        # ---- 结构失效线 ----
+        if ptype == "3B" and zs is not None:
+            p["invalidation_line"] = round(float(zs.zg), 3)
+        elif ptype == "3S" and zs is not None:
+            p["invalidation_line"] = round(float(zs.zd), 3)
+        elif ptype in ("1B", "2B") and prev2 is not None:
+            p["invalidation_line"] = round(float(prev2.high), 3)
+        elif ptype in ("1S", "2S") and prev2 is not None:
+            p["invalidation_line"] = round(float(prev2.low), 3)
+        else:
+            p["invalidation_line"] = 0.0
+
+        # ---- 确认时间（消前视）----
+        p["confirmed_at"] = _confirmed_at(last, bars)
+
+    return points
+
+
+def _detect_buy_sell_points(c: CZSC, bars: Optional[list] = None) -> Dict[str, List[Dict[str, Any]]]:
     """结构驱动的三类买卖点识别 (简化但符合缠论定义):
 
     一买 (1B): 下跌趋势中, 最后一笔向下且相对前一同向笔出现背驰 (力度衰减);
     二买 (2B): 一买确认后回调笔不创新低;
     三买 (3B): 向上离开中枢后, 向下回调笔的低点仍高于中枢上沿 ZG;
     对称地给出 1S/2S/3S 卖点。
+
+    Phase A: 传入 bars(原始K线序列) 时, 每个信号额外附带
+    stop_loss / invalidation_line / confirmed_at 三个结构化风控字段。
     """
     buys: List[Dict[str, Any]] = []
     sells: List[Dict[str, Any]] = []
@@ -188,6 +260,11 @@ def _detect_buy_sell_points(c: CZSC) -> Dict[str, List[Dict[str, Any]]]:
             "reason": "一卖后的首次反弹未创新高, 次级别确认压力",
         })
 
+    # ---- Phase A: 结构化风控字段增强（stop_loss / invalidation_line / confirmed_at）----
+    if bars is not None and bis:
+        _enrich_points(buys, c, bars)
+        _enrich_points(sells, c, bars)
+
     return {"buy_points": buys, "sell_points": sells}
 
 
@@ -249,7 +326,7 @@ def analyze_czsc(bars: List[RawBar], max_recent_bars: int = 500) -> Dict[str, An
         "last_zs": _zs_dict(last_zs) if last_zs else None,
         "ubi_fenxing": str(c.ubi_fxs[-1].mark) if c.ubi_fxs else None,  # 未完成笔的最新分型 (顶/底分型)
     }
-    signals = _detect_buy_sell_points(c)
+    signals = _detect_buy_sell_points(c, bars)
     result: Dict[str, Any] = {
         "symbol": bars[0].symbol,
         "freq": c.freq.value if hasattr(c.freq, "value") else str(c.freq),
