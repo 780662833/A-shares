@@ -1,0 +1,12 @@
+# A股数据网关依赖清单 (Python 3.9 - 3.11)
+# 安装: pip install -r requirements.txt
+
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0
+akshare>=1.14.0
+baostock>=0.8.8
+pandas>=1.5.0
+requests>=2.31.0
+czsc>=1.0.0
+numpy>=1.24.0
+vectorbt>=0.26.0
