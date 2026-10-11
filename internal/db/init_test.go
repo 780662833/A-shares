@@ -307,6 +307,110 @@ func TestCandidatePool_SignalTypeValidation(t *testing.T) {
 	}
 }
 
+// TestCandidatePool_GetAll 验证"获取所有股票候选池内容"的读取路径：
+// 写入多日多信号数据后，用 Find 全表扫描，检查行数、字段完整性、排序与空表语义。
+func TestCandidatePool_GetAll(t *testing.T) {
+	gdb, _ := openTempDB(t)
+
+	// --- 空表时 GetAll 应返回空切片而非报错 ---
+	var empty []model.CandidatePool
+	if err := gdb.Order("trade_date, code").Find(&empty).Error; err != nil {
+		t.Fatalf("find on empty table: %v", err)
+	}
+	if len(empty) != 0 {
+		t.Fatalf("fresh table should return 0 rows, got %d", len(empty))
+	}
+
+	// --- 写入跨两日、多种信号类型的 6 条记录 ---
+	seed := []model.CandidatePool{
+		{TradeDate: "2026-10-10", Code: "600519", SignalType: model.SignalBuy3, CzscSummary: "回踩中枢上沿不破", ZsCount: 3, TrendDirection: "up"},
+		{TradeDate: "2026-10-10", Code: "300750", SignalType: model.SignalObservation, CzscSummary: "两中枢向上", ZsCount: 2, TrendDirection: "up"},
+		{TradeDate: "2026-10-10", Code: "000001", SignalType: model.SignalSell1, CzscSummary: "疑似顶背驰", ZsCount: 4, TrendDirection: "down"},
+		{TradeDate: "2026-10-11", Code: "600519", SignalType: model.SignalBuy2, CzscSummary: "第二类买点确认", ZsCount: 3, TrendDirection: "up"},
+		{TradeDate: "2026-10-11", Code: "688111", SignalType: model.SignalBuy1, CzscSummary: "", ZsCount: 5, TrendDirection: "unknown"},
+		{TradeDate: "2026-10-11", Code: "002594", SignalType: model.SignalSell3, CzscSummary: "跌破中枢下沿", ZsCount: 2, TrendDirection: "down"},
+	}
+	for i := range seed {
+		if err := gdb.Create(&seed[i]).Error; err != nil {
+			t.Fatalf("seed candidate %d (%s,%s): %v", i, seed[i].TradeDate, seed[i].Code, err)
+		}
+	}
+
+	// --- 获取所有候选池内容（生产读取方式：Find 全表 + 日期/代码排序）---
+	var all []model.CandidatePool
+	if err := gdb.Order("trade_date ASC, code ASC").Find(&all).Error; err != nil {
+		t.Fatalf("get all candidates: %v", err)
+	}
+	if len(all) != len(seed) {
+		t.Fatalf("expect %d rows in total, got %d", len(seed), len(all))
+	}
+
+	// --- 行数一致性交叉验证：Count 与 Find 结果长度相等 ---
+	var cnt int64
+	if err := gdb.Model(&model.CandidatePool{}).Count(&cnt).Error; err != nil {
+		t.Fatalf("count all candidates: %v", err)
+	}
+	if cnt != int64(len(all)) {
+		t.Fatalf("Count=%d disagrees with Find len=%d", cnt, len(all))
+	}
+
+	// --- 排序正确性：字典序 (trade_date, code) 应为
+	// 10-10: 000001, 300750, 600519; 10-11: 002594, 600519, 688111 ---
+	wantOrder := [][2]string{
+		{"2026-10-10", "000001"}, {"2026-10-10", "300750"}, {"2026-10-10", "600519"},
+		{"2026-10-11", "002594"}, {"2026-10-11", "600519"}, {"2026-10-11", "688111"},
+	}
+	for i, w := range wantOrder {
+		if all[i].TradeDate != w[0] || all[i].Code != w[1] {
+			t.Errorf("row %d: got (%s,%s), want (%s,%s)", i,
+				all[i].TradeDate, all[i].Code, w[0], w[1])
+		}
+	}
+
+	// --- 字段完整性：每条记录的信号类型合法、时间戳自动填充、与种子数据一致 ---
+	seedByKey := map[string]model.CandidatePool{}
+	for _, s := range seed {
+		seedByKey[s.TradeDate+"|"+s.Code] = s
+	}
+	for _, row := range all {
+		key := row.TradeDate + "|" + row.Code
+		s, ok := seedByKey[key]
+		if !ok {
+			t.Errorf("unexpected row returned by GetAll: %s", key)
+			continue
+		}
+		if !model.IsValidSignalType(row.SignalType) {
+			t.Errorf("%s: invalid signal_type %q in DB", key, row.SignalType)
+		}
+		if row.SignalType != s.SignalType || row.ZsCount != s.ZsCount ||
+			row.TrendDirection != s.TrendDirection || row.CzscSummary != s.CzscSummary {
+			t.Errorf("%s: field round-trip mismatch: got %+v, want %+v", key, row, s)
+		}
+		if row.ID == 0 || row.CreatedAt.IsZero() || row.UpdatedAt.IsZero() {
+			t.Errorf("%s: ID/timestamps not auto-filled: %+v", key, row)
+		}
+		delete(seedByKey, key) // 消费掉，防止重复返回
+	}
+	if len(seedByKey) != 0 {
+		t.Errorf("GetAll missed seeded rows: %v", seedByKey)
+	}
+
+	// --- 按最新交易日过滤读取（Layer2 Agent 的典型用法），不应混入旧日期 ---
+	var latest []model.CandidatePool
+	if err := gdb.Where("trade_date = ?", "2026-10-11").
+		Order("code ASC").Find(&latest).Error; err != nil {
+		t.Fatalf("query latest day pool: %v", err)
+	}
+	if len(latest) != 3 {
+		t.Fatalf("expect 3 rows for 2026-10-11, got %d", len(latest))
+	}
+	for _, r := range latest {
+		if r.TradeDate != "2026-10-11" {
+			t.Errorf("latest-day query leaked other date: %+v", r)
+		}
+	}
+}
+
 // TestCalcLimitPrices_Boards 覆盖主板/创业板/科创板的涨跌停计算与取整。
 func TestCalcLimitPrices_Boards(t *testing.T) {
 	cases := []struct {
