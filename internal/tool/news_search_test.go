@@ -4,8 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -17,6 +21,8 @@ import (
 //   - mockNewsFor       Mock 数据确定性生成
 //   - NewNewsSearchTool 构造参数校验
 //   - InvokableRun      入参校验 / 网关成功 / 网关降级 Mock（httptest 模拟 Python 网关）
+//   - TestNewsRealDataSource 真实新闻数据源集成测试（AKShare 东财 stock_news_em，
+//     默认 skip，需显式开启：ASHARE_NEWS_REAL_TEST=1 go test -run TestNewsRealDataSource ./internal/tool/ -v）
 // ---------------------------------------------------------------------------
 
 func TestClassifySentiment(t *testing.T) {
@@ -332,5 +338,196 @@ func TestNewsToolInfo(t *testing.T) {
 	}
 	if lim.Type != "integer" {
 		t.Fatalf("limit type = %q, want integer", lim.Type)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// TestNewsRealDataSource 真实新闻数据源集成测试
+//
+// 目的：验证 NewsSearchTool 对接「真实」Python 网关 /api/news（底层为 AKShare
+// 东方财富 stock_news_em 实时数据，非 httptest 假响应、非 Mock）时的端到端行为。
+//
+// 因依赖外网且上游接口有偶发限流，默认 skip，不影响常规 CI。开启方式：
+//   ASHARE_NEWS_REAL_TEST=1 go test -run TestNewsRealDataSource ./internal/tool/ -v
+//
+// 可选环境变量：
+//   ASHARE_NEWS_GATEWAY_URL  自定义网关地址（须已实现 GET /api/news?symbol=&limit=）；
+//                            未设置时本测试会自动拉起本地 Python 真实源网关
+//                            （data_gateway/news.py + uvicorn，需 python3/akshare/fastapi）。
+//   ASHARE_NEWS_SYMBOL       指定测试股票代码，默认 600519（贵州茅台，新闻覆盖率高）。
+// ---------------------------------------------------------------------------
+
+func TestNewsRealDataSource(t *testing.T) {
+	if os.Getenv("ASHARE_NEWS_REAL_TEST") != "1" {
+		t.Skip("真实新闻数据源集成测试默认跳过（需外网+AKShare），设置 ASHARE_NEWS_REAL_TEST=1 开启")
+	}
+
+	symbol := os.Getenv("ASHARE_NEWS_SYMBOL")
+	if symbol == "" {
+		symbol = "600519" // 贵州茅台：东财新闻覆盖稳定
+	}
+
+	baseURL := os.Getenv("ASHARE_NEWS_GATEWAY_URL")
+	if baseURL == "" {
+		baseURL = startRealNewsGateway(t) // 自动拉起本地真实源网关
+	}
+
+	toolInst, err := NewNewsSearchTool(NewsSearchConfig{
+		GatewayBaseURL: baseURL,
+		HTTPTimeout:    60 * time.Second, // 真实源经 AKShare 回源东财，首拉可能较慢
+	})
+	if err != nil {
+		t.Fatalf("NewNewsSearchTool: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	raw, runErr := toolInst.InvokableRun(ctx, fmt.Sprintf(`{"symbol":%q,"limit":5}`, symbol))
+	if runErr != nil {
+		t.Fatalf("InvokableRun returned go error (should never happen): %v", runErr)
+	}
+	t.Logf("真实源耗时 %v, 原始返回前 200 字节: %.200s", time.Since(start), raw)
+
+	var out struct {
+		OK            bool       `json:"ok"`
+		Symbol        string     `json:"symbol"`
+		Source        string     `json:"source"`
+		NewsCount     int        `json:"news_count"`
+		NegativeCount int        `json:"negative_count"`
+		RedFlagCount  int        `json:"red_flag_count"`
+		News          []NewsItem `json:"news"`
+		Summary       string     `json:"summary"`
+	}
+	if err := json.Unmarshal([]byte(raw), &out); err != nil {
+		t.Fatalf("decode result: %v", err)
+	}
+
+	// ---- 核心断言：必须命中真实网关而非 Mock 降级 ----
+	if !out.OK {
+		t.Fatalf("real gateway run should be ok=true, got: %.300s", raw)
+	}
+	if out.Source != "gateway" {
+		t.Fatalf("source = %q, want \"gateway\"（真实源不可用时请检查网络/AKShare, 不允许静默用 mock 通过本测试）", out.Source)
+	}
+	if out.Symbol != symbol {
+		t.Fatalf("symbol = %q, want %q", out.Symbol, symbol)
+	}
+	if out.NewsCount == 0 || len(out.News) != out.NewsCount {
+		t.Fatalf("news_count = %d, len(news) = %d, 真实源应返回 >0 条且一致", out.NewsCount, len(out.News))
+	}
+	if out.NewsCount > 5 {
+		t.Fatalf("news_count = %d, 请求 limit=5 不应超量", out.NewsCount)
+	}
+
+	// ---- 真实数据质量断言 ----
+	for i, it := range out.News {
+		if strings.TrimSpace(it.Title) == "" {
+			t.Errorf("news[%d].title 为空, 不符合真实新闻结构", i)
+		}
+		if it.Source == "Mock" {
+			t.Errorf("news[%d].source=Mock, 混入了 mock 数据", i)
+		}
+		switch it.Sentiment {
+		case "positive", "negative", "neutral":
+		default:
+			t.Errorf("news[%d].sentiment=%q 非法", i, it.Sentiment)
+		}
+		// 情绪标签与关键词表一致性（工具契约：negative 必标红雷）
+		if it.Sentiment == "negative" && !it.RedFlag {
+			gotSent, gotFlag := classifySentiment(it.Title, it.Summary)
+			if gotSent == "negative" && gotFlag {
+				t.Errorf("news[%d] negative 但未标 red_flag", i)
+			}
+		}
+	}
+	neg, flags := 0, 0
+	for _, it := range out.News {
+		if it.Sentiment == "negative" {
+			neg++
+		}
+		if it.RedFlag {
+			flags++
+		}
+	}
+	if neg != out.NegativeCount || flags != out.RedFlagCount {
+		t.Errorf("统计不一致: negative %d/%d, red_flag %d/%d", neg, out.NegativeCount, flags, out.RedFlagCount)
+	}
+	if !strings.Contains(out.Summary, symbol) {
+		t.Errorf("summary 应包含代码 %q: %q", symbol, out.Summary)
+	}
+	t.Logf("✅ 真实源返回 %d 条新闻（负面 %d / 硬雷 %d），首条: %s [%s]",
+		out.NewsCount, neg, flags, out.News[0].Title, out.News[0].Source)
+}
+
+// startRealNewsGateway 启动本地 Python 真实新闻源网关子进程（uvicorn + data_gateway/news.py），
+// 轮询 /api/news 直到就绪或超时；测试结束自动回收进程。
+func startRealNewsGateway(t *testing.T) string {
+	t.Helper()
+	port := fmt.Sprintf("%d", 18300+os.Getpid()%400)
+	base := "http://127.0.0.1:" + port
+
+	script := `
+import sys
+sys.path.insert(0, "data_gateway")
+from fastapi import FastAPI, Query, HTTPException
+import news as news_mod
+app = FastAPI()
+@app.get("/api/news")
+def get_news(symbol: str = Query(...), limit: int = Query(5)):
+    if len(symbol) != 6 or not symbol.isdigit():
+        raise HTTPException(status_code=400, detail="bad symbol")
+    r = news_mod.get_stock_news(symbol, limit=limit, include_notice=False)
+    if "error" in r:
+        raise HTTPException(status_code=400, detail=r["error"])
+    return {"code": 0, "message": "success", "symbol": symbol, "data": r}
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="127.0.0.1", port=int(sys.argv[1]), log_level="warning")
+`
+	cmd := exec.Command("python3", "-c", script, port)
+	cmd.Dir = repoRoot(t)
+	cmd.Stdout = os.Stderr
+	cmd.Stderr = os.Stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("启动真实源网关失败（需要 python3 + akshare + fastapi + uvicorn）: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = cmd.Process.Kill()
+		_, _ = cmd.Process.Wait()
+	})
+
+	client := &http.Client{Timeout: 3 * time.Second}
+	deadline := time.Now().Add(60 * time.Second)
+	for time.Now().Before(deadline) {
+		resp, err := client.Get(base + "/api/news?symbol=000001&limit=1")
+		if err == nil {
+			_, _ = io.Copy(io.Discard, resp.Body)
+			_ = resp.Body.Close()
+			return base // 服务已就绪（无论业务码，能应答即可开始正式用例）
+		}
+		time.Sleep(time.Second)
+	}
+	t.Fatal("真实源网关 60s 内未就绪，请确认本机可访问东财新闻接口")
+	return ""
+}
+
+// repoRoot 从当前测试工作目录向上找 go.mod 所在目录，保证子进程相对路径 data_gateway 可用。
+func repoRoot(t *testing.T) string {
+	t.Helper()
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for d := wd; ; {
+		if _, err := os.Stat(filepath.Join(d, "go.mod")); err == nil {
+			return d
+		}
+		parent := filepath.Dir(d)
+		if parent == d {
+			t.Fatal("go.mod not found above test dir")
+		}
+		d = parent
 	}
 }
