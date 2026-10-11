@@ -579,24 +579,71 @@ class ScreenPoolRequest(BaseModel):
     )
 
 
-def _fetch_czsc_result(symbol: str, period: str, start_date: str, end_date: str) -> Dict[str, Any]:
-    """全量拉取单只股票的前复权K线并执行 czsc 分析 (缓存未命中时的回源路径)。"""
-    df: pd.DataFrame = _retry_call(
-        lambda: ak.stock_zh_a_hist(
-            symbol=symbol,
-            period=period,
-            start_date=start_date,
-            end_date=end_date,
-            adjust="qfq",   # 前复权, 保证跨除权日的笔/中枢不被价格跳空打断
-        )
+# ---------------------------------------------------------------------------
+# 防弹衣数据获取层: 本地 SQLite 行情缓存 + BaoStock(主)/AKShare(备) 多源降级
+#   - 日线每天收盘后只变一次: 当日 15:30 后已落库的数据直接读 local_cache.db;
+#   - 主源 BaoStock 失败自动切备用源 AKShare; 双源全挂返回旧缓存并打 stale 标记。
+# ---------------------------------------------------------------------------
+from data_fetcher import LocalKlineCache, _bs_daily_df, get_daily_kline_safe  # noqa: E402
+
+_kline_cache = LocalKlineCache()
+
+
+def _bs_query_daily(symbol: str, start_date: str, end_date: str) -> pd.DataFrame:
+    """BaoStock 主源查询 (带全局会话锁与断线自动重登), 输出中文列 DataFrame。"""
+    with _bs_lock:
+        _bs_ensure_login()
+        try:
+            return _bs_daily_df(bs, symbol, start_date, end_date)
+        except Exception as exc:  # noqa: BLE001 - 会话失效则重登重试一次
+            logger.warning("baostock 查询异常, 尝试重新登录后重试: %s", exc)
+            _bs_logout_quietly()
+            _bs_ensure_login()
+            return _bs_daily_df(bs, symbol, start_date, end_date)
+
+
+def _ak_hist_daily(symbol: str, period: str, start_date: str, end_date: str) -> pd.DataFrame:
+    """AKShare 备用源: 仅 daily 周期可无缝替换 (周/月线仍走原接口)。"""
+    _throttle()
+    return ak.stock_zh_a_hist(
+        symbol=symbol, period=period,
+        start_date=start_date, end_date=end_date,
+        adjust="qfq",   # 前复权, 保证跨除权日的笔/中枢不被价格跳空打断
     )
+
+
+def _fetch_kline_df(symbol: str, period: str, start_date: str, end_date: str) -> tuple:
+    """防弹衣取数入口: 返回 (df, meta)。非 daily 周期不启用本地行情缓存。"""
+    if period != "daily":
+        df = _retry_call(lambda: _ak_hist_daily(symbol, period, start_date, end_date))
+        return df, {"source": "akshare_live", "is_stale_data": False}
+    res = get_daily_kline_safe(
+        symbol, start_date, end_date,
+        cache=_kline_cache,
+        bs_query=lambda s, a, b: _bs_query_daily(s, a, b),
+        ak_hist=lambda s, p, a, b: _ak_hist_daily(s, p, a, b),
+        retry_call=_retry_call,
+    )
+    return res.get("df"), {k: v for k, v in res.items() if k != "df"}
+
+
+def _fetch_czsc_result(symbol: str, period: str, start_date: str, end_date: str) -> Dict[str, Any]:
+    """全量拉取单只股票的前复权K线并执行 czsc 分析 (缓存未命中时的回源路径)。
+
+    数据链路 (防弹衣): local_cache.db 新鲜命中 -> BaoStock(主) -> AKShare(备)
+    -> 旧缓存兜底 (is_stale_data=True)。
+    """
+    df, meta = _fetch_kline_df(symbol, period, start_date, end_date)
     if df is None or df.empty:
-        return {"error": "no_data"}
+        return {"error": meta.get("error", "no_data")}
     bars = akshare_to_czsc_bars(df, symbol=symbol, period=period)
     result = analyze_czsc(bars)
     if "error" not in result:
         last_dt = str(df.iloc[-1]["日期"] if "日期" in df.columns else df.iloc[-1, 0])[:10]
         result["window_end"] = last_dt.replace("-", "")
+        result["data_source"] = meta.get("source", "unknown")
+        if meta.get("is_stale_data"):
+            result["is_stale_data"] = True
     return result
 
 

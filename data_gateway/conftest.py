@@ -94,6 +94,7 @@ def gateway_client(monkeypatch, tmp_path, hist_df):
     """返回 (TestClient, calls) — calls 记录每次 ak.stock_zh_a_hist 的参数。"""
     import akshare as ak
     import main as gw
+    from data_fetcher import LocalKlineCache as KlineCache
 
     # 磁盘缓存指向临时目录, 避免污染仓库且用例间隔离
     cache_dir = str(tmp_path / "czsc_cache")
@@ -116,6 +117,12 @@ def gateway_client(monkeypatch, tmp_path, hist_df):
         return df.reset_index(drop=True)
 
     monkeypatch.setattr(ak, "stock_zh_a_hist", fake_hist)
+    # 防弹衣层打桩: BaoStock 主源在沙箱不可用 -> 抛异常验证自动降级到 AKShare;
+    # 本地行情缓存指向临时文件, 避免污染仓库且用例间隔离。
+    def fake_bs_query(symbol, start_date, end_date):
+        raise RuntimeError("baostock unavailable in sandbox")
+    monkeypatch.setattr(gw, "_bs_query_daily", fake_bs_query)
+    monkeypatch.setattr(gw, "_kline_cache", KlineCache(db_path=str(tmp_path / "local_cache.db")))
     # 限速参数归零, 批量用例秒级完成 (令牌桶 + 逐股 sleep 全部关闭)
     monkeypatch.setattr(gw, "_SCREEN_SLEEP_SECONDS", 0.0)
     monkeypatch.setattr(gw, "_GLOBAL_MIN_INTERVAL", 0.0)
