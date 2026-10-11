@@ -54,6 +54,13 @@ class CzscResultCache:
         # 简单内存索引: key -> (mtime, payload)，避免每次请求都读磁盘
         self._mem: Dict[str, tuple] = {}
 
+    @staticmethod
+    def _now_iso() -> str:
+        """当前时间戳 (秒级 ISO)。抽成方法便于测试冻结时钟 —— put() 写入的
+        generated_at 与 main._cache_is_fresh 读取的 now() 必须同源, 否则跨模块
+        时钟不一致会让"当日新鲜"判定漂移 (test_cache_hit_zero_network 根因)。"""
+        return datetime.now().isoformat(timespec="seconds")
+
     # ------------------------------------------------------------------ path
     def _path(self, symbol: str, period: str) -> str:
         d = os.path.join(self.base_dir, "czsc", _safe_name(period))
@@ -113,7 +120,11 @@ class CzscResultCache:
             "period": _safe_name(period),
             "trade_date": _iso(window_end),
             "window_start": _iso(window_start),
-            "generated_at": datetime.now().isoformat(timespec="seconds"),
+            # 落盘窗口末端: get() 会把它回填到 entry["window_end"] 供新鲜度判定。
+            # 缺失该字段时 entry.window_end 恒为空 -> _cache_is_fresh 永远 False
+            # -> 每次请求都走增量/回源 (test_cache_hit_zero_network 的根因)。
+            "window_end": _iso(window_end),
+            "generated_at": self._now_iso(),
             "result": result,
         }
         tmp = f"{path}.tmp.{os.getpid()}.{int(time.time()*1000)}"

@@ -105,6 +105,29 @@ def _zs_dict(zs) -> Dict[str, Any]:
     }
 
 
+def _risk_fields(bi, zs) -> Dict[str, Any]:
+    """Phase A 止损价契约 (决策#1: invalidation 与 stop_loss 并存, 取较高者为实际风控线):
+
+    - invalidation (结构失效线): 最近中枢上沿 ZG —— 价格跌回 ZG 之下意味着
+      "向上离开中枢"的判定逻辑死亡 (V2.0 用 30 分钟中枢 ZG, Phase A 沿用日线 ZG)。
+    - stop_loss (价格止损线): 回抽低点 × 0.99 —— 以买点确认笔(回抽笔)的低点为基准,
+      留 1% 缓冲防插针。
+    - effective_stop: max(stop_loss, invalidation), 二者取较高者作为实际风控线。
+    """
+    low = round(float(bi.low), 3)
+    stop_loss = round(low * 0.99, 3)
+    invalidation = round(float(zs.zg), 3) if zs is not None else None
+    effective = stop_loss
+    if invalidation is not None and invalidation > effective:
+        effective = invalidation
+    return {
+        "pullback_low": low,        # 回抽低点 (买点确认笔的极值)
+        "stop_loss": stop_loss,     # 价格止损 = 回抽低点 × 0.99
+        "invalidation": invalidation,  # 结构失效线 = 最近中枢 ZG (无中枢时 None)
+        "effective_stop": effective,   # 实际风控线 = max(stop_loss, invalidation)
+    }
+
+
 def _detect_buy_sell_points(c: CZSC) -> Dict[str, List[Dict[str, Any]]]:
     """结构驱动的三类买卖点识别 (简化但符合缠论定义):
 
@@ -112,6 +135,9 @@ def _detect_buy_sell_points(c: CZSC) -> Dict[str, List[Dict[str, Any]]]:
     二买 (2B): 一买确认后回调笔不创新低;
     三买 (3B): 向上离开中枢后, 向下回调笔的低点仍高于中枢上沿 ZG;
     对称地给出 1S/2S/3S 卖点。
+
+    Phase A 扩展字段: 每个买卖点附带 pullback_low / stop_loss / invalidation /
+    effective_stop (见 _risk_fields), 供 Go 端仓位计算与持仓止损监控使用。
     """
     buys: List[Dict[str, Any]] = []
     sells: List[Dict[str, Any]] = []
@@ -134,6 +160,7 @@ def _detect_buy_sell_points(c: CZSC) -> Dict[str, List[Dict[str, Any]]]:
                 "price": round(float(last.low), 3),
                 "dt": last.edt.strftime("%Y-%m-%d"),
                 "reason": f"向下回调笔低点 {last.low:.2f} 高于最近中枢上沿 ZG={zs.zg:.2f}, 上涨动能确认",
+                **_risk_fields(last, zs),
             })
         if last_dir == _UP and last.high < zs.zd:
             sells.append({
@@ -142,6 +169,7 @@ def _detect_buy_sell_points(c: CZSC) -> Dict[str, List[Dict[str, Any]]]:
                 "price": round(float(last.high), 3),
                 "dt": last.edt.strftime("%Y-%m-%d"),
                 "reason": f"向上反弹笔高点 {last.high:.2f} 低于最近中枢下沿 ZD={zs.zd:.2f}, 下跌动能确认",
+                **_risk_fields(last, zs),
             })
 
     # --- 一买 / 一卖: 相邻同向笔的力度背驰 (power_price 衰减近似 MACD 面积背驰) ---
@@ -156,6 +184,7 @@ def _detect_buy_sell_points(c: CZSC) -> Dict[str, List[Dict[str, Any]]]:
                 "price": round(float(last.low), 3),
                 "dt": last.edt.strftime("%Y-%m-%d"),
                 "reason": f"下跌笔力度 {p_last:.2f} 不足前一下跌笔 {p_prev2:.2f} 的80%, 且创出新低, 存在底背驰",
+                **_risk_fields(last, zss[-1] if zss else None),
             })
         if last_dir == _UP and prev2.direction.value == _UP and p_last < p_prev2 * 0.8 \
                 and last.high >= prev2.high:
@@ -165,6 +194,7 @@ def _detect_buy_sell_points(c: CZSC) -> Dict[str, List[Dict[str, Any]]]:
                 "price": round(float(last.high), 3),
                 "dt": last.edt.strftime("%Y-%m-%d"),
                 "reason": f"上涨笔力度 {p_last:.2f} 不足前一上涨笔 {p_prev2:.2f} 的80%, 且创出新高, 存在顶背驰",
+                **_risk_fields(last, zss[-1] if zss else None),
             })
 
     # --- 二买 / 二卖: 一买/一卖确认后, 首次回调(反弹)笔不创新低(高) ---
@@ -177,6 +207,7 @@ def _detect_buy_sell_points(c: CZSC) -> Dict[str, List[Dict[str, Any]]]:
             "price": round(float(last.low), 3),
             "dt": last.edt.strftime("%Y-%m-%d"),
             "reason": "一买后的首次回调未创新低, 次级别确认支撑",
+            **_risk_fields(last, zss[-1] if zss else None),
         })
     if any(s["type"] == "1S" for s in sells) and prev_dir == _DOWN and last_dir == _UP \
             and last.high < prev2.high:
@@ -186,6 +217,7 @@ def _detect_buy_sell_points(c: CZSC) -> Dict[str, List[Dict[str, Any]]]:
             "price": round(float(last.high), 3),
             "dt": last.edt.strftime("%Y-%m-%d"),
             "reason": "一卖后的首次反弹未创新高, 次级别确认压力",
+            **_risk_fields(last, zss[-1] if zss else None),
         })
 
     return {"buy_points": buys, "sell_points": sells}

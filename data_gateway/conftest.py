@@ -122,7 +122,62 @@ def gateway_client(monkeypatch, tmp_path, hist_df):
     def fake_bs_query(symbol, start_date, end_date):
         raise RuntimeError("baostock unavailable in sandbox")
     monkeypatch.setattr(gw, "_bs_query_daily", fake_bs_query)
-    monkeypatch.setattr(gw, "_kline_cache", KlineCache(db_path=str(tmp_path / "local_cache.db")))
+    kline_cache = KlineCache(db_path=str(tmp_path / "local_cache.db"))
+    monkeypatch.setattr(gw, "_kline_cache", kline_cache)
+
+    # 磁盘缓存 + 行情缓存的"新鲜"判定都依赖 now(); 把整个夹具的运行时刻冻结到
+    # 合成数据终点 (2026-10-09 收盘后), 使缓存命中/强制回源的语义在任何真实
+    # 运行日期下都确定成立 —— 否则沙箱时钟越过数据终点后, coverage_for_request
+    # 永远判 partial, use_cache=false 的"强制回源"会退化成行情缓存命中 (零网络)。
+    _frozen_dt = datetime(2026, 10, 9, 16, 0, 0)
+
+    class _MockDatetime:
+        """datetime 类替身: now/today 返回固定时刻, 其余属性透传真实 datetime 类。"""
+
+        @classmethod
+        def strptime(cls, s, fmt):
+            return datetime.strptime(s, fmt)
+
+        @classmethod
+        def fromisoformat(cls, s):
+            return datetime.fromisoformat(s)
+
+        def __call__(self, *args, **kwargs):
+            return datetime(*args, **kwargs)
+
+        def now(self, tz=None):
+            return _frozen_dt
+
+        def today(self):
+            return _frozen_dt
+
+        def __getattr__(self, name):
+            # date.combine / timedelta 等静态成员兜底透传, 避免逐个补桩遗漏
+            return getattr(datetime, name)
+
+    mock_dt = _MockDatetime()
+    import data_fetcher as dfm
+
+    # 重试等待归零 (沙箱无外网, baostock 桩必然失败 -> 降级路径秒级完成)
+    def _no_wait_retry(fn, attempts=3, backoff=0.0):
+        last_exc = None
+        for _ in range(attempts):
+            try:
+                return fn()
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+        raise last_exc
+    monkeypatch.setattr(gw, "_retry_call", _no_wait_retry)
+    # 行情缓存新鲜度时钟: data_fetcher 内部统一经 _now() 取当前时间
+    monkeypatch.setattr(dfm, "_now", lambda: _frozen_dt)
+    # czsc 磁盘缓存新鲜度时钟: main._cache_is_fresh 使用模块级 datetime.now()
+    monkeypatch.setattr(gw, "datetime", mock_dt, raising=False)
+    # mine_sweeper / czsc_backtest 各自持有独立的 datetime 引用, 同样需要冻结时钟,
+    # 否则 _MockDatetime 缺方法或真实时钟越过合成数据终点会导致缓存判定漂移。
+    import mine_sweeper as ms_mod
+    import czsc_backtest as bt_mod
+    monkeypatch.setattr(ms_mod, "datetime", mock_dt, raising=False)
+    monkeypatch.setattr(bt_mod, "datetime", mock_dt, raising=False)
     # 限速参数归零, 批量用例秒级完成 (令牌桶 + 逐股 sleep 全部关闭)
     monkeypatch.setattr(gw, "_SCREEN_SLEEP_SECONDS", 0.0)
     monkeypatch.setattr(gw, "_GLOBAL_MIN_INTERVAL", 0.0)
