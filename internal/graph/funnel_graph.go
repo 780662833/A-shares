@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -46,12 +47,13 @@ const (
 )
 
 const (
-	keyPool        = "candidate_pool"      // []qtool.ScreenPoolHit
-	keyPoolJSON    = "candidate_pool_json" // string: 候选池序列化 JSON（喂 LLM）
-	keyNewsCtx     = "news_context"        // map[string]string: symbol -> 新闻 JSON
-	keyNewsCtxJSON = "news_context_json"   // string: 新闻上下文序列化 JSON（喂 LLM）
-	keyDecisions   = "ai_decisions"        // []agent.DecisionItem: LLM 最终决策
-	keyDecisionIDs = "ai_decision_log_ids" // []uint64: 落库主键（审计用）
+	keyPool               = "candidate_pool"      // []qtool.ScreenPoolHit
+	keyPoolJSON           = "candidate_pool_json" // string: 候选池序列化 JSON（喂 LLM）
+	keyNewsCtx            = "news_context"        // map[string]string: symbol -> 新闻 JSON
+	keyNewsCtxJSON        = "news_context_json"   // string: 新闻上下文序列化 JSON（喂 LLM）
+	keyDecisions          = "ai_decisions"        // []agent.DecisionItem: LLM 最终决策
+	keyDecisionIDs        = "ai_decision_log_ids" // []uint64: 落库主键（审计用）
+	keyDecisionViolations = "decision_violations" // []string: Manager 决策服务端校验违规说明
 )
 
 // ---------------------------------------------------------------------------
@@ -122,7 +124,7 @@ func BuildFunnelGraph(ctx context.Context, cfg FunnelConfig) (compose.Runnable[F
 	// ---- Node 3: ManagerDecision（LLM 排雷精选）----
 	if err := g.AddLambdaNode(NodeManagerDecision, compose.InvokableLambda(
 		func(ctx context.Context, state map[string]any) (map[string]any, error) {
-			return managerDecision(ctx, state, cfg.ChatModel, cfg.MaxLLMRetry)
+			return managerDecisionWithPositions(ctx, state, cfg.ChatModel, cfg.MaxLLMRetry, cfg.DB)
 		})); err != nil {
 		return nil, fmt.Errorf("funnel_graph: add ManagerDecision: %w", err)
 	}
@@ -318,12 +320,50 @@ func fetchNews(ctx context.Context, state map[string]any, newsTool *qtool.NewsSe
 // ---------------------------------------------------------------------------
 
 func managerDecision(ctx context.Context, state map[string]any, cm model.BaseChatModel, maxRetry int) (map[string]any, error) {
+	return managerDecisionWithPositions(ctx, state, cm, maxRetry, nil)
+}
+
+// loadPositionSymbols 读取当前持仓（quantity>0）代码集合，供 Manager 的 SELL
+// 校验与 Prompt 上下文使用。DB 为 nil（单测注入场景）时返回空集合+nil error，
+// 语义等价"无持仓"——保守方向：SELL 会被降级为 DROP。
+func loadPositionSymbols(gdb *gorm.DB) (map[string]bool, []dbmodel.Position, error) {
+	if gdb == nil {
+		return map[string]bool{}, nil, nil
+	}
+	var rows []dbmodel.Position
+	if err := gdb.Where("quantity > 0").Find(&rows).Error; err != nil {
+		return nil, nil, fmt.Errorf("manager_decision: load positions: %w", err)
+	}
+	set := make(map[string]bool, len(rows))
+	for _, p := range rows {
+		set[p.Code] = true
+	}
+	return set, rows, nil
+}
+
+// managerDecisionWithPositions 是 ManagerDecision 的可测实现：
+//   - 持仓清单进入 User Prompt（杜绝 LLM 对无持仓股票生成 SELL 的幻觉前提）；
+//   - 解析后先 filterKnownSymbols 剔池外幻觉，再 agent.ValidateDecisions 做
+//     服务端完整性校验（重复/缺失留痕、无持仓 SELL 硬降级为 DROP）——
+//     这些检查由代码兜底，不依赖 LLM 遵守提示词。
+func managerDecisionWithPositions(ctx context.Context, state map[string]any, cm model.BaseChatModel, maxRetry int, gdb *gorm.DB) (map[string]any, error) {
 	tradeDate, _ := state[keyTradeDate].(string)
 	poolJSON, _ := state[keyPoolJSON].(string)
 	newsJSON, _ := state[keyNewsCtxJSON].(string)
 
+	heldSet, heldRows, err := loadPositionSymbols(gdb)
+	if err != nil {
+		return nil, err
+	}
+	positionsJSON := "[]"
+	if b, jerr := json.Marshal(heldRows); jerr == nil {
+		positionsJSON = string(b)
+	} else {
+		log.Printf("manager_decision: WARN marshal positions failed: %v", jerr)
+	}
+
 	system := schema.SystemMessage(agent.ManagerSystemPrompt)
-	user := schema.UserMessage(agent.BuildManagerPrompt(tradeDate, poolJSON, newsJSON))
+	user := schema.UserMessage(agent.BuildManagerPrompt(tradeDate, poolJSON, positionsJSON, newsJSON))
 	history := []*schema.Message{system, user}
 
 	var lastErr error
@@ -342,18 +382,50 @@ func managerDecision(ctx context.Context, state map[string]any, cm model.BaseCha
 		}
 		decisions, perr := agent.ParseDecisions(extractJSONCandidate(resp.Content))
 		if perr == nil {
-			// 校验 symbol 必须来自候选池（防止 LLM 幻觉出池外股票）
+			// 第一道闸：symbol 必须来自候选池（防止 LLM 幻觉出池外股票）
 			pool, _ := state[keyPool].([]qtool.ScreenPoolHit)
 			valid := filterKnownSymbols(decisions, pool)
+
+			// 第二道闸：服务端完整性校验（重复去重 / 无持仓 SELL 降级 DROP / 缺失留痕）。
+			// expected 传 nil：候选池允许被排雷层部分丢弃，"每只都必答"仅作软告警来源，
+			// 缺失项在此记录但不阻断（下游按已答项继续，未答=无决策=不下单，安全方向）。
+			expected := make(map[string]bool, len(pool))
+			for _, h := range pool {
+				expected[h.Symbol] = true
+			}
+			valid, violations := agent.ValidateDecisions(valid, nil, heldSet)
+			for _, miss := range missingCandidates(valid, expected) {
+				violations = append(violations, "missing decision for candidate "+miss)
+			}
 			state[keyDecisions] = valid
-			log.Printf("manager_decision: attempt=%d decisions=%d (dropped hallucinated=%d)",
-				attempt+1, len(valid), len(decisions)-len(valid))
+			state[keyDecisionViolations] = violations
+			log.Printf("manager_decision: attempt=%d decisions=%d violations=%d held_positions=%d",
+				attempt+1, len(valid), len(violations), len(heldSet))
+			for _, v := range violations {
+				log.Printf("manager_decision:   violation: %s", v)
+			}
 			return state, nil
 		}
 		lastErr = perr
 		log.Printf("manager_decision: attempt=%d parse failed: %v", attempt+1, perr)
 	}
 	return nil, fmt.Errorf("manager_decision: llm output unparseable after %d retries: %w", maxRetry, lastErr)
+}
+
+// missingCandidates 返回候选池中没有任何决策项的代码（排序保证可复现日志）。
+func missingCandidates(valid []agent.DecisionItem, expected map[string]bool) []string {
+	answered := make(map[string]bool, len(valid))
+	for _, it := range valid {
+		answered[it.Symbol] = true
+	}
+	var miss []string
+	for sym := range expected {
+		if !answered[sym] {
+			miss = append(miss, sym)
+		}
+	}
+	sort.Strings(miss)
+	return miss
 }
 
 // filterKnownSymbols 剔除候选池之外的幻觉 symbol。
@@ -377,15 +449,29 @@ func filterKnownSymbols(items []agent.DecisionItem, pool []qtool.ScreenPoolHit) 
 // Node 4: SaveDecision —— 决策落库 AIDecisionLog
 // ---------------------------------------------------------------------------
 
+// saveDecision 落库留痕。V2.0：BUY 决策入库前做服务端资格复核——候选池中
+// Observation（无明确买卖点）的股票不允许以 BUY 身份进入开仓链路（Prompt 只是
+// 软约束，这里代码兜底），命中则降级 DROP 并 WARN。
 func saveDecision(state map[string]any, gdb *gorm.DB) (map[string]any, error) {
 	tradeDate, _ := state[keyTradeDate].(string)
 	items, ok := state[keyDecisions].([]agent.DecisionItem)
 	if !ok {
 		return nil, errors.New("save_decision: missing ai_decisions in state")
 	}
+	pool, _ := state[keyPool].([]qtool.ScreenPoolHit)
+	observation := make(map[string]bool, len(pool))
+	for _, h := range pool {
+		if !isEntrySignal(h.SignalType) {
+			observation[h.Symbol] = true
+		}
+	}
 
 	ids := make([]uint64, 0, len(items))
 	for _, it := range items {
+		if it.Action == "BUY" && observation[it.Symbol] {
+			log.Printf("save_decision: WARN %s BUY downgraded to DROP (no confirmed entry signal in czsc pool)", it.Symbol)
+			it.Action = "DROP"
+		}
 		action, err := dbmodel.NormalizeAction(it.Action)
 		if err != nil { // ParseDecisions 已归一化，理论不可达；防御性跳过
 			log.Printf("save_decision: WARN skip invalid action %q for %s: %v", it.Action, it.Symbol, err)

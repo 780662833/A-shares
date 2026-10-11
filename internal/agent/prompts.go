@@ -1,76 +1,119 @@
 // Package agent 定义 Master Agent 的 System Prompt 与交易计划 JSON 契约。
 //
-// 设计原则：Prompt 中的每条硬约束（T+1 / 20% 单票 / 80% 总仓 / JSON 格式）
+// 设计原则：Prompt 中的每条硬约束（T+1 / 单票上限 / 总仓上限 / JSON 格式）
 // 在 graph.RiskCheck 节点都有对应的服务端代码复核 —— Prompt 约束是「软提示」，
 // 代码校验才是「硬风控」，二者缺一不可。
+//
+// V2.0 职责收敛（架构师裁决版）：
+//   - 技术结构判断（分型/笔/中枢/买卖点确认）统一归 czsc Python 网关，
+//     LLM 不再从原始 K 线自行推演 MA/量能等技术信号；
+//   - BUY 计划的 quantity 只是「意向量」，最终委托股数由 Layer3 风险预算
+//     （internal/risk.CalculatePosition，双止损线取较高者）接管重算；
+//   - 仓位比例常量单一来源为 internal/risk（Default*），本包通过 init() 派生
+//     Prompt 文本，杜绝两处口径漂移。
 package agent
 
 import (
 	"encoding/json"
 	"fmt"
 	"strings"
+
+	"ashare-quant/internal/risk"
 )
 
 // ---------------------------------------------------------------------------
-// 仓位硬约束常量（RiskCheck 节点与 Prompt 共用同一口径，防止两处漂移）
+// 仓位硬约束（派生自 internal/risk 单一事实来源，防止两处漂移）
 // ---------------------------------------------------------------------------
 
-const (
-	// MaxPositionRatioPerStock 单只股票市值占总资产上限：20%。
-	MaxPositionRatioPerStock = 0.20
-
-	// MaxTotalPositionRatio 全部持仓市值占总资产上限：80%。
-	MaxTotalPositionRatio = 0.80
+// maxPositionRatioPerStock / maxTotalPositionRatio 运行时从 risk 默认常量派生。
+var (
+	maxPositionRatioPerStock = risk.DefaultMaxPositionRatioPerStock
+	maxTotalPositionRatio    = risk.DefaultMaxTotalPositionRatio
 )
+
+// MaxPositionRatioPerStock 单只股票市值占总资产上限（当前 20%，源自 risk 包）。
+//
+// Deprecated: 请直接使用 risk.Config.MaxPositionRatioPerStock /
+// risk.DefaultMaxPositionRatioPerStock。保留此导出仅为兼容既有测试与旧引用，
+// 其值始终与 risk 默认常量一致（init 派生），不是独立配置项。
+func MaxPositionRatioPerStock() float64 { return maxPositionRatioPerStock }
+
+// MaxTotalPositionRatio 全部持仓市值占总资产上限（当前 80%，源自 risk 包）。
+//
+// Deprecated: 同 MaxPositionRatioPerStock。
+func MaxTotalPositionRatio() float64 { return maxTotalPositionRatio }
 
 // ---------------------------------------------------------------------------
 // System Prompt
 // ---------------------------------------------------------------------------
 
-// MasterSystemPrompt 是「A股日终复盘策略总监」的系统提示词。
-//
-// 输出契约（必须与 TradePlan 结构保持一致）：
-//
-//	{"action":"BUY|SELL","symbol":"6位代码","quantity":int,"price":float,"reason":"..."}
-//
-// 多笔计划以 JSON 数组输出；无操作时输出空数组 []。
-const MasterSystemPrompt = `你是"A股日终复盘策略总监"，负责每个交易日 15:30 收盘后对模拟盘进行复盘，并生成次一交易日的交易计划。
+// masterSystemPromptTemplate 是「A股日终复盘策略总监」系统提示词的模板。
+// 两个 %d 占位符依次为：单票仓位上限百分比、总仓位上限百分比 —— 由 init()
+// 从 internal/risk 默认常量渲染，确保 Prompt 与硬风控代码永远同一口径。
+const masterSystemPromptTemplate = `你是"A股日终复盘策略总监"，负责每个交易日 15:30 收盘后对模拟盘进行复盘，并生成次一交易日的交易计划。
 
-## 身份与目标
-- 你管理一个初始资金 100 万元的 A 股纯日线模拟账户，不接真实券商。
-- 目标：控制回撤优先，趋势跟随，不做日内博弈（系统只有日线数据与开盘撮合能力）。
+## 身份与职责边界
+- 你管理一个 A 股纯日线模拟账户，不接真实券商；目标是控制回撤优先、趋势跟随，不做日内博弈。
+- 技术面结论（分型/笔/中枢/买卖点/背驰）一律以输入的 czsc 缠论信号为准：signal_type 是网关规范化后的别名（1B/2B/3B 买点、1S/2S/3S 卖点、Observation 观察），confirmed_at 为消前视确认时间。你不得基于原始 K 线自行重新认定买卖点，也不得把 Observation 当作买点。
+- Manager 排雷层已完成基本面否决，其结论你不得推翻。
+- RiskCheck 是最终硬风控：BUY 的 quantity 只是意向量，实际委托股数由服务端按风险预算公式（单笔最大亏损 ÷ 每股止损距离，双止损线取较高者）重算，可能小于你的意向量甚至归零拒单。因此你只需给出方向、标的与理由，不必也不应试图通过数量绕过风控。
 
 ## 铁律（违反任何一条的计划将被服务端风控直接废弃）
-1. T+1 制度：当日买入的股票次日才能卖出。卖出数量绝不能超过持仓中的"可用数量"。
-2. 单票仓位上限：任一股票的持仓市值（含本次拟买入部分）不得超过账户总资产的 20%。
-3. 总仓位上限：全部持仓市值不得超过账户总资产的 80%，即始终保留至少 20% 现金。
-4. 买入数量必须是 100 的整数倍（一手 = 100 股）；卖出时若清仓可一次性全部卖出。
-5. 买入委托价参考最新收盘价，不得高于次日涨停价（主板 ±10%，创业板/科创板 ±20%）；
-   一字涨停板买单、一字跌停板卖单将无法成交。
+1. T+1 制度：当日买入的股票次日才能卖出。卖出数量绝不能超过持仓中的"可用数量"（available_quantity）。
+2. 单票仓位上限：任一股票的持仓市值（含本次拟买入部分）不得超过账户总资产的 %d%%。
+3. 总仓位上限：全部持仓市值不得超过账户总资产的 %d%%，即始终保留最低限度的现金。
+4. 买入数量必须是 100 的整数倍（一手 = 100 股）；卖出清仓时可一次性全部卖出（含不足一手的零股）。
+5. 委托价必须来自输入行情快照（reference_price / last_close），不得臆造次日开盘价或成交价。一字涨停板买单、一字跌停板卖单将无法成交。
 6. 只能使用输入数据中出现的事实做决策，禁止臆造行情、新闻或财务数据。
 
-## 分析框架（对每只候选股票依次评估）
-- 趋势：MA5/MA10/MA20 多头排列？收盘价相对 20 日高点位置？
-- 量能：近 5 日均量 vs 前 20 日均量，放量突破还是缩量阴跌？
-- 风险：距离涨跌停价的幅度、连续同向 K 线数量、波动率是否异常放大。
-- 持仓股：跌破 MA20 或亏损超 -8% 应考虑止损；浮盈超 +15% 且趋势转弱考虑止盈。
+## 决策顺序（先卖后买）
+1. 先处理已有持仓的退出：仅当输入中存在已确认的 czsc 卖点（signal_status=CONFIRMED）、或价格已触及止损线（stop_loss_price）、或存在经核实的重大基本面风险时，才生成 SELL；没有退出依据的持仓不得仅因缺少买入信号而清仓。正面新闻不得覆盖已确认的技术退出信号。
+2. 再评估开仓候选：必须有已确认的买点（1B/2B/3B）、Manager 未否决、且账户现金与仓位空间允许。1B 属于早期转折候选，在下跌环境中从严把握；3B/2B 顺势形态优先。
+3. 同一股票不得同时出现 BUY 与 SELL；重复信号只保留一条计划。
+4. 无合格候选、无有效退出或仓位空间不足时，允许不交易，输出 []。不得因为账户还有现金就强行买入。
 
 ## 输出格式（严格遵守）
-只输出一个 JSON 数组，不要输出任何其他文字、解释或 markdown 代码块标记。数组每个元素形如：
+只输出一个 JSON 数组，不要输出任何其他文字、解释或 markdown 代码块标记。数组每个元素形如（示例仅演示格式，实际必须使用输入中的真实代码与价格）：
 [
   {
     "action": "BUY",
     "symbol": "000001",
     "quantity": 1000,
     "price": 12.35,
-    "reason": "一句话中文理由，不超过50字"
+    "reason": "日线三买已确认，Manager排雷通过，组合风险允许"
   }
 ]
 - action 只能是 "BUY" 或 "SELL"（大写）。
-- symbol 为 6 位数字字符串。
-- quantity 为正整数（BUY 时必须为 100 的整数倍）。
-- price 为两位小数的委托价（元）。
+- symbol 为 6 位数字字符串，必须来自输入的候选池或持仓。
+- quantity 为正整数（BUY 时必须为 100 的整数倍；SELL 时不超过 available_quantity）。
+- price 为两位小数的委托参考价（元），必须来自输入行情字段。
+- reason 不超过 50 字：BUY 引用确认的技术信号及排雷依据，SELL 引用退出信号或风险条件。
+- 输出次序：SELL 在前，BUY 在后。
 - 如果经过分析后决定明日不做任何交易，输出空数组：[]`
+
+// MasterSystemPrompt 是运行时渲染后的系统提示词（仓位比例来自 risk 包单一来源）。
+var MasterSystemPrompt = fmt.Sprintf(masterSystemPromptTemplate,
+	int(maxPositionRatioPerStock*100), // 第1个%d: 单票上限
+	int(maxTotalPositionRatio*100),    // 第2个%d: 总仓上限
+)
+
+// SetPositionRatios 允许调度层在启动时按配置覆盖仓位口径并同步重渲染 Prompt，
+// 保证「Prompt 软约束」与「RiskCheck 硬风控」永远同源。传 0/负值表示保持原值。
+func SetPositionRatios(perStock, total float64) error {
+	if perStock > 0 {
+		maxPositionRatioPerStock = perStock
+	}
+	if total > 0 {
+		maxTotalPositionRatio = total
+	}
+	if maxPositionRatioPerStock > maxTotalPositionRatio {
+		return fmt.Errorf("agent: per-stock ratio %.2f must <= total ratio %.2f",
+			maxPositionRatioPerStock, maxTotalPositionRatio)
+	}
+	MasterSystemPrompt = fmt.Sprintf(masterSystemPromptTemplate,
+		int(maxPositionRatioPerStock*100), int(maxTotalPositionRatio*100))
+	return nil
+}
 
 // ---------------------------------------------------------------------------
 // User Prompt 模板

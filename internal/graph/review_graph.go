@@ -32,6 +32,7 @@ import (
 
 	"ashare-quant/internal/agent"
 	dbmodel "ashare-quant/internal/model"
+	"ashare-quant/internal/risk"
 	qtool "ashare-quant/internal/tool"
 )
 
@@ -478,13 +479,13 @@ func riskCheck(state map[string]any) (map[string]any, error) {
 
 			// 规则 2：单票仓位 ≤ 20%（以现有市值 + 本次新增计算）
 			projected := valueByCode[pl.Symbol] + newValue
-			if projected > snap.TotalAssets*agent.MaxPositionRatioPerStock+1e-6 {
+			if projected > snap.TotalAssets*risk.DefaultMaxPositionRatioPerStock+1e-6 {
 				rejected = append(rejected, Rejection{pl, fmt.Sprintf(
 					"违反单票20%%上限：该票预计市值 %.2f > 总资产 %.2f × 20%%", projected, snap.TotalAssets)})
 				continue
 			}
 			// 规则 3：总仓位 ≤ 80%
-			if holdValue+newValue > snap.TotalAssets*agent.MaxTotalPositionRatio+1e-6 {
+			if holdValue+newValue > snap.TotalAssets*risk.DefaultMaxTotalPositionRatio+1e-6 {
 				rejected = append(rejected, Rejection{pl, fmt.Sprintf(
 					"违反总仓位80%%上限：加仓后总市值 %.2f > 总资产 %.2f × 80%%", holdValue+newValue, snap.TotalAssets)})
 				continue
