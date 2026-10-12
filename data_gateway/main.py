@@ -2017,6 +2017,12 @@ class WatchlistGenerateRequest(BaseModel):
 def post_watchlist_generate(req: WatchlistGenerateRequest) -> Dict[str, Any]:
     """生成今日动态自选股池: ETF动量 + 行业龙头 + 龙虎榜资金异动 + 人工白名单。
 
+    .. deprecated:: 2026-10-12
+        **候选池生成主链路已迁移至 Go 层** (internal/pool + stock-go SDK)。
+        本接口降级为灰度回退链路: 仅当 Go 原生池生成失败时由 Go 端自动调用。
+        Python 端职责收敛为 czsc 形态确认 (/api/czsc/screen_pool, /api/czsc/refresh)。
+        响应中附带 "deprecated": true 标记供监控识别。
+
     弱依赖设计: 任一 AKShare 数据源失败仅记入 warnings 并跳过该来源,
     其余来源结果照常返回, 接口几乎永不整体失败。
     """
@@ -2040,7 +2046,8 @@ def post_watchlist_generate(req: WatchlistGenerateRequest) -> Dict[str, Any]:
     return {
         "code": 0,
         "message": "success",
-        "data": {**result, "elapsed_seconds": elapsed, "manual_errors": errors},
+        "data": {**result, "elapsed_seconds": elapsed, "manual_errors": errors,
+                 "deprecated": True},
     }
 
 
