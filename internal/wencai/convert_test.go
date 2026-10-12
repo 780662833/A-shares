@@ -132,10 +132,15 @@ func TestTabHandlers(t *testing.T) {
     ]`
 	var arr []any
 	_ = json.Unmarshal([]byte(raw), &arr)
-	out := multiShowTypeHandler(arr)
+	out := multiShowTypeHandler(arr) // 测试直接调 handler；convertResponse 才包 {"structured":...} 信封
 	tab4, _ := out["题材库"].(map[string]any)
-	if tab4 == nil || tab4["涨停"] != "3家" {
-		t.Errorf("tab4 = %+v", out["题材库"])
+	if tab4 == nil {
+		t.Fatalf("tab4 = %+v", out)
+	}
+	// tab4 双层嵌套：tab_name -> show_type -> handler 结果（复刻上游 tcomp.set 结构）
+	zt, _ := tab4["涨停"].(map[string]any)
+	if zt == nil || zt["txt1"] != "3家" {
+		t.Errorf("tab4[涨停][txt1] = %+v", tab4["涨停"])
 	}
 	if _, has := tab4[""]; has {
 		t.Errorf("empty tab_name should be skipped")
