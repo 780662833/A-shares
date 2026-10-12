@@ -110,14 +110,37 @@ def _cache_put(kind: str, symbol: str, obj: Dict[str, Any]) -> None:
 # 通用小工具
 # ---------------------------------------------------------------------------
 
+# 确定性异常特征: 重试不可能成功, 必须快速失败。
+# 已知案例: akshare<=1.19.x stock_news_em 内部对 pyarrow 字符串列执行
+#   .str.replace(r"\u3000", "", regex=True), RE2 引擎不支持 \u 转义,
+#   抛 pyarrow.lib.ArrowInvalid("invalid escape sequence: \u")。
+# 该错误在函数内部数据清洗阶段触发 (网络请求已成功), 与网络抖动无关,
+# 走指数退避重试只会白白多等数秒并放大日志噪音。
+_DETERMINISTIC_ERR_HINTS = ("invalid escape sequence", "invalid regular expression")
+
+
+def _is_deterministic_error(exc: BaseException) -> bool:
+    """判断异常是否为"重试必然复现"的确定性错误 (正则/解析类)。"""
+    if type(exc).__name__ == "ArrowInvalid":
+        return True
+    msg = str(exc).lower()
+    return any(h in msg for h in _DETERMINISTIC_ERR_HINTS)
+
+
 def _retry_call(fn: Callable[[], Any], attempts: int = 3, backoff: float = 1.5) -> Any:
-    """指数退避重试, 应对东财接口偶发限流 (与 main._retry_call 同语义, 独立实现避免循环导入)。"""
+    """指数退避重试, 应对东财接口偶发限流 (与 main._retry_call 同语义, 独立实现避免循环导入)。
+
+    确定性错误 (如 ArrowInvalid 正则编译失败) 首次即抛出, 不浪费退避时间。
+    """
     last_exc: Optional[Exception] = None
     for i in range(attempts):
         try:
             return fn()
         except Exception as exc:  # noqa: BLE001
             last_exc = exc
+            if _is_deterministic_error(exc):
+                logger.error("news 上游返回确定性错误, 放弃重试: %s: %s", type(exc).__name__, exc)
+                raise
             wait = backoff * (2 ** i)
             logger.warning("news 上游调用失败(第 %d/%d 次): %s, %.1fs 后重试", i + 1, attempts, exc, wait)
             time.sleep(wait)
@@ -157,6 +180,68 @@ def _norm_date(value: Any) -> str:
 # 方案1: 东方财富个股新闻 ak.stock_news_em
 # ---------------------------------------------------------------------------
 
+def _strip_html_tags(s):
+    """去掉 <...> 标签 (上游 akshare 只清 <em>, 实测还有 <br> 等残留)。"""
+    return s.str.replace(r"<[^><]*>", "", regex=True)
+
+
+def _clean_em_fallback(symbol: str):
+    """ak.stock_news_em 崩溃时的兜底: 直连东财搜索接口自建 DataFrame。
+
+    复刻上游请求参数, 但清洗逻辑全部用 Python re 在 object 列上完成,
+    彻底绕开 pyarrow RE2 不支持 \\u 转义的问题。失败返回 None。
+    """
+    import requests
+
+    url = "https://search-api-web.eastmoney.com/search/jsonp"
+    inner_param = {
+        "uid": "",
+        "keyword": symbol,
+        "type": ["cmsArticleWebOld"],
+        "client": "web",
+        "clientType": "web",
+        "clientVersion": "curr",
+        "param": {"cmsArticleWebOld": {
+            "searchScope": "default", "sort": "default",
+            "pageIndex": 1, "pageSize": 100,
+            "preTag": "<em>", "postTag": "</em>",
+        }},
+    }
+    headers = {
+        "accept": "*/*",
+        "referer": f"https://so.eastmoney.com/news/s?keyword={symbol}",
+        "user-agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                       "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"),
+    }
+    try:
+        r = requests.get(url, params={"cb": "callback", "param": json.dumps(inner_param, ensure_ascii=False)},
+                         headers=headers, timeout=15)
+        text = r.text
+        payload = text[text.index("(") + 1:text.rindex(")")]
+        arts = json.loads(payload)["result"]["cmsArticleWebOld"]
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("stock_news_em 兜底直连失败(%s): %s", symbol, exc)
+        return None
+    if not arts:
+        return pd.DataFrame(columns=["关键词", "新闻标题", "新闻内容", "发布时间", "文章来源", "新闻链接"])
+    df = pd.DataFrame(arts, dtype="object")
+    df["新闻链接"] = "http://finance.eastmoney.com/a/" + df["code"].astype(str) + ".html"
+    out = pd.DataFrame({
+        "关键词": symbol,
+        "新闻标题": df["title"],
+        "新闻内容": df["content"],
+        "发布时间": df["date"],
+        "文章来源": df["mediaName"],
+        "新闻链接": df["新闻链接"],
+    })
+    for col in ("新闻标题", "新闻内容"):
+        out[col] = (out[col].fillna("").astype(str)
+                    .str.replace("\u3000", "", regex=False)      # 全角空格
+                    .str.replace("\r\n", " ", regex=False)
+                    .pipe(_strip_html_tags))
+    return out
+
+
 def fetch_eastmoney_news(symbol: str, limit: int = 10) -> Dict[str, Any]:
     """拉取个股新闻 (东方财富)。返回 {items:[...], source:"eastmoney"} 或 {error:...}。"""
     if not _AK_AVAILABLE:
@@ -168,7 +253,11 @@ def fetch_eastmoney_news(symbol: str, limit: int = 10) -> Dict[str, Any]:
         df = _retry_call(lambda: ak.stock_news_em(symbol=symbol))
     except Exception as exc:  # noqa: BLE001
         logger.error("stock_news_em(%s) 失败: %s", symbol, exc)
-        return {"error": f"stock_news_em: {type(exc).__name__}: {exc}"}
+        # 兜底: akshare/pandas 版本组合 bug (如 ArrowInvalid \u 转义) 时直连东财重试一次
+        df = _clean_em_fallback(symbol)
+        if df is None:
+            return {"error": f"stock_news_em: {type(exc).__name__}: {exc}"}
+        logger.info("stock_news_em(%s) 已走直连兜底通道恢复数据", symbol)
 
     items: List[Dict[str, Any]] = []
     if df is not None and len(df) > 0:
