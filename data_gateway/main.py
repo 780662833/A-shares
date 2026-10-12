@@ -258,6 +258,31 @@ def _gateway_error(status_code: int, source: str, exc: Exception) -> HTTPExcepti
     )
 
 
+def disable_env_proxy() -> None:
+    """关闭系统代理探测 (Windows IE 代理注册表 / *_proxy 环境变量)。
+
+    背景: Windows 桌面机常因 VPN/加速器在注册表留下已失效的代理配置,
+    requests 默认 trust_env=True 会读取它们, 导致 AKShare 直连东财接口时报
+    ProxyError('Unable to connect to proxy', RemoteDisconnected(...))。
+    A股行情接口本应直连, 经代理反而不稳定; 确需代理的环境可设
+    ASHARE_USE_PROXY=1 保留原始行为。
+    """
+    if os.getenv("ASHARE_USE_PROXY", "").strip().lower() in ("1", "true", "yes"):
+        return
+    try:
+        import urllib3.exceptions as _u3e  # noqa: F401
+        import akshare as ak
+        session = getattr(ak, "requests_session", None)
+        if session is not None and hasattr(session, "trust_env"):
+            session.trust_env = False
+            logger.info("已禁用 AKShare 系统代理探测 (trust_env=False)")
+    except Exception as exc:  # noqa: BLE001 - 弱依赖, 失败不影响启动
+        logger.warning("禁用系统代理失败(忽略): %s", exc)
+
+
+disable_env_proxy()
+
+
 def _retry_call(fn: Callable[[], Any], attempts: int = 3, backoff: float = 1.5) -> Any:
     """
     对上游数据源调用做指数退避重试 (应对东财等接口的偶发限流/连接重置)。

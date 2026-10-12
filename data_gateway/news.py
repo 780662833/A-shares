@@ -227,6 +227,10 @@ def _clean_em_fallback(symbol: str):
     """
     import requests
 
+    # 与网关启动时的 disable_env_proxy 策略一致: A股接口直连, 不读系统代理
+    sess = requests.Session()
+    sess.trust_env = False
+
     url = "https://search-api-web.eastmoney.com/search/jsonp"
     inner_param = {
         "uid": "",
@@ -248,8 +252,8 @@ def _clean_em_fallback(symbol: str):
                        "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"),
     }
     try:
-        r = requests.get(url, params={"cb": "callback", "param": json.dumps(inner_param, ensure_ascii=False)},
-                         headers=headers, timeout=15)
+        r = sess.get(url, params={"cb": "callback", "param": json.dumps(inner_param, ensure_ascii=False)},
+                     headers=headers, timeout=15)
         text = r.text
         payload = text[text.index("(") + 1:text.rindex(")")]
         arts = json.loads(payload)["result"]["cmsArticleWebOld"]
