@@ -185,6 +185,40 @@ def _strip_html_tags(s):
     return s.str.replace(r"<[^><]*>", "", regex=True)
 
 
+def _patched_stock_news_em(symbol: str):
+    """猴补丁通道: 修复 akshare stock_news_em 的 r"\\u3000" 正则 bug 后原样执行。
+
+    旧版 akshare (含 1.19.x) 源码用 str.replace(r"\\u3000", "", regex=True),
+    在 pandas>=3 + pyarrow ArrowStringArray (RE2 引擎) 下抛 ArrowInvalid。
+    这里把该行替换为字面量全角空格 (regex=False) 后 exec 出修正版函数,
+    保持上游 URL/参数/列名/排序完全一致; 失败返回 None (由调用方走直连兜底)。
+    """
+    import inspect
+    import io
+    import contextlib
+
+    try:
+        src = inspect.getsource(ak.stock_news_em)
+        fixed = (src
+                 .replace('r"\\u3000"', '"\\u3000"')
+                 .replace("r'\\u3000'", "'\\u3000'"))
+        # 防御性: 若未来版本改写清洗语句导致找不到目标行, 放弃补丁 (避免静默错替)
+        if "\\u3000" not in fixed or fixed == src:
+            logger.warning("stock_news_em 源码结构已变化, 跳过猴补丁")
+            return None
+        ns = dict(vars(ak.news.news_stock))
+        ns["__name__"] = "akshare_patch_em_news"
+        exec(compile(fixed, "<akshare-patched-stock_news_em>", "exec"), ns)
+        fn = ns.get("stock_news_em")
+        if fn is None:
+            return None
+        with contextlib.redirect_stdout(io.StringIO()):  # 屏蔽上游 print 提示
+            return fn(symbol=symbol)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("stock_news_em 猴补丁通道失败(%s): %s", symbol, exc)
+        return None
+
+
 def _clean_em_fallback(symbol: str):
     """ak.stock_news_em 崩溃时的兜底: 直连东财搜索接口自建 DataFrame。
 
@@ -253,11 +287,16 @@ def fetch_eastmoney_news(symbol: str, limit: int = 10) -> Dict[str, Any]:
         df = _retry_call(lambda: ak.stock_news_em(symbol=symbol))
     except Exception as exc:  # noqa: BLE001
         logger.error("stock_news_em(%s) 失败: %s", symbol, exc)
-        # 兜底: akshare/pandas 版本组合 bug (如 ArrowInvalid \u 转义) 时直连东财重试一次
-        df = _clean_em_fallback(symbol)
-        if df is None:
-            return {"error": f"stock_news_em: {type(exc).__name__}: {exc}"}
-        logger.info("stock_news_em(%s) 已走直连兜底通道恢复数据", symbol)
+        # 兜底链: 猴补丁(修复上游正则bug后原样执行) -> 直连东财自建DataFrame
+        patched = _patched_stock_news_em(symbol)
+        if patched is not None and len(patched) > 0:
+            df = patched
+            logger.info("stock_news_em(%s) 已走猴补丁通道恢复数据", symbol)
+        else:
+            df = _clean_em_fallback(symbol)
+            if df is None:
+                return {"error": f"stock_news_em: {type(exc).__name__}: {exc}"}
+            logger.info("stock_news_em(%s) 已走直连兜底通道恢复数据", symbol)
 
     items: List[Dict[str, Any]] = []
     if df is not None and len(df) > 0:
