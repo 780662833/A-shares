@@ -270,12 +270,76 @@ def disable_env_proxy() -> None:
     if os.getenv("ASHARE_USE_PROXY", "").strip().lower() in ("1", "true", "yes"):
         return
     try:
-        import urllib3.exceptions as _u3e  # noqa: F401
+        import requests
         import akshare as ak
+
+        patched = []
+        # 路径1: 旧版 akshare 的全局会话对象
         session = getattr(ak, "requests_session", None)
         if session is not None and hasattr(session, "trust_env"):
             session.trust_env = False
-            logger.info("已禁用 AKShare 系统代理探测 (trust_env=False)")
+            patched.append("akshare.requests_session")
+
+        # 路径2: 新版 akshare>=1.16 的东财分页工具 request_with_retry / fetch_paginated_data
+        #   内部每次请求都 `with requests.Session() as session:` 新建会话, 不经过全局
+        #   session —— 只 patch 路径1 时这类接口(fund_etf_spot_em /
+        #   stock_sector_fund_flow_rank / stock_board_industry_cons_em 等)仍会读取
+        #   Windows 注册表里的失效代理并报错。这里把模块内引用的 requests 换成
+        #   trust_env=False 的替身对象, 使其中所有 Session()/get/post 均直连。
+        class _NoProxyRequests:
+            """透传 requests 全部属性, 仅让 Session() 返回 trust_env=False 实例。"""
+
+            def __init__(self, _real):
+                self._real = _real
+
+            def __getattr__(self, name):
+                return getattr(self._real, name)
+
+            @staticmethod
+            def Session(*a, **kw):
+                s = requests.Session(*a, **kw)
+                s.trust_env = False
+                return s
+
+        # 注意: 函数体查找名字用的是 fn.__globals__ (可能与模块属性不是同一对象),
+        # 因此对模块 __dict__ 和每个目标函数的 __globals__ 都做幂等替换。
+        def _swap(ns) -> bool:
+            cur = ns.get("requests")
+            if cur is requests:
+                ns["requests"] = _NoProxyRequests(requests)
+                return True
+            return False
+
+        targets = {
+            "akshare.utils.func": ["request_with_retry", "fetch_paginated_data"],
+            "akshare.request": ["make_request_with_retry_json",
+                                "make_request_with_retry_text"],
+        }
+        for mod_name, funcs in targets.items():
+            try:
+                import importlib
+                mod = importlib.import_module(mod_name)
+            except ImportError:
+                continue
+            hit = _swap(mod.__dict__)
+            for fname in funcs:
+                fn = getattr(mod, fname, None)
+                g = getattr(fn, "__globals__", None)
+                if g is not None:
+                    hit = _swap(g) or hit
+            if hit:
+                patched.append(mod_name)
+
+        # 路径3: 兜底再清一遍环境变量, 防止第三方库自行读 *_proxy
+        for var in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy",
+                    "ALL_PROXY", "all_proxy"):
+            os.environ.pop(var, None)
+
+        if patched:
+            logger.info("已禁用系统代理探测 (trust_env=False): %s", ", ".join(patched))
+        else:
+            logger.warning("未找到可打补丁的 AKShare 会话对象, 代理修复未生效 "
+                           "(若报 ProxyError 请检查网络或设 ASHARE_USE_PROXY=1)")
     except Exception as exc:  # noqa: BLE001 - 弱依赖, 失败不影响启动
         logger.warning("禁用系统代理失败(忽略): %s", exc)
 
