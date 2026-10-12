@@ -47,13 +47,16 @@ type WatchEntry struct {
 	OrgNetBuy   *float64 `json:"org_net_buy,omitempty"`
 }
 
-type watchlistGenData struct {
+// WatchlistGenData 网关 /api/watchlist/generate 的 data 字段（导出供 cmd 层日志/统计使用）。
+type WatchlistGenData struct {
 	TradeDate string         `json:"trade_date"`
 	Total     int            `json:"total"`
 	BySource  map[string]int `json:"by_source"`
 	Pool      []WatchEntry   `json:"pool"`
 	Warnings  []string       `json:"warnings"`
 }
+
+type watchlistGenData = WatchlistGenData
 
 type watchlistGenEnvelope struct {
 	Code    int               `json:"code"`

@@ -2,10 +2,12 @@
 //
 // 职责：
 //  1. 初始化 SQLite（Phase 2 db.InitDB，幂等，默认账户 100 万）；
-//  2. 注册 robfig/cron 两个工作日任务：
+//  2. 注册 robfig/cron 四个工作日任务：
+//     - 0  15 * * 1-5 : 动态自选股池更新（Layer 0.5，ASHARE_DYNAMIC_WATCHLIST=1 时启用）；
+//     - 10 15 * * 1-5 : czsc 缓存增量预热（当日 ACTIVE 池 ∪ 持仓股）；
 //     - 30 15 * * 1-5 : 触发 Phase 5 Eino 复盘 Graph，生成次日 PENDING 计划；
 //     - 25 09 * * 1-5 : 调用 Phase 3 MockBroker.SimulateNextDayOpen 撮合昨日计划；
-//  3. 提供调试用 HTTP 手动触发接口（/trigger/review、/trigger/simulate、/healthz）；
+//  3. 提供调试用 HTTP 手动触发接口（/trigger/review、/trigger/simulate、/trigger/refresh、/trigger/watchlist、/healthz）；
 //  4. 监听 SIGINT/SIGTERM 优雅退出（停 cron + 关 HTTP + 关 DB）。
 //
 // 环境变量：
@@ -13,7 +15,11 @@
 //	ASHARE_DB_PATH      SQLite 文件路径，默认 ./data/trading.db
 //	ASHARE_GATEWAY_URL  Python 数据网关地址，默认 http://127.0.0.1:8000
 //	ASHARE_HTTP_ADDR    手动触发服务监听地址，默认 :8080（设为 "off" 可禁用）
-//	ASHARE_WATCHLIST    候选股票池，逗号分隔，如 "000001,600519"，默认空（仅复盘持仓股）
+//	ASHARE_WATCHLIST    候选股票池，逗号分隔，如 "000001,600519"，默认空（仅复盘持仓股）；
+//	                    动态池模式下兼作人工白名单（MANUAL）与降级保底名单
+//	ASHARE_DYNAMIC_WATCHLIST   =1 启用动态池模式（watchlist_items 表为 symbols 主来源）
+//	ASHARE_WATCHLIST_MAX       动态池参与粗筛的最大股票数，默认 100（持仓股不占配额）
+//	ASHARE_CRON_WATCHLIST      动态池更新 cron，默认 "0 15 * * 1-5"
 //	ASHARE_LLM_BASE_URL / ASHARE_MODEL / ASHARE_API_KEY
 //	                    LLM 接入配置。MVP 未强依赖 eino-ext provider：
 //	                    未配置时系统以「降级模式」运行 —— 复盘任务将跳过 LLM 决策
@@ -32,6 +38,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -44,6 +51,7 @@ import (
 	"ashare-quant/internal/db"
 	dbmodel "ashare-quant/internal/model"
 	datasync "ashare-quant/internal/sync"
+	"ashare-quant/internal/tool"
 )
 
 // ---------------------------------------------------------------------------
@@ -51,27 +59,45 @@ import (
 // ---------------------------------------------------------------------------
 
 type appConfig struct {
-	DBPath     string
-	GatewayURL string
-	HTTPAddr   string
-	Watchlist  []string
-	CronReview string // 日终复盘 cron 表达式
-	CronSimul  string // 次日撮合 cron 表达式
-	CronRefresh string // 收盘后 czsc 缓存预计算 cron 表达式（长期方案 C）
+	DBPath       string
+	GatewayURL   string
+	HTTPAddr     string
+	Watchlist    []string
+	CronReview   string        // 日终复盘 cron 表达式
+	CronSimul    string        // 次日撮合 cron 表达式
+	CronRefresh  string        // 收盘后 czsc 缓存预计算 cron 表达式（长期方案 C）
+	CronWatch    string        // 动态自选股池生成 cron 表达式
+	DynWatchOn   bool          // ASHARE_DYNAMIC_WATCHLIST=1 时启用动态池模式
+	DynWatchMax  int           // 每日动态池参与粗筛的最大股票数（持仓股不占配额）
+	WatchTimeout time.Duration // 网关 /api/watchlist/generate 单次调用超时
 }
 
 func loadConfig() appConfig {
 	cwd, _ := os.Getwd()
 	cfg := appConfig{
-		DBPath:     envOr("ASHARE_DB_PATH", filepath.Join(cwd, "data", "trading.db")),
-		GatewayURL: envOr("ASHARE_GATEWAY_URL", "http://127.0.0.1:8000"),
-		HTTPAddr:   envOr("ASHARE_HTTP_ADDR", ":8080"),
-		CronReview:  "30 15 * * 1-5",
-		CronSimul:   "25 9 * * 1-5",
-		CronRefresh: "10 15 * * 1-5", // 先于复盘 20 分钟，保证 15:30 粗筛全部命中缓存
+		DBPath:       envOr("ASHARE_DB_PATH", filepath.Join(cwd, "data", "trading.db")),
+		GatewayURL:   envOr("ASHARE_GATEWAY_URL", "http://127.0.0.1:8000"),
+		HTTPAddr:     envOr("ASHARE_HTTP_ADDR", ":8080"),
+		CronReview:   "30 15 * * 1-5",
+		CronSimul:    "25 9 * * 1-5",
+		CronRefresh:  "10 15 * * 1-5", // 晚于 15:00 池子更新、先于复盘 20 分钟，保证 15:30 粗筛全部命中缓存
+		CronWatch:    "0 15 * * 1-5",  // 收盘即更新动态池（Layer 0.5），10 分钟后 refresh 只对当日 ACTIVE 池增量预热
+		DynWatchMax:  100,
+		WatchTimeout: 4 * time.Minute,
 	}
 	if v := strings.TrimSpace(os.Getenv("ASHARE_CRON_REFRESH")); v != "" {
 		cfg.CronRefresh = v
+	}
+	if v := strings.TrimSpace(os.Getenv("ASHARE_CRON_WATCHLIST")); v != "" {
+		cfg.CronWatch = v
+	}
+	cfg.DynWatchOn = strings.TrimSpace(os.Getenv("ASHARE_DYNAMIC_WATCHLIST")) == "1"
+	if v := strings.TrimSpace(os.Getenv("ASHARE_WATCHLIST_MAX")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			cfg.DynWatchMax = n
+		} else {
+			log.Printf("WARN: invalid ASHARE_WATCHLIST_MAX=%q, keep %d", v, cfg.DynWatchMax)
+		}
 	}
 	for _, s := range strings.Split(envOr("ASHARE_WATCHLIST", ""), ",") {
 		if s = strings.TrimSpace(s); s != "" {
@@ -147,28 +173,112 @@ func (a *app) unlock(name string) {
 	delete(a.running, name)
 }
 
-// syncSymbols 返回本轮需要同步落库的股票集合：
-// 自选股（ASHARE_WATCHLIST）∪ 当前持仓股。持仓股必须同步——次日撮合卖出时
-// Broker 依赖 daily_klines 的涨跌停价判定一字板，缺数据会导致订单被拒。
-func (a *app) syncSymbols() []string {
-	seen := make(map[string]bool)
-	var out []string
-	add := func(s string) {
-		s = strings.TrimSpace(s)
-		if s != "" && !seen[s] {
-			seen[s] = true
-			out = append(out, s)
-		}
-	}
-	for _, s := range a.cfg.Watchlist {
-		add(s)
-	}
+// positionCodes 返回当前持仓（quantity > 0）股票代码，去重。
+func (a *app) positionCodes() []string {
 	var positions []dbmodel.Position
 	if err := a.gdb.Where("quantity > 0").Find(&positions).Error; err != nil {
-		log.Printf("WARN: load positions for sync failed: %v", err)
+		log.Printf("WARN: load positions failed: %v", err)
 	}
+	seen := make(map[string]bool)
+	var out []string
 	for _, p := range positions {
-		add(p.Code)
+		if !seen[p.Code] {
+			seen[p.Code] = true
+			out = append(out, p.Code)
+		}
+	}
+	return out
+}
+
+// syncSymbols 返回本轮需要同步落库的股票集合：
+// scanSymbols()（动态池模式下 = watchlist_items ACTIVE ∪ MANUAL ∪ 持仓股；
+// 否则 = ASHARE_WATCHLIST ∪ 持仓股）。持仓股必须同步——次日撮合卖出时
+// Broker 依赖 daily_klines 的涨跌停价判定一字板，缺数据会导致订单被拒。
+func (a *app) syncSymbols() []string {
+	return a.scanSymbols()
+}
+
+// scanSymbols 返回每日 czsc 粗筛 / 缓存预热的 symbols 集合。
+//
+// 静态模式（默认）：ASHARE_WATCHLIST ∪ 持仓股，行为与历史版本完全一致。
+// 动态模式（ASHARE_DYNAMIC_WATCHLIST=1）：以 watchlist_items 表为唯一主来源 ——
+//   - MANUAL/BLACKLIST 等人工终态不受配额约束；
+//   - 持仓股必进且不占 DynWatchMax 配额（撮合依赖其行情缓存）；
+//   - 其余 ACTIVE 条目按来源优先级 MANUAL > ETF_MOMENTUM > SECTOR_LEADER > FUND_FLOW
+//     截断到 DynWatchMax，防止上游异动接口异常导致池子暴涨拖垮 refresh 时限；
+//   - 表为空（首次启用/网关从未成功）自动回退 ASHARE_WATCHLIST ∪ 持仓股，保证首日不断流。
+func (a *app) scanSymbols() []string {
+	seen := make(map[string]bool)
+	var out []string
+	add := func(s string) bool {
+		s = strings.TrimSpace(s)
+		if s == "" || seen[s] {
+			return false
+		}
+		seen[s] = true
+		out = append(out, s)
+		return true
+	}
+	pos := a.positionCodes()
+
+	if !a.cfg.DynWatchOn {
+		for _, s := range a.cfg.Watchlist {
+			add(s)
+		}
+		for _, p := range pos {
+			add(p)
+		}
+		return out
+	}
+
+	var items []dbmodel.WatchlistItem
+	if err := a.gdb.Where("status = ?", dbmodel.WatchStatusActive).Find(&items).Error; err != nil {
+		log.Printf("WARN: load dynamic watchlist failed (%v), fallback to static ASHARE_WATCHLIST", err)
+	}
+	if len(items) == 0 {
+		log.Printf("[watchlist] dynamic pool empty (table has no ACTIVE rows), fallback to static watchlist")
+		for _, s := range a.cfg.Watchlist {
+			add(s)
+		}
+		for _, p := range pos {
+			add(p)
+		}
+		return out
+	}
+
+	// 第一遍：人工白名单 + 持仓股（不占配额）
+	for _, it := range items {
+		if it.SourceType == dbmodel.WatchSourceManual {
+			add(it.Code)
+		}
+	}
+	for _, p := range pos {
+		add(p)
+	}
+	// 第二遍：动态来源按优先级填充剩余配额
+	rank := map[string]int{
+		dbmodel.WatchSourceETF:    0,
+		dbmodel.WatchSourceSector: 1,
+		dbmodel.WatchSourceFund:   2,
+	}
+	quota := a.cfg.DynWatchMax
+	for quota > 0 {
+		picked := false
+		for r := 0; r < len(rank) && quota > 0; r++ {
+			for _, it := range items {
+				if rank[it.SourceType] == r && add(it.Code) {
+					quota--
+					picked = true
+				}
+			}
+		}
+		if !picked {
+			break // 未知来源类型兜底退出，防止死循环
+		}
+	}
+	if len(out) > len(pos)+len(a.cfg.Watchlist) {
+		log.Printf("[watchlist] dynamic mode: scanned=%d (cap=%d, positions=%d not counted against cap)",
+			len(out), a.cfg.DynWatchMax, len(pos))
 	}
 	return out
 }
@@ -347,6 +457,50 @@ func (a *app) runCzscRefresh(trigger string) error {
 }
 
 // ---------------------------------------------------------------------------
+// 任务 0（Layer 0.5）：动态自选股池更新（15:00，ASHARE_DYNAMIC_WATCHLIST=1 时启用）
+// ---------------------------------------------------------------------------
+
+const flowWatchlist = "watchlist"
+
+// runWatchlistUpdate 调用网关 POST /api/watchlist/generate 生成今日动态池，
+// 并按生命周期规则落库 watchlist_items（新增/续期/过期清理，MANUAL 与 BLACKLIST 不受侵蚀）。
+//
+// 降级语义：网关失败返回 error 但**绝不清空现有池子**——scanSymbols 会继续使用
+// 昨日 ACTIVE 集合（未过期部分），复盘链路零感知。
+func (a *app) runWatchlistUpdate(trigger string) error {
+	if !a.tryLock(flowWatchlist) {
+		return errors.New("watchlist update already running, skip")
+	}
+	defer a.unlock(flowWatchlist)
+
+	start := time.Now()
+	ctx, cancel := context.WithTimeout(context.Background(), a.cfg.WatchTimeout+30*time.Second)
+	defer cancel()
+
+	data, err := tool.FetchGeneratedWatchlist(ctx, a.cfg.GatewayURL, a.cfg.Watchlist, a.cfg.WatchTimeout)
+	if err != nil {
+		log.Printf("[watchlist] FAILED trigger=%s err=%v (沿用现有池子)", trigger, err)
+		return fmt.Errorf("update watchlist: %w", err)
+	}
+
+	res, err := tool.ApplyWatchlistPool(a.gdb, data, time.Now())
+	if res != nil {
+		log.Printf("[watchlist] applied trigger=%s trade_date=%s generated=%d inserted=%d updated=%d skipped_manual=%d inactivated=%d by_source=%v warnings=%d elapsed=%s",
+			trigger, res.TradeDate, res.Generated, res.Inserted, res.Updated,
+			res.SkippedMan, res.Inactivated, data.BySource, len(res.Warnings), time.Since(start))
+		for _, w := range res.Warnings {
+			log.Printf("[watchlist] WARN source step: %s", w)
+		}
+	}
+	if err != nil {
+		log.Printf("[watchlist] apply partial failure after %d ops: %v", res.Inserted+res.Updated, err)
+		return fmt.Errorf("apply watchlist pool: %w", err)
+	}
+	log.Printf("[watchlist] ===== 池子更新完成 elapsed=%s =====", time.Since(start))
+	return nil
+}
+
+// ---------------------------------------------------------------------------
 // HTTP 手动触发接口（白天调试用）
 // ---------------------------------------------------------------------------
 
@@ -391,6 +545,18 @@ func (a *app) newHTTPServer() *http.Server {
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "message": "czsc cache refresh finished"})
+	})
+
+	mux.HandleFunc("/trigger/watchlist", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"ok": false, "error": "use POST"})
+			return
+		}
+		if err := a.runWatchlistUpdate("manual"); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"ok": false, "error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "message": "watchlist update finished"})
 	})
 
 	return &http.Server{
@@ -450,9 +616,21 @@ func main() {
 	}); err != nil {
 		log.Fatalf("FATAL: add czsc refresh cron (%q): %v", cfg.CronRefresh, err)
 	}
+	// Layer 0.5：15:00 动态自选股池更新（仅动态模式启用；早于 15:10 预热，
+	// 保证当日新入池股票当晚即被增量/全量预热，次日复盘零联网成本）
+	watchEnabled := cfg.DynWatchOn
+	if watchEnabled {
+		if _, err := c.AddFunc(cfg.CronWatch, func() {
+			if err := appInstance.runWatchlistUpdate("cron"); err != nil {
+				log.Printf("cron watchlist job error: %v", err)
+			}
+		}); err != nil {
+			log.Fatalf("FATAL: add watchlist cron (%q): %v", cfg.CronWatch, err)
+		}
+	}
 	c.Start()
-	log.Printf("cron registered: review=%q simulate=%q czsc_refresh=%q (Asia/Shanghai)",
-		cfg.CronReview, cfg.CronSimul, cfg.CronRefresh)
+	log.Printf("cron registered: review=%q simulate=%q czsc_refresh=%q watchlist=%q(enabled=%v) (Asia/Shanghai)",
+		cfg.CronReview, cfg.CronSimul, cfg.CronRefresh, cfg.CronWatch, watchEnabled)
 
 	// ---- HTTP 调试接口 ----
 	var httpSrv *http.Server

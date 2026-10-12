@@ -761,3 +761,68 @@ class TestMarketEnvironment:
         d = r.json()["data"]
         assert d["regime"] == "BEAR" and d["global_max_position_pct"] == 0.3
         assert "error" in d
+
+
+# ---------------------------------------------------------------------------
+# T1.7 动态自选股池 (Layer 0.5): watchlist_generator + /api/watchlist/generate
+# ---------------------------------------------------------------------------
+
+
+class TestWatchlistGenerator:
+    def test_momentum_pct(self):
+        from watchlist_generator import momentum_pct
+        assert momentum_pct([100] * 25 + [120], window=20) == pytest.approx(20.0)
+        assert momentum_pct([1] * 10, window=20) is None      # 样本不足
+        assert momentum_pct([0] * 30 + [1], window=20) is None  # 基期为 0/脏值被过滤后仍不足
+
+    def test_dedup_priority_and_st(self):
+        from watchlist_generator import dedup_entries, is_st_name, make_entry
+        entries = [
+            make_entry("600519", "贵州茅台", "MANUAL"),
+            make_entry("600519", "重复ETF", "ETF_MOMENTUM"),   # 后到同码 -> 丢弃, 保留 MANUAL
+            make_entry("300750", "宁德时代", "SECTOR_LEADER"),
+            make_entry("", "空代码", "FUND_FLOW"),              # 空 symbol -> 丢弃
+        ]
+        pool = dedup_entries(entries)
+        assert [(e["symbol"], e["source_type"]) for e in pool] == [
+            ("600519", "MANUAL"), ("300750", "SECTOR_LEADER")]
+        assert is_st_name("*ST海润") and not is_st_name("海润光电")
+
+    def test_generate_weak_dependency(self, monkeypatch):
+        """任一来源抛异常只进 warnings, 其余来源照常出结果 (弱依赖核心语义)。"""
+        import watchlist_generator as wg
+
+        boom = lambda: (_ for _ in ()).throw(RuntimeError("上游限流 mock"))
+        monkeypatch.setattr(wg, "_gen_etf_momentum", boom)
+        monkeypatch.setattr(wg, "_gen_sector_leaders", boom)
+        monkeypatch.setattr(
+            wg, "_gen_fund_flow_lhb",
+            lambda: [wg.make_entry("002594", "比亚迪", wg.SOURCE_FUND, "龙虎榜机构")],
+        )
+        out = wg.generate_watchlist(manual_symbols=["600519", "bad-code", "600519"])
+        assert out["total"] == 2                       # MANUAL 去重后 1 + FUND 1
+        assert out["by_source"] == {"MANUAL": 1, "FUND_FLOW": 1}
+        assert len(out["warnings"]) == 2               # ETF / SECTOR 两步失败均记录
+        assert out["pool"][0]["source_type"] == "MANUAL"
+
+
+class TestWatchlistEndpoint:
+    def test_generate_envelope_and_manual_validation(self, monkeypatch):
+        """非法 manual 代码隔离进 manual_errors; 合法透传; 信封字段完整。"""
+        import main as gw
+        from fastapi.testclient import TestClient
+        import watchlist_generator as wg
+
+        monkeypatch.setattr(wg, "_gen_etf_momentum", lambda: [])
+        monkeypatch.setattr(wg, "_gen_sector_leaders", lambda: [])
+        monkeypatch.setattr(wg, "_gen_fund_flow_lhb", lambda: [])
+
+        client = TestClient(gw.app, raise_server_exceptions=False)
+        resp = client.post("/api/watchlist/generate",
+                           json={"manual_symbols": ["600519", "123", "abc"]})
+        assert resp.status_code == 200
+        data = resp.json()["data"]
+        assert data["pool"][0]["symbol"] == "600519"
+        assert data["pool"][0]["source_type"] == "MANUAL"
+        assert len(data["manual_errors"]) == 2          # 123 / abc 被校验拒绝
+        assert "elapsed_seconds" in data and "trade_date" in data

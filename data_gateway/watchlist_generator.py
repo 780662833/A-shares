@@ -43,6 +43,8 @@ SOURCE_ETF = "ETF_MOMENTUM"
 SOURCE_FUND = "FUND_FLOW"
 
 _ST_RE = re.compile(r"(\*?ST)")
+# A股 6 位数字代码 (含北交所), 用于人工白名单入池前的格式校验
+_ACODE_RE = re.compile(r"^\d{6}$")
 
 
 # ---------------------------------------------------------------------------
@@ -110,9 +112,10 @@ def _safe_step(fn: Callable[[], List[Dict[str, Any]]], step: str,
 
 
 def _gen_manual(manual_symbols: List[str]) -> List[Dict[str, Any]]:
-    """来源4: 人工白名单, 直接透传 (Go 端负责补名称)。"""
+    """来源4: 人工白名单 —— 仅放行 6 位数字 A股代码, 非法格式静默剔除 (Go 端负责补名称)。"""
     return [make_entry(s.strip(), "", SOURCE_MANUAL, "人工自选")
-            for s in manual_symbols if str(s).strip()]
+            for s in manual_symbols
+            if _ACODE_RE.match(str(s).strip())]
 
 
 def _gen_etf_momentum() -> List[Dict[str, Any]]:
