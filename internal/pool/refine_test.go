@@ -33,6 +33,11 @@ func refineCfg() Config {
 	c.RequirePositiveEPS = true
 	c.MinROE = 0
 	c.RSWindow = 60
+	// 显式双窗口（20/60）: 契约默认口径, 夹具不依赖 DefaultConfig 的内部默认值,
+	// 避免"配置解析回落"与"窗口取值"两件事在同一用例里耦合（此前长窗未设置时
+	// 解析回落为短窗同值, 触发单窗口退化路径, 使双窗口用例失真）。
+	c.RSShortWindow = 20
+	c.RSLongWindow = 60
 	c.RSEnabled = true
 	c.RSTopK = 0
 	return c
@@ -167,17 +172,16 @@ func TestRefineRSSortTopKAndFuse(t *testing.T) {
 	f.stockBars = func(code string, lookback int) []DailyBar {
 		switch code {
 		case "600001":
-			return mkBars(10, 13, lookback) // +30 -> RS=+20
+			return mkFlat(61, 13, 10, 10) // R20 +30 / R60 +30 -> RS_index=+20
 		case "600002":
-			return mkBars(10, 12, lookback) // +20 -> RS=+10
+			return mkFlat(61, 12, 10, 10) // R20 +20 / R60 +20 -> RS_index=+10
 		case "600003":
-			return mkBars(10, 9.5, lookback) // -5 -> RS=-15
+			return mkFlat(61, 9.5, 10, 10) // R20 -5 / R60 -5 -> RS_index=-15
 		}
 		return nil
 	}
 	cfg := refineCfg()
-	cfg.RSShortWindow = 20
-	cfg.RSLongWindow = 20 // 单窗口退化: 中间分 = R20 超额
+	cfg.RSLongWindow = 20 // 单窗口退化: 中间分 = R20 超额（长窗端点样本不足）
 	poolIn := []AggEntry{
 		entryOf("600003", sourceSector),
 		entryOf("600001", sourceFund),
@@ -423,13 +427,19 @@ func TestRefineStrengthPathSemantics(t *testing.T) {
 	f.indexBars = func(idx string, lookback int) []DailyBar {
 		return mkFlat(61, 100, 100, 100)
 	}
+	// 行业指数 K 线: "测试" 行业 R20 = -10%（bars[n-21]=110 -> 99/110-1=-10）。
+	// 刻意让个股跑输行业，验证 A 路径的 RS20_sector>0 硬门槛——行业侧确认不过关时
+	// 必须诚实降级 B（契约 6.2: 未知或为负都不进 A），绝不允许"排名列前即 A"。
+	f.sectorIndexBars = func(name string, lookback int) []DailyBar {
+		return mkFlat(61, 99, 110, 110)
+	}
 	f.stockBars = func(code string, lookback int) []DailyBar {
 		switch code {
-		case "600001": // R20 +10, R60 +10 -> 总分 +10, 短期超额正, 排名1 -> A
+		case "600001": // R20 +10, R60 +10 -> 短期超额正 -> B（行业侧 -10 否决 A）
 			return mkFlat(61, 110, 100, 100)
-		case "600002": // R20 -5, R60 +20 -> 总分 0.6*(-5)+0.4*20=5, 中期强 -> B
+		case "600002": // R20 -5, R60 +20 -> 短期超额负 -> NONE（B 需 R20 与 RS20_index 皆正）
 			return mkFlat(61, 120, 126.316, 100) // 120/126.316-1=-5%, 120/100-1=+20%
-		case "600003": // R20 -10, R60 -10 -> 总分 -10 -> NONE
+		case "600003": // R20 -10, R60 -10 -> 双窗皆弱 -> NONE
 			return mkFlat(61, 90, 100, 100)
 		}
 		return nil
@@ -445,16 +455,18 @@ func TestRefineStrengthPathSemantics(t *testing.T) {
 	for _, e := range out {
 		byCode[e.Symbol] = e
 	}
-	if byCode["600001"].Strength != StrengthA {
-		t.Errorf("600001 want A, got %v (score %v)", byCode["600001"].Strength, byCode["600001"].RankScore)
+	if byCode["600001"].Strength != StrengthB {
+		t.Errorf("600001 want B (short-strong vs index but sector unconfirmed-negative), got %v (score %v)", byCode["600001"].Strength, byCode["600001"].RankScore)
 	}
-	if byCode["600002"].Strength != StrengthB {
-		t.Errorf("600002 want B (mid-term strong only), got %v (score %v)", byCode["600002"].Strength, byCode["600002"].RankScore)
+	if byCode["600002"].Strength != StrengthNone {
+		t.Errorf("600002 want NONE (R20 excess negative fails B admission), got %v (score %v)", byCode["600002"].Strength, byCode["600002"].RankScore)
 	}
 	if byCode["600003"].Strength != StrengthNone {
 		t.Errorf("600003 want NONE (both windows weak), got %v", byCode["600003"].Strength)
 	}
-	// 排序按总分降序: 600001(+10) > 600002(+5) > 600003(-10)
+	// 分段序 A→B→其余 + 段内按四因子百分位分降序连续编号：
+	// 600001(B, P(RS)=100/P(R60)=100 -> 100) RankPos=1；
+	// 600002(NONE, P(RS)=50/P(R60)=100 -> 75) RankPos=2；600003(全末位 -> 0) RankPos=3。
 	if byCode["600001"].RankPos != 1 || byCode["600002"].RankPos != 2 || byCode["600003"].RankPos != 3 {
 		t.Errorf("rank pos wrong: %+v", []int{byCode["600001"].RankPos, byCode["600002"].RankPos, byCode["600003"].RankPos})
 	}

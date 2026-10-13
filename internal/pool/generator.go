@@ -6,7 +6,7 @@
 //
 // 迁移后新增能力：全市场流动性初筛（原 Layer 0 base_filter 的 Go 化）——
 //
-//	非 ST、收盘价 >= MinPrice、近 20 日均成交额(代理: 当日成交额) >= MinAvgAmount、
+//	非 ST、收盘价 >= MinPrice、近 20 日均成交额(代理: 当日成交额) > MinAvgAmount、
 //	总市值 >= MinMarketCap；初筛结果作为 SECTOR/FUND 两个资金流来源的前置门槛。
 //
 // 弱依赖原则保持不变：任一来源失败仅记入 warnings，不影响其余来源；
@@ -264,7 +264,10 @@ func (g *Generator) Generate(ctx context.Context, manualSymbols []string, now ti
 
 	// ---- 全市场流动性初筛（Go 层新增, 供 SECTOR/FUND 两来源做前置门槛）----
 	// 弱依赖: 初筛失败仅记入 warnings 并退化为"不设门槛", 绝不阻断池子生成。
-	liquidSet, liquidityCount, err := g.liquidityScreen(ctx)
+	// 快照集合 liquidIdx 同时为 SECTOR 来源提供市值/20日均成交额字段,
+	// 使行业龙头排序可用真实市值口径（对齐 TS 端 filterBasicQuotes 的
+	// circulatingMarketCap 过滤 + 多条件本地筛选设计）。
+	liquidSet, liquidIdx, liquidityCount, err := g.liquidityScreen(ctx)
 	srcStatus := map[string]SourceStatus{"LIQUIDITY_SCREEN": StatusOK}
 	srcErrs := map[string]string{}
 	markSrc := func(name string, e error) {
@@ -294,7 +297,7 @@ func (g *Generator) Generate(ctx context.Context, manualSymbols []string, now ti
 	}
 
 	// ---- 来源 1: 行业龙头（行业资金流 Top N -> 板块成分股 Top K, 流动性门槛叠加）----
-	sectorEntries, err := g.genSectorLeaders(ctx, liquidSet)
+	sectorEntries, err := g.genSectorLeaders(ctx, liquidSet, liquidIdx)
 	if err != nil {
 		warnings = append(warnings, "SECTOR_LEADER 失败(已跳过): "+err.Error())
 	} else {
@@ -377,12 +380,13 @@ func (g *Generator) Generate(ctx context.Context, manualSymbols []string, now ti
 // ---------------------------------------------------------------------------
 
 // liquidityScreen 拉全市场快照并按 Config 阈值过滤, 返回通过集合(code->true)、
-// 通过数量与错误。语义约定: err != nil 时 set 为 nil, 调用方据此"不设门槛"退化;
+// 快照索引(code->StockQuote, 供来源侧做市值/流动性排序与补字段)、通过数量与错误。
+// 语义约定: err != nil 时 set/index 为 nil, 调用方据此"不设门槛"退化;
 // err == nil 且 set 非空时门槛生效。
-func (g *Generator) liquidityScreen(ctx context.Context) (map[string]bool, int, error) {
+func (g *Generator) liquidityScreen(ctx context.Context) (map[string]bool, map[string]StockQuote, int, error) {
 	quotes, err := g.prov.AllStocks(ctx)
 	if err != nil {
-		return nil, 0, err
+		return nil, nil, 0, err
 	}
 	passed := make([]StockQuote, 0, len(quotes)/4)
 	for _, q := range quotes {
@@ -395,7 +399,7 @@ func (g *Generator) liquidityScreen(ctx context.Context) (map[string]bool, int, 
 		if q.Price < g.cfg.MinPrice {
 			continue
 		}
-		if q.AvgAmount20D < g.cfg.MinAvgAmount {
+		if q.AvgAmount20D <= g.cfg.MinAvgAmount {
 			continue
 		}
 		if g.cfg.MinMarketCap > 0 && q.TotalMarketCap > 0 && q.TotalMarketCap < g.cfg.MinMarketCap {
@@ -409,22 +413,24 @@ func (g *Generator) liquidityScreen(ctx context.Context) (map[string]bool, int, 
 		passed = passed[:g.cfg.LiquidityTopN]
 	}
 	set := make(map[string]bool, len(passed))
+	idx := make(map[string]StockQuote, len(passed))
 	for _, q := range passed {
 		set[q.Code] = true
+		idx[q.Code] = q
 	}
 	if len(set) == 0 {
 		// 上游快照异常导致全军覆没: 视为初筛失败, 调用方退化为不设门槛,
 		// 绝不因数据问题把资金流来源整体清空。
-		return nil, 0, context.DeadlineExceeded // 语义: 初筛通过数为 0
+		return nil, nil, 0, context.DeadlineExceeded // 语义: 初筛通过数为 0
 	}
-	return set, len(set), nil
+	return set, idx, len(set), nil
 }
 
 // ---------------------------------------------------------------------------
 // 来源 1: 行业龙头
 // ---------------------------------------------------------------------------
 
-func (g *Generator) genSectorLeaders(ctx context.Context, liquidSet map[string]bool) ([]Entry, error) {
+func (g *Generator) genSectorLeaders(ctx context.Context, liquidSet map[string]bool, liquidIdx map[string]StockQuote) ([]Entry, error) {
 	rank, err := g.prov.SectorFundFlowRank(ctx)
 	if err != nil {
 		return nil, err
@@ -462,10 +468,28 @@ func (g *Generator) genSectorLeaders(ctx context.Context, liquidSet map[string]b
 		if len(filtered) == 0 {
 			continue // 该板块成分股全部未过门槛, 跳过
 		}
-		// 龙头口径: 按最新价降序取 Top K。
-		// （stock-go BoardConstituent 无市值字段, 市值排序不可得; 流动性/规模
-		// 门槛已由 liquidSet 全市场初筛叠加保证, 价格排序为可得的龙头代理。）
-		sort.SliceStable(filtered, func(i, j int) bool { return filtered[i].Price > filtered[j].Price })
+		// 龙头口径（对齐 TS 端"多因子本地筛选 + 排序"设计, 分三级键降级）:
+		//   1) 总市值降序 —— 初筛快照带市值时优先, 真实龙头代理;
+		//   2) 最新价降序 —— 无市值时的可得上游字段;
+		//   3) 代码升序 —— 全缺失时保证确定性。
+		// stock-go BoardConstituent 本身无市值字段, 市值经 liquidIdx 关联补齐。
+		val := func(c ConstituentStock) (cap, price float64) {
+			if q, ok := liquidIdx[c.Code]; ok {
+				return q.TotalMarketCap, q.Price
+			}
+			return 0, c.Price
+		}
+		sort.SliceStable(filtered, func(i, j int) bool {
+			ci, pi := val(filtered[i])
+			cj, pj := val(filtered[j])
+			if ci != cj {
+				return ci > cj
+			}
+			if pi != pj {
+				return pi > pj
+			}
+			return filtered[i].Code < filtered[j].Code
+		})
 		if len(filtered) > g.cfg.SectorLeadersK {
 			filtered = filtered[:g.cfg.SectorLeadersK]
 		}
