@@ -361,8 +361,9 @@ func TestRefineDualWindowWeightedScore(t *testing.T) {
 	// 尾部日期与 as_of(testNow=asOfDate 当日) 对齐。
 	f.barsOHLC = func(code string, lookback int) []barOHLC { return mkOHLCFromDaily(sb) }
 	cfg := refineCfg() // RSShortWindow=20, RSLongWindow=60, weight=60%
-	in := entryOf("600001", sourceSector)
-	out, _ := runRefine(t, f, cfg, []AggEntry{in})
+	// 显式注入短/长窗口 20/60: 基准与个股都是固定 61 根序列, R20/R60 端点语义唯一,
+	// 不依赖 fake 钩子对 lookback 的透传方式。
+	out, _ := runRefineDual(t, f, cfg, []AggEntry{entryOf("600001", sourceSector)}, 20, 60)
 	if len(out) != 1 {
 		t.Fatalf("entry must survive, got %d", len(out))
 	}
@@ -389,16 +390,16 @@ func TestRefineStrengthPathSemantics(t *testing.T) {
 	f.qualify = func(code string) *StockQualification { return qual("2020-01-01", 1, 5) }
 	// 基准两窗口均为 +0%（横盘：现价=R20端点=R60端点=100）
 	f.indexBars = func(idx string, lookback int) []DailyBar {
-		return mkFlat(lookback, 100, 100, 100)
+		return mkFlat(61, 100, 100, 100)
 	}
 	f.stockBars = func(code string, lookback int) []DailyBar {
 		switch code {
 		case "600001": // R20 +10, R60 +10 -> 总分 +10, 短期超额正, 排名1 -> A
-			return mkFlat(lookback, 110, 100, 100)
+			return mkFlat(61, 110, 100, 100)
 		case "600002": // R20 -5, R60 +20 -> 总分 0.6*(-5)+0.4*20=5, 中期强 -> B
-			return mkFlat(lookback, 120, 126.316, 100) // 120/126.316-1=-5%, 120/100-1=+20%
+			return mkFlat(61, 120, 126.316, 100) // 120/126.316-1=-5%, 120/100-1=+20%
 		case "600003": // R20 -10, R60 -10 -> 总分 -10 -> NONE
-			return mkFlat(lookback, 90, 100, 100)
+			return mkFlat(61, 90, 100, 100)
 		}
 		return nil
 	}
@@ -492,11 +493,14 @@ func TestRefineSingleWindowDegeneration(t *testing.T) {
 func TestRefineInvalidWindowsFallback(t *testing.T) {
 	f := newFake()
 	f.qualify = func(code string) *StockQualification { return qual("2020-01-01", 1, 5) }
-	f.indexBars = func(idx string, lookback int) []DailyBar { return mkFlat(lookback, 100, 100, 100) }
-	// 个股现价 13、R20 端点 10 -> R20=+30%；R60 端点与现价同值 -> R60=0。
-	// 非法 RSShortWindow=90 回落 20、RSLongWindow=0 取 RSWindow=60 后，
-	// 总分 = 0.6*30 + 0.4*0 = 18（基准两窗口均 0），精确断言回落口径生效。
-	f.stockBars = func(code string, lookback int) []DailyBar { return mkFlat(lookback, 13, 10, 13) }
+	// 基准固定 61 根: R20 端点=现价=100 -> 基准R20=0; R60 端点=80 -> 基准R60=+25%
+	f.indexBars = func(idx string, lookback int) []DailyBar { return mkFlat(61, 100, 100, 80) }
+	// 个股固定 61 根: 现价 13、R20 端点 10、R60 端点 10 -> R20=R60=+30%
+	// 回落正确(short=20,long=60): R20超额=30-0=30, R60超额=30-25=5
+	//   总分 = 0.6*30 + 0.4*5 = 20。
+	// 若非法 short=90 未回落被直接采用: needBars(90)=91 > 61 -> 短窗样本不足,
+	//   单窗口退化只用长窗打分 -> 总分=5 ≠ 20，断言可区分两种口径。
+	f.stockBars = func(code string, lookback int) []DailyBar { return mkFlat(61, 13, 10, 10) }
 	cfg := refineCfg()
 	cfg.RSShortWindow = 90 // >= longWin(60) -> 非法, 应回落 20
 	cfg.RSLongWindow = 0   // 非法 -> 取 RSWindow=60
@@ -505,8 +509,8 @@ func TestRefineInvalidWindowsFallback(t *testing.T) {
 		t.Fatalf("entry must survive, got %d", len(out))
 	}
 	e := out[0]
-	if e.RankScore < 17.9 || e.RankScore > 18.1 {
-		t.Errorf("invalid config must fall back to contract defaults (20/60), score want ~18 (0.6*30+0.4*0), got %v", e.RankScore)
+	if e.RankScore < 19.9 || e.RankScore > 20.1 {
+		t.Errorf("invalid config must fall back to contract defaults (20/60), score want ~20 (0.6*30+0.4*5), got %v", e.RankScore)
 	}
 	if e.RetShortExcess == nil || *e.RetShortExcess < 29.9 || *e.RetShortExcess > 30.1 {
 		t.Errorf("want R20 excess ~30 after fallback, got %v", e.RetShortExcess)

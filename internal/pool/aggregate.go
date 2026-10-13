@@ -111,6 +111,15 @@ type AggEntry struct {
 	// Scored 标记该条目是否实际参与 RS 打分（refinePool 设置）。未打分的股票类
 	// 条目 Strength 保持 Unset、RankPos=0 —— 防止"未打分"被误判为"打分后落选"。
 	Scored bool `json:"scored,omitempty"`
+
+	// ---- 阶段 6: 财务快照溯源四字段（契约硬要求, 由 FinancialProvider 回填）----
+	// report_period / announcement_date 决定回测可见性（只能使用公告日 <= as_of
+	// 的快照, 防未来数据污染）; data_as_of + provider 保证可审计与新鲜度校验。
+	FinReportPeriod   string `json:"fin_report_period,omitempty"`
+	FinAnnounceDate   string `json:"fin_announcement_date,omitempty"`
+	FinDataAsOf       string `json:"fin_data_as_of,omitempty"`
+	FinProviderSource string `json:"fin_provider,omitempty"`
+	FinReasons        string `json:"fin_reasons,omitempty"` // WARN/BLOCKED/DATA_INSUFFICIENT 判定理由（审计用）
 }
 
 // Tradability 状态常量（最终交易资格, 进入审批流程的唯一闸门）。
@@ -163,8 +172,13 @@ func (e *AggEntry) ComputeTradability() {
 		// 样本不足无法计算 ADV -> 诚实 UNKNOWN（不放行也不剔除）。
 		e.Tradability = TradUnknown
 		e.BlockedBy = "LIQUIDITY_DATA"
-	case e.Eligibility == EligUnknown || e.Financial == FinDataInsufficient:
+	case e.Eligibility == EligUnknown:
 		e.Tradability = TradUnknown
+		e.BlockedBy = "ELIGIBILITY_DATA"
+	case e.Financial == FinDataInsufficient:
+		// 阶段 6: 财务快照缺失/过期 -> UNKNOWN（不放行也不剔除, 显示缺失原因）
+		e.Tradability = TradUnknown
+		e.BlockedBy = "FINANCIAL_DATA"
 	default:
 		e.Tradability = TradEligible
 	}

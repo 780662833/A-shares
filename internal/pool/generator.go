@@ -173,7 +173,14 @@ type Generator struct {
 	// 黑名单事实位与 first/last_seen 生命周期锚点, 供聚合阶段消费。
 	// nil-safe: 单测可不接 DB。由 cmd/main.go 接线。
 	PersistentStatus func(ctx context.Context) map[string]AggEntry
+	// finProv 阶段 6: 独立财务数据供应商（stock-go 无财报 API）。nil 时精筛闸门
+	// 诚实输出 FinDataInsufficient —— 绝不把"财务未知"默认成"财务已通过"。
+	// 由 SetFinancialProvider 注入; 单测注入 fake 实现。
+	finProv FinancialProvider
 }
+
+// SetFinancialProvider 注入阶段 6 财务数据供应商（外部财报服务 / 测试 fake）。
+func (g *Generator) SetFinancialProvider(p FinancialProvider) { g.finProv = p }
 
 // NewGenerator 创建生成器。cfg 为零值时取 DefaultConfig；对显式传入但缺省的
 // 精筛字段做兜底（避免调用方只覆盖部分来源参数时 RS/资格闸门静默失效）。

@@ -180,7 +180,8 @@ func (g *Generator) refinePoolWith(ctx context.Context, pool []AggEntry, warning
 				}
 				if reason, reject := g.qualifyReject(q, now); reject {
 					res.rejected, res.reason = true, reason
-					res.finBlock = strings.Contains(reason, "EPS") || strings.Contains(reason, "ROE")
+					// finBlock 仅标记"财务维度"否决(画像 EPS/ROE); 上市时长等资格闸门不算财务结论
+					res.finBlock = strings.Contains(reason, "EPS") || strings.Contains(reason, "ROE中位数")
 				}
 			}
 
@@ -213,7 +214,7 @@ func (g *Generator) refinePoolWith(ctx context.Context, pool []AggEntry, warning
 
 			if !res.rejected && g.cfg.RSEnabled {
 				// 阶段 5: 一次取 max(R20,R60)+1 根 K 线, 同序列上计算双窗口收益（避免两次 RPC 口径不一致）
-				bars, err := g.prov.StockBars(ctx, code, maxWin, now)
+				bars, err := g.prov.StockBars(ctx, code, needBars(maxWin), now)
 				if err != nil || len(bars) < needBars(shortWin) {
 					res.unknown = true
 				} else {
@@ -236,7 +237,9 @@ func (g *Generator) refinePoolWith(ctx context.Context, pool []AggEntry, warning
 	// ---- 基准指数同期涨跌幅（阶段 5: 双窗口, 与个股同一条 K 线序列计算）----
 	var benchChg, benchChgShort *float64
 	if g.cfg.RSEnabled {
-		bars, err := g.prov.IndexBars(ctx, g.cfg.RSBenchmark, maxWin, now)
+		// 请求 needBars(maxWin)=maxWin+1 根: lookback 与 pctChangeOver 的样本口径
+		// 统一为 needBars(window)，fake/SDK 按请求条数精确截断也不会移动窗口端点。
+		bars, err := g.prov.IndexBars(ctx, g.cfg.RSBenchmark, needBars(maxWin), now)
 		if err == nil && len(bars) >= needBars(shortWin) {
 			benchChgShort = pctChangeOver(bars, shortWin)
 			if len(bars) >= needBars(longWin) {
@@ -249,6 +252,57 @@ func (g *Generator) refinePoolWith(ctx context.Context, pool []AggEntry, warning
 	}
 
 	// ---- 应用闸门与打分 ----
+	// 阶段 6: 独立 FinancialProvider 并发取财务快照（弱依赖：供应商未接入/取数
+	// 失败一律 FinDataInsufficient, 绝不默认"已通过"; 也不阻断整池生成）。
+	finStatus := make([]FinancialStatus, len(stockIdx))
+	finReasons := make([][]string, len(stockIdx))
+	for k := range finStatus {
+		finStatus[k] = FinDataInsufficient
+	}
+	if g.cfg.QualifyEnabled {
+		var fwg sync.WaitGroup
+		fsem := make(chan struct{}, g.cfg.RSConcurrency)
+		for k, idx := range stockIdx {
+			fwg.Add(1)
+			go func(k, idx int) {
+				defer fwg.Done()
+				fsem <- struct{}{}
+				defer func() { <-fsem }()
+				if g.finProv == nil {
+					finReasons[k] = []string{ErrFinancialNotWired.Error()}
+					return
+				}
+				s, err := g.finProv.GetFinSnapshot(ctx, pool[idx].Symbol, now)
+				if err != nil || s == nil {
+					finReasons[k] = []string{fmt.Sprintf("财务供应商取数失败: %v", err)}
+					return
+				}
+				st, rs := classifyFinSnapshot(s, now)
+				finStatus[k] = st
+				finReasons[k] = rs
+				pe, pa, pd, pp := s.metaFields()
+				pool[idx].FinReportPeriod = pe
+				pool[idx].FinAnnounceDate = pa
+				pool[idx].FinDataAsOf = pd
+				pool[idx].FinProviderSource = pp
+			}(k, idx)
+		}
+		fwg.Wait()
+		var nBlocked, nWarn, nInsuf int
+		for _, st := range finStatus {
+			switch st {
+			case FinBlocked:
+				nBlocked++
+			case FinWarn:
+				nWarn++
+			case FinDataInsufficient:
+				nInsuf++
+			}
+		}
+		*warnings = append(*warnings, fmt.Sprintf("FINANCIAL 闸门完成: BLOCKED %d, WARN(降权) %d, DATA_INSUFFICIENT %d%s",
+			nBlocked, nWarn, nInsuf, map[bool]string{true: ", provider 未接入(全部按数据不足处理)", false: ""}[g.finProv == nil]))
+	}
+
 	var unknownN, rejectedN int
 	kept := make([]AggEntry, 0, len(stockIdx))
 	dropped := make([]AggEntry, 0, len(stockIdx))
@@ -267,7 +321,34 @@ func (g *Generator) refinePoolWith(ctx context.Context, pool []AggEntry, warning
 			e.Financial = FinDataInsufficient
 		default:
 			e.Eligibility = EligPass
-			e.Financial = FinPass
+			// 阶段 6: 精筛开启时旧画像启发式不再自动给出"财务 PASS"结论 ——
+			// 权威快照不可得(provider 未接入/取数失败)保持 DATA_INSUFFICIENT;
+			// 接入后由上方 finStatus 覆盖规则统一回填。仅精筛关闭(无 provider
+			// 链路, 兼容迁移版行为)时才沿用默认 PASS。
+			if g.cfg.QualifyEnabled {
+				e.Financial = FinDataInsufficient
+			} else {
+				e.Financial = FinPass
+			}
+		}
+		// ---- 阶段 6 覆盖规则（精筛开启即生效; provider 未接入时快照循环已把全部
+		// 条目诚实初始化为 FinDataInsufficient + "provider 未接入"理由）----
+		// 旧画像 EPS/ROE 启发式保留为兜底; 权威财务快照的判定优先。
+		if g.cfg.QualifyEnabled {
+			// provider 未接入时快照不可得, 不得用旧启发式的"默认 PASS"吞掉未知;
+			// 其余状态（WARN/BLOCKED/PASS）来自真实快照, 一律覆盖旧启发式结论。
+			if !(g.finProv == nil && finStatus[k] == FinDataInsufficient) {
+				e.Financial = finStatus[k]
+			}
+			if len(finReasons[k]) > 0 {
+				e.FinReasons = strings.Join(finReasons[k], "; ")
+			}
+			// 重大风险确认 -> BLOCKED 硬排除（不进可交易队列, 记录保留）。
+			// 注意: 不翻转 Eligibility —— 股票可以符合研究资格却因财务被禁新单
+			// （eligibility 与 tradability 分离，见阶段 3 契约）。
+			if finStatus[k] == FinBlocked {
+				res.rejected, res.reason = true, "财务重大风险:"+e.FinReasons
+			}
 		}
 		if res.rejected {
 			rejectedN++
@@ -315,6 +396,13 @@ func (g *Generator) refinePoolWith(ctx context.Context, pool []AggEntry, warning
 			if haveL {
 				v := round2(lExcess)
 				e.RetLongExcess = &v
+			}
+			// 阶段 6: WARN 财务质量弱项 -> 排序降权（PASS=1.0, WARN=0.5）。
+			// 只影响名次, 不删除记录；BLOCKED 已在上方硬排除, 不会走到这里。
+			if g.cfg.QualifyEnabled {
+				if p := finRankPenalty(e.Financial); p != 1.0 {
+					e.RankScore = round2(e.RankScore * p)
+				}
 			}
 		}
 		kept = append(kept, e)
@@ -405,7 +493,9 @@ func (g *Generator) refinePoolWith(ctx context.Context, pool []AggEntry, warning
 			switch {
 			case kept[i].RetShortExcess != nil && *kept[i].RetShortExcess > 0 &&
 				(onlyShort || inShortTopThird):
-				kept[i].Strength = StrengthA; t1 := true; _ = t1
+				kept[i].Strength = StrengthA
+				t1 := true
+				_ = t1
 			case kept[i].RetLongExcess != nil && *kept[i].RetLongExcess > 0:
 				kept[i].Strength = StrengthB
 			default:
