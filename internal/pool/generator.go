@@ -43,6 +43,17 @@ type Config struct {
 	MinMarketCap  float64 // 最低总市值（元, 默认 5e9 = 50 亿; 0 表示缺失时放行）
 	ExcludeST     bool    // 剔除 ST/*ST（默认 true）
 	LiquidityTopN int     // 通过初筛的股票按成交额保留前 N 只做后续叠加（默认 400, 控制规模）
+
+	// ---- 精筛管线：证券资格 / 财务状态 / 相对强度排序（Layer 0.75, Go 层新增）----
+	QualifyEnabled     bool    // 总开关（默认 true）; false 时行为与迁移版完全一致
+	MinListedDays      int     // 证券资格: 上市满 N 自然日方可入池（默认 120; 次新波动大且无足够 RS 样本）
+	RequirePositiveEPS bool    // 财务状态: 最近一期基本 EPS < 0 剔除（默认 true; 数据缺失放行）
+	MinROE             float64 // 财务状态: 加权 ROE 下限 %（默认 0 = 仅剔除明确负 ROE; -1e9 可关闭）
+	RSWindow           int     // 相对强度: 回看交易日数（默认 60）
+	RSBenchmark        string  // 相对强度基准指数代码（默认 "000300" 沪深300）
+	RSEnabled          bool    // 是否执行 RS 打分与排序（默认 true; 失败自动退化保持原顺序）
+	RSTopK             int     // RS 排序后仅保留前 K 名股票类条目（默认 0 = 全部保留但仍排序）
+	RSConcurrency      int     // RS/资格计算并发度（默认 6）
 }
 
 // DefaultConfig 返回与 Python 版对齐的默认参数。
@@ -61,6 +72,16 @@ func DefaultConfig() Config {
 		MinMarketCap:   5e9,
 		ExcludeST:      true,
 		LiquidityTopN:  400,
+
+		QualifyEnabled:     true,
+		MinListedDays:      120,
+		RequirePositiveEPS: true,
+		MinROE:             0,
+		RSWindow:           60,
+		RSBenchmark:        "000300",
+		RSEnabled:          true,
+		RSTopK:             0,
+		RSConcurrency:      6,
 	}
 }
 
@@ -74,6 +95,15 @@ type Entry struct {
 	Momentum20DPct *float64 `json:"momentum_20d_pct,omitempty"`
 	OrgNetBuy      *float64 `json:"org_net_buy,omitempty"`
 	AvgAmount20D   *float64 `json:"avg_amount_20d,omitempty"`
+
+	// ---- Go 精筛管线新增诊断字段（WatchlistGenData 无对应列, round-trip 自然丢弃）----
+	RankScore float64 `json:"rank_score,omitempty"` // RS 相对强度得分（RSWindow 日超额收益 %）
+	RankPos   int     `json:"rank_pos,omitempty"`   // 排序后名次（1 起）; 0 表示未参与 RS 排序
+
+	// ---- 阶段 2 契约状态（聚合层回填 AggEntry 用; 同样被 round-trip 丢弃）----
+	EligibilityStatus EligibilityStatus `json:"eligibility_status,omitempty"`
+	FinancialStatusV  FinancialStatus   `json:"financial_status,omitempty"`
+	StrengthPathV     StrengthPath      `json:"strength_path,omitempty"`
 }
 
 // Result 一次生成的完整输出（tool.WatchlistGenData 的同构体 + Go 层新增诊断字段）。
@@ -81,7 +111,7 @@ type Result struct {
 	TradeDate string         `json:"trade_date"`
 	Total     int            `json:"total"`
 	BySource  map[string]int `json:"by_source"`
-	Pool      []Entry        `json:"pool"`
+	Pool      []AggEntry     `json:"pool"`
 	Warnings  []string       `json:"warnings"`
 
 	// LiquidityPassed 通过全市场流动性初筛的股票数（诊断字段, Go 层迁移新增;
@@ -120,12 +150,31 @@ func isETFCode(code string) bool {
 type Generator struct {
 	prov Provider
 	cfg  Config
+	// PersistentStatus 可选钩子：从持久层（watchlist_items）回填每条记录的
+	// 黑名单事实位与 first/last_seen 生命周期锚点, 供聚合阶段消费。
+	// nil-safe: 单测可不接 DB。由 cmd/main.go 接线。
+	PersistentStatus func(ctx context.Context) map[string]AggEntry
 }
 
-// NewGenerator 创建生成器。cfg 为零值时取 DefaultConfig。
+// NewGenerator 创建生成器。cfg 为零值时取 DefaultConfig；对显式传入但缺省的
+// 精筛字段做兜底（避免调用方只覆盖部分来源参数时 RS/资格闸门静默失效）。
 func NewGenerator(prov Provider, cfg Config) *Generator {
 	if cfg.SectorTopN == 0 {
 		cfg = DefaultConfig()
+	} else {
+		d := DefaultConfig()
+		if cfg.MinListedDays == 0 && cfg.QualifyEnabled {
+			cfg.MinListedDays = d.MinListedDays
+		}
+		if cfg.RSWindow == 0 && cfg.RSEnabled {
+			cfg.RSWindow = d.RSWindow
+		}
+		if cfg.RSBenchmark == "" {
+			cfg.RSBenchmark = d.RSBenchmark
+		}
+		if cfg.RSConcurrency <= 0 {
+			cfg.RSConcurrency = d.RSConcurrency
+		}
 	}
 	return &Generator{prov: prov, cfg: cfg}
 }
@@ -134,7 +183,7 @@ func NewGenerator(prov Provider, cfg Config) *Generator {
 // now 注入以便测试时间边界。
 func (g *Generator) Generate(ctx context.Context, manualSymbols []string, now time.Time) (*Result, error) {
 	warnings := []string{}
-	pool := []Entry{}
+	raw := []Entry{}
 	tradeDate := now.Format("2006-01-02")
 
 	// ---- 来源 4: 人工白名单（无网络, 永不失败）----
@@ -143,7 +192,7 @@ func (g *Generator) Generate(ctx context.Context, manualSymbols []string, now ti
 		if code == "" {
 			continue
 		}
-		pool = append(pool, g.entry(code, "", sourceManual, "人工自选"))
+		raw = append(raw, g.entry(code, "", sourceManual, "人工自选"))
 	}
 
 	// ---- 全市场流动性初筛（Go 层新增, 供 SECTOR/FUND 两来源做前置门槛）----
@@ -159,7 +208,7 @@ func (g *Generator) Generate(ctx context.Context, manualSymbols []string, now ti
 	if err != nil {
 		warnings = append(warnings, "ETF_MOMENTUM 失败(已跳过): "+err.Error())
 	} else {
-		pool = append(pool, etfEntries...)
+		raw = append(raw, etfEntries...)
 	}
 
 	// ---- 来源 1: 行业龙头（行业资金流 Top N -> 板块成分股 Top K, 流动性门槛叠加）----
@@ -167,7 +216,7 @@ func (g *Generator) Generate(ctx context.Context, manualSymbols []string, now ti
 	if err != nil {
 		warnings = append(warnings, "SECTOR_LEADER 失败(已跳过): "+err.Error())
 	} else {
-		pool = append(pool, sectorEntries...)
+		raw = append(raw, sectorEntries...)
 	}
 
 	// ---- 来源 3: 龙虎榜机构净买入（叠加流动性门槛）----
@@ -175,13 +224,31 @@ func (g *Generator) Generate(ctx context.Context, manualSymbols []string, now ti
 	if err != nil {
 		warnings = append(warnings, "FUND_FLOW 失败(已跳过): "+err.Error())
 	} else {
-		pool = append(pool, fundEntries...)
+		raw = append(raw, fundEntries...)
 	}
 
-	pool = dedupEntries(pool)
+	// ---- 持久层状态注入（黑名单事实位 + 既有生命周期锚点; nil-safe, 单测可不接 DB）----
+	var statusOf func(string) *AggEntry
+	if g.PersistentStatus != nil {
+		ps := g.PersistentStatus(ctx)
+		statusOf = func(code string) *AggEntry {
+			v, ok := ps[code]
+			if !ok {
+				return nil
+			}
+			return &v
+		}
+	}
+	pool := aggregateEntries(raw, tradeDate, now, statusOf)
+
+	// ---- Layer 0.75 精筛管线：证券资格 + 财务状态闸门 -> RS 相对强度排序（Go 层新增）----
+	if g.cfg.QualifyEnabled {
+		pool = g.refinePool(ctx, pool, &warnings, now)
+	}
+
 	bySource := map[string]int{}
 	for _, e := range pool {
-		bySource[e.SourceType]++
+		bySource[e.PrimarySource]++
 	}
 
 	return &Result{

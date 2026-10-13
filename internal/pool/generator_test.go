@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 )
@@ -23,6 +24,12 @@ type fakeProvider struct {
 	errAll       error
 	errStocks    error
 	calls        map[string]int
+	mu           sync.Mutex // refinePool 并发打分时保护 calls map
+
+	// 精筛管线测试钩子（nil = 数据缺失，走未知放行退化路径）
+	qualify   func(code string) *StockQualification
+	stockBars func(code string, lookback int) []DailyBar
+	indexBars func(indexCode string, lookback int) []DailyBar
 }
 
 func newFake() *fakeProvider {
@@ -30,38 +37,74 @@ func newFake() *fakeProvider {
 }
 
 func (f *fakeProvider) AllStocks(ctx context.Context) ([]StockQuote, error) {
-	f.calls["AllStocks"]++
+	func() { f.mu.Lock(); defer f.mu.Unlock(); f.calls["AllStocks"]++ }()
 	if f.errStocks != nil {
 		return nil, f.errStocks
 	}
 	return f.stocks, nil
 }
 func (f *fakeProvider) SectorFundFlowRank(ctx context.Context) ([]SectorFlow, error) {
-	f.calls["SectorRank"]++
+	func() { f.mu.Lock(); defer f.mu.Unlock(); f.calls["SectorRank"]++ }()
 	return f.sectorRank, nil
 }
 func (f *fakeProvider) IndustryConstituents(ctx context.Context, board string) ([]ConstituentStock, error) {
-	f.calls["Constituents:"+board]++
+	func() { f.mu.Lock(); defer f.mu.Unlock(); f.calls["Constituents:"+board]++ }()
 	return f.constituents[board], nil
 }
 func (f *fakeProvider) DragonTigerInstitution(ctx context.Context, start, end time.Time) ([]InstitutionBuy, error) {
-	f.calls["DragonTiger"]++
+	func() { f.mu.Lock(); defer f.mu.Unlock(); f.calls["DragonTiger"]++ }()
 	return f.dragon, nil
 }
 func (f *fakeProvider) FundList(ctx context.Context) ([]string, error) {
-	f.calls["FundList"]++
+	func() { f.mu.Lock(); defer f.mu.Unlock(); f.calls["FundList"]++ }()
 	return f.fundCodes, nil
 }
 func (f *fakeProvider) FundBatchQuote(ctx context.Context, codes []string) ([]FundSnapshot, error) {
-	f.calls["FundQuote"]++
+	func() { f.mu.Lock(); defer f.mu.Unlock(); f.calls["FundQuote"]++ }()
 	return f.fundSnaps, nil
 }
 func (f *fakeProvider) ETFCloseSeries(ctx context.Context, code string, lookback int, end time.Time) (*DailyClose, error) {
-	f.calls["Kline:"+code]++
+	func() { f.mu.Lock(); defer f.mu.Unlock(); f.calls["Kline:"+code]++ }()
 	if f.kline == nil {
 		return nil, errors.New("no kline")
 	}
 	return f.kline(code), nil
+}
+
+// ---- 精筛管线三方法（默认"数据缺失"退化：旧测试全部走未知放行路径）----
+
+func (f *fakeProvider) StockQualification(ctx context.Context, code string) (*StockQualification, error) {
+	func() { f.mu.Lock(); defer f.mu.Unlock(); f.calls["Qualify:"+code]++ }()
+	if f.qualify != nil {
+		return f.qualify(code), nil
+	}
+	return nil, errors.New("no qualification")
+}
+
+func (f *fakeProvider) StockBars(ctx context.Context, code string, lookback int, end time.Time) ([]DailyBar, error) {
+	func() { f.mu.Lock(); defer f.mu.Unlock(); f.calls["StockBars:"+code]++ }()
+	if f.stockBars != nil {
+		return f.stockBars(code, lookback), nil
+	}
+	return nil, errors.New("no stock bars")
+}
+
+func (f *fakeProvider) IndexBars(ctx context.Context, indexCode string, lookback int, end time.Time) ([]DailyBar, error) {
+	func() { f.mu.Lock(); defer f.mu.Unlock(); f.calls["IndexBars:"+indexCode]++ }()
+	if f.indexBars != nil {
+		return f.indexBars(indexCode, lookback), nil
+	}
+	return nil, errors.New("no index bars")
+}
+
+// mkBars 生成 lookback+1 根升序日 K，收盘从 base 线性走到 last。
+func mkBars(base, last float64, n int) []DailyBar {
+	bars := make([]DailyBar, 0, n+1)
+	step := (last - base) / float64(n)
+	for i := 0; i <= n; i++ {
+		bars = append(bars, DailyBar{Date: fmt.Sprintf("d%03d", i), Close: base + step*float64(i)})
+	}
+	return bars
 }
 
 var testNow = time.Date(2026, 10, 12, 15, 0, 0, 0, time.UTC)

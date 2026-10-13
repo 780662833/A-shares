@@ -77,6 +77,70 @@ type appConfig struct {
 	WatchTimeout time.Duration // 网关 /api/watchlist/generate 单次调用超时
 	PoolSource   string        // ASHARE_POOL_SOURCE: go | python（默认 python, 灰度开关）
 	PoolTimeout  time.Duration // Go 原生池单次生成超时
+	PoolCfg      pool.Config   // Go 原生池精筛管线参数（ASHARE_REFINE_* / ASHARE_RS_* 环境变量覆盖 DefaultConfig）
+}
+
+// applyPoolEnvOverrides 用环境变量覆盖精筛管线参数；非法值告警并保持原值。
+func applyPoolEnvOverrides(c *pool.Config) {
+	if v := strings.TrimSpace(os.Getenv("ASHARE_REFINE_ENABLED")); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			c.QualifyEnabled = b
+		} else {
+			log.Printf("WARN: invalid ASHARE_REFINE_ENABLED=%q, keep %v", v, c.QualifyEnabled)
+		}
+	}
+	if v := strings.TrimSpace(os.Getenv("ASHARE_MIN_LISTED_DAYS")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			c.MinListedDays = n
+		} else {
+			log.Printf("WARN: invalid ASHARE_MIN_LISTED_DAYS=%q, keep %d", v, c.MinListedDays)
+		}
+	}
+	if v := strings.TrimSpace(os.Getenv("ASHARE_REQUIRE_POSITIVE_EPS")); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			c.RequirePositiveEPS = b
+		} else {
+			log.Printf("WARN: invalid ASHARE_REQUIRE_POSITIVE_EPS=%q, keep %v", v, c.RequirePositiveEPS)
+		}
+	}
+	if v := strings.TrimSpace(os.Getenv("ASHARE_MIN_ROE")); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			c.MinROE = f
+		} else {
+			log.Printf("WARN: invalid ASHARE_MIN_ROE=%q, keep %v", v, c.MinROE)
+		}
+	}
+	if v := strings.TrimSpace(os.Getenv("ASHARE_RS_ENABLED")); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			c.RSEnabled = b
+		} else {
+			log.Printf("WARN: invalid ASHARE_RS_ENABLED=%q, keep %v", v, c.RSEnabled)
+		}
+	}
+	if v := strings.TrimSpace(os.Getenv("ASHARE_RS_WINDOW")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			c.RSWindow = n
+		} else {
+			log.Printf("WARN: invalid ASHARE_RS_WINDOW=%q, keep %d", v, c.RSWindow)
+		}
+	}
+	if v := strings.TrimSpace(os.Getenv("ASHARE_RS_BENCHMARK")); v != "" {
+		c.RSBenchmark = v
+	}
+	if v := strings.TrimSpace(os.Getenv("ASHARE_RS_TOPK")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			c.RSTopK = n
+		} else {
+			log.Printf("WARN: invalid ASHARE_RS_TOPK=%q, keep %d", v, c.RSTopK)
+		}
+	}
+	if v := strings.TrimSpace(os.Getenv("ASHARE_RS_CONCURRENCY")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			c.RSConcurrency = n
+		} else {
+			log.Printf("WARN: invalid ASHARE_RS_CONCURRENCY=%q, keep %d", v, c.RSConcurrency)
+		}
+	}
 }
 
 func loadConfig() appConfig {
@@ -120,6 +184,8 @@ func loadConfig() appConfig {
 			log.Printf("WARN: invalid ASHARE_WATCHLIST_MAX=%q, keep %d", v, cfg.DynWatchMax)
 		}
 	}
+	cfg.PoolCfg = pool.DefaultConfig()
+	applyPoolEnvOverrides(&cfg.PoolCfg)
 	for _, s := range strings.Split(envOr("ASHARE_WATCHLIST", ""), ",") {
 		if s = strings.TrimSpace(s); s != "" {
 			cfg.Watchlist = append(cfg.Watchlist, s)
@@ -546,7 +612,35 @@ func (a *app) generatePoolNative(now time.Time) (*tool.WatchlistGenData, error) 
 	ctx, cancel := context.WithTimeout(context.Background(), a.cfg.PoolTimeout)
 	defer cancel()
 
-	gen := pool.NewGenerator(pool.NewSDKProvider(15*time.Second), pool.DefaultConfig())
+	gen := pool.NewGenerator(pool.NewSDKProvider(15*time.Second), a.cfg.PoolCfg)
+	// 阶段 2: 把持久层事实位（BLACKLIST / first_seen / last_seen / expire）回填进
+	// 聚合器, 使黑名单优先压制 MANUAL、FAILED/STALE 不批量失效等生命周期规则
+	// 基于真实 DB 状态而非仅本次运行内存态。
+	if gdb := a.db(); gdb != nil {
+		gen.PersistentStatus = func(ctx context.Context) map[string]pool.AggEntry {
+			m := make(map[string]pool.AggEntry)
+			var items []model.WatchlistItem
+			if err := gdb.WithContext(ctx).Find(&items).Error; err != nil {
+				log.Printf("[watchlist] WARN load persistent status failed: %v", err)
+				return m
+			}
+			for _, it := range items {
+				agg := pool.AggEntry{Symbol: it.Code, Blacklisted: it.Status == model.WatchStatusBlacklist}
+				if !it.AddedDate.IsZero() {
+					agg.FirstSeenAt = it.AddedDate
+				}
+				if it.LastSeenAt != nil {
+					agg.LastSeenAt = *it.LastSeenAt
+				}
+				if it.ExpireDate != nil {
+					exp := *it.ExpireDate
+					agg.ExpireDate = &exp
+				}
+				m[it.Code] = agg
+			}
+			return m
+		}
+	}
 	res, err := gen.Generate(ctx, a.cfg.Watchlist, now)
 	if err != nil {
 		return nil, fmt.Errorf("go-native pool generate: %w", err)

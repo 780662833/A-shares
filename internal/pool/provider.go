@@ -15,6 +15,7 @@ package pool
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	stock "github.com/ceheng-io/stock-go"
@@ -73,6 +74,30 @@ type DailyClose struct {
 	Closes []float64
 }
 
+// StockQualification 单只股票的证券资格 + 财务状态画像（精筛闸门输入）。
+//
+// 数据来源拆分：
+//   - SecurityType / ListingDate：stock-go Data.StockProfile（F10 公司概况）；
+//   - ROEWeighted / ParentNetProfitYoY / BasicEPS：stock-go Data.FinancialIndicators
+//     （最近一期定期报告，字段为 *float64，nil 表示缺失）。
+//
+// 弱依赖约定：上游查询失败时由 Provider 返回 error，Generator 侧仅将该股票
+// 标记为"未知"放行并记入 warnings，绝不因数据缺失误杀整池。
+type StockQualification struct {
+	Code               string
+	SecurityType       string // 证券类型, 如 "其他理财产品"→ETF/LOF、"创业板股票" 等; 空表示未取到
+	ListingDate        string // 上市日期 "2006-01-02"; 空表示未取到
+	ROEWeighted        *float64
+	ParentNetProfitYoY *float64
+	BasicEPS           *float64
+}
+
+// DailyBar 个股日 K 线一行（相对强度计算输入，仅保留所需字段）。
+type DailyBar struct {
+	Date  string
+	Close float64
+}
+
 // ---------------------------------------------------------------------------
 // Provider 接口
 // ---------------------------------------------------------------------------
@@ -94,6 +119,17 @@ type Provider interface {
 	FundBatchQuote(ctx context.Context, codes []string) ([]FundSnapshot, error)
 	// ETFCloseSeries 返回一只 ETF 最近 lookback 个交易日的收盘价序列（前复权）。
 	ETFCloseSeries(ctx context.Context, code string, lookback int, end time.Time) (*DailyClose, error)
+
+	// ---- 精筛管线新增能力（证券资格 / 财务状态 / 相对强度）----
+
+	// StockQualification 返回单只股票的资格画像（上市日期/证券类型）与最近一期
+	// 关键财务指标。上游失败返回 error，调用方按"未知放行 + warning"退化。
+	StockQualification(ctx context.Context, code string) (*StockQualification, error)
+	// StockBars 返回个股最近 lookback 个交易日日 K 收盘序列（升序; 不复权，
+	// RS 口径为区间涨跌幅，无需复权精度保证跨票一致性时优先前复权——见 generator.go 注释）。
+	StockBars(ctx context.Context, code string, lookback int, end time.Time) ([]DailyBar, error)
+	// IndexBars 返回基准指数（如 "000300" 沪深300）最近 lookback 个交易日日 K 收盘序列（升序）。
+	IndexBars(ctx context.Context, indexCode string, lookback int, end time.Time) ([]DailyBar, error)
 }
 
 // ---------------------------------------------------------------------------
@@ -285,4 +321,83 @@ func minInt(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// ---------------------------------------------------------------------------
+// 精筛管线新增能力实现（证券资格 / 财务状态 / 相对强度）
+// ---------------------------------------------------------------------------
+
+// StockQualification 组合 F10 概况（上市日期/证券类型）与最近一期财务指标。
+//
+// 两个子查询独立容错：任一失败不阻断另一个，缺失字段留空/nil，由 Generator
+// 侧按"未知放行 + warning"策略处理；仅当两者都失败时才返回 error。
+func (p *SDKProvider) StockQualification(ctx context.Context, code string) (*StockQualification, error) {
+	q := &StockQualification{Code: code}
+	var profileErr, finErr error
+
+	profile, err := p.sdk.Data.StockProfile(ctx, code)
+	if err != nil {
+		profileErr = err
+	} else {
+		q.SecurityType = profile.SecurityType
+		if profile.Issue.ListingDate != nil {
+			q.ListingDate = *profile.Issue.ListingDate
+		}
+	}
+
+	rows, err := p.sdk.Data.FinancialIndicators(ctx, code, stock.FinancialIndicatorOptions{})
+	if err != nil {
+		finErr = err
+	} else if len(rows) > 0 {
+		latest := rows[0] // 上游按报告期降序; 防御性再扫一遍取最新非空行
+		for _, r := range rows {
+			if r.ROEWeighted != nil || r.ParentNetProfitYoY != nil || r.BasicEPS != nil {
+				latest = r
+				break
+			}
+		}
+		q.ROEWeighted = latest.ROEWeighted
+		q.ParentNetProfitYoY = latest.ParentNetProfitYoY
+		q.BasicEPS = latest.BasicEPS
+	}
+
+	if profileErr != nil && finErr != nil {
+		return nil, fmt.Errorf("qualification both sources failed: profile=%v fin=%w", profileErr, finErr)
+	}
+	return q, nil
+}
+
+// StockBars 个股日 K 收盘序列（前复权，保证区间涨跌幅口径跨票可比）。
+func (p *SDKProvider) StockBars(ctx context.Context, code string, lookback int, end time.Time) ([]DailyBar, error) {
+	return p.bars(ctx, code, lookback, end, stock.AdjustQFQ)
+}
+
+// IndexBars 基准指数日 K 收盘序列（指数无复权语义，取不复权）。
+func (p *SDKProvider) IndexBars(ctx context.Context, indexCode string, lookback int, end time.Time) ([]DailyBar, error) {
+	return p.bars(ctx, indexCode, lookback, end, stock.AdjustNone)
+}
+
+func (p *SDKProvider) bars(ctx context.Context, code string, lookback int, end time.Time, adjust stock.AdjustType) ([]DailyBar, error) {
+	start := end.AddDate(0, 0, int(float64(lookback)*1.8)+10)
+	rows, err := p.sdk.Kline.CN(ctx, code, stock.HistoryKlineOptions{
+		Period:    stock.KlinePeriodDaily,
+		Adjust:    adjust,
+		StartDate: start.Format("2006-01-02"),
+		EndDate:   end.Format("2006-01-02"),
+	})
+	if err != nil {
+		return nil, err
+	}
+	bars := make([]DailyBar, 0, len(rows))
+	for _, r := range rows {
+		c := f64(r.Close)
+		if c <= 0 {
+			continue
+		}
+		bars = append(bars, DailyBar{Date: r.Date, Close: c})
+	}
+	if len(bars) > lookback {
+		bars = bars[len(bars)-lookback:]
+	}
+	return bars, nil
 }
