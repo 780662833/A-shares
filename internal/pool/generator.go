@@ -6,7 +6,7 @@
 //
 // 迁移后新增能力：全市场流动性初筛（原 Layer 0 base_filter 的 Go 化）——
 //
-//	非 ST、收盘价 >= MinPrice、近 20 日均成交额(代理: 当日成交额) >= MinAvgAmount、
+//	非 ST、收盘价 >= MinPrice、近 20 日均成交额(代理: 当日成交额) > MinAvgAmount、
 //	总市值 >= MinMarketCap；初筛结果作为 SECTOR/FUND 两个资金流来源的前置门槛。
 //
 // 弱依赖原则保持不变：任一来源失败仅记入 warnings，不影响其余来源；
@@ -395,7 +395,7 @@ func (g *Generator) liquidityScreen(ctx context.Context) (map[string]bool, int, 
 		if q.Price < g.cfg.MinPrice {
 			continue
 		}
-		if q.AvgAmount20D < g.cfg.MinAvgAmount {
+		if q.AvgAmount20D <= g.cfg.MinAvgAmount {
 			continue
 		}
 		if g.cfg.MinMarketCap > 0 && q.TotalMarketCap > 0 && q.TotalMarketCap < g.cfg.MinMarketCap {

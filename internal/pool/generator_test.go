@@ -34,6 +34,9 @@ type fakeProvider struct {
 	// 阶段3: nil -> 复用 stockBars 生成合法 OHLC；可注入异常 K 线
 	barsOHLC  func(code string, lookback int) []barOHLC
 	indexBars func(indexCode string, lookback int) []DailyBar
+	// sectorIndexBars: 行业指数 K 线钩子（按行业名）。nil -> 复用 indexBars；
+	// 测试可注入与宽基不同的序列，精确构造 RS20_sector 硬门槛场景。
+	sectorIndexBars func(sectorName string, lookback int) []DailyBar
 }
 
 func newFake() *fakeProvider {
@@ -121,6 +124,11 @@ func (f *fakeProvider) StockBars(ctx context.Context, code string, lookback int,
 
 func (f *fakeProvider) IndexBars(ctx context.Context, indexCode string, lookback int, end time.Time) ([]DailyBar, error) {
 	func() { f.mu.Lock(); defer f.mu.Unlock(); f.calls["IndexBars:"+indexCode]++ }()
+	// 行业指数请求（非宽基代码）优先走 sectorIndexBars 钩子，允许测试把
+	// 行业侧与宽基侧构造为不同序列（RS20_sector 硬门槛专项用例需要）。
+	if f.sectorIndexBars != nil && indexCode != "000300" && indexCode != "" {
+		return f.sectorIndexBars(indexCode, lookback), nil
+	}
 	if f.indexBars != nil {
 		return f.indexBars(indexCode, lookback), nil
 	}
@@ -180,7 +188,7 @@ func TestLiquidityScreenEmptySetDegenerates(t *testing.T) {
 func TestLiquidityTopNTruncation(t *testing.T) {
 	f := newFake()
 	for i := 0; i < 50; i++ {
-		f.stocks = append(f.stocks, quote(fmt.Sprintf("6000%02d", i), fmt.Sprintf("股%d", i), 10, float64(i+1)*1e8, 1e11))
+		f.stocks = append(f.stocks, quote(fmt.Sprintf("6000%02d", i), fmt.Sprintf("股%d", i), 10, float64(i+2)*1e8, 1e11))
 	}
 	cfg := DefaultConfig()
 	cfg.LiquidityTopN = 10

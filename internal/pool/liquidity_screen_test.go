@@ -21,11 +21,12 @@ func sprintfCode(i int) string { return fmt.Sprintf("6000%02d", i) }
 func TestLiquidityScreenDefaultConfigThresholds(t *testing.T) {
 	f := newFake()
 	f.stocks = []StockQuote{
-		quote("600001", "边界上", 1.0, 1e8, 5e9),     // 恰好等于三个下限 -> 放行（闭区间）
+		quote("600001", "边界上", 1.0, 1.001e8, 5e9), // 价格/市值恰好等于下限、成交额略高于下限 -> 放行
 		quote("600002", "价格差一分", 0.99, 5e8, 1e11), // 低于 MinPrice -> 剔除
 		quote("600003", "缩量一分", 10, 9.99e7, 1e11), // 低于 MinAvgAmount -> 剔除
 		quote("600004", "市值差一点", 10, 5e8, 4.99e9), // 低于 MinMarketCap -> 剔除
 		quote("600005", "*ST退市警示", 10, 5e8, 1e11), // ST 剔除
+		quote("600006", "缩量边界", 10, 1e8, 1e11),    // 恰好等于 MinAvgAmount -> 剔除（开区间，须严格大于门槛）
 	}
 	g := NewGenerator(f, DefaultConfig())
 	set, n, err := g.liquidityScreen(context.Background())
@@ -33,7 +34,7 @@ func TestLiquidityScreenDefaultConfigThresholds(t *testing.T) {
 		t.Fatalf("unexpected err: %v", err)
 	}
 	if n != 1 || len(set) != 1 || !set["600001"] {
-		t.Fatalf("want only 600001 (boundary-equal) passed, got set=%v n=%d", set, n)
+		t.Fatalf("want only 600001 passed (600006 equal-to-threshold must be rejected), got set=%v n=%d", set, n)
 	}
 }
 
@@ -142,7 +143,7 @@ func TestLiquidityScreenTopNDescendingTruncation(t *testing.T) {
 	f := newFake()
 	for i := 0; i < 20; i++ {
 		f.stocks = append(f.stocks, quote(
-			sprintfCode(i), "股", 10, float64(i+1)*1e8, 1e11))
+			sprintfCode(i), "股", 10, float64(i+1)*1e8+1, 1e11))
 	}
 	cfg := DefaultConfig()
 	cfg.LiquidityTopN = 5
@@ -169,7 +170,7 @@ func TestLiquidityScreenTopNDescendingTruncation(t *testing.T) {
 func TestLiquidityScreenTopNDisabled(t *testing.T) {
 	f := newFake()
 	for i := 0; i < 12; i++ {
-		f.stocks = append(f.stocks, quote(sprintfCode(i), "股", 10, float64(i+1)*1e8, 1e11))
+		f.stocks = append(f.stocks, quote(sprintfCode(i), "股", 10, float64(i+1)*1e8+1, 1e11))
 	}
 	cfg := DefaultConfig()
 	cfg.LiquidityTopN = 0

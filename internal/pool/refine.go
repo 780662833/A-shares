@@ -477,37 +477,49 @@ func (g *Generator) refinePoolWith(ctx context.Context, pool []AggEntry, warning
 	// 每次运行先重置强度包：精筛关闭/基准不可得时保持 nil（StrengthKnown=false）,
 	// 防止上一轮的 wiring 指针残留把"管线未执行"误标成"打分后落选 STRENGTH"。
 	g.strengthWiring = nil
-	// 输入全部来自本次已采集数据（趋势结构 trendRes、基准 benchChgShort/benchChg）；
-	// ADV20 与行业指数 R20 属流动性/板块侧数据, 由调用方在 liquidityGatePool 之后
-	// 通过 ApplyStrengthStage2 补齐（见 generator.go）——本函数先用"可得因子"打分,
+	// 输入全部来自本次已采集数据（趋势结构 trendRes、基准 benchChgShort/benchChg、
+	// 行业指数经 fetchSector 复取）；ADV20 属流动性侧数据, 由调用方在 liquidityGatePool
+	// 之后通过 RefineScores 补齐——本函数先用"可得因子"打分,
 	// 后续补算会覆盖 RankScore 为完整四因子口径。
 	{
 		w := strengthWiring{BenchR20: benchChgShort, BenchR60: benchChg, SingleWindowShortOnly: benchChgShort != nil && benchChg == nil,
 			SectorR20: map[string]*float64{}, Adv: map[string]*float64{},
 			Trend: map[string]trendState{}}
 		for k, idxK := range stockIdx {
-			_ = idxK
 			if trendRes[k].Known || trendRes[k].CloseGeMA20 || trendRes[k].MA20GeMA60 {
 				w.Trend[pool[idxK].Symbol] = trendRes[k]
 			}
 		}
-		// 行业基准：同名行业只请求一次（缓存于 sectorCache）
-		sectorCache := map[string]*float64{}
+		// ---- 生产 bug 修复：行业相对强度 RS20_sector 的权威来源是**行业指数**。
+		// 旧实现把中文行业名当指数代码传给 IndexBars, 真实供应商必然取数失败, 且失败
+		// 结果被 sectorCache 永久缓存 nil，SectorR20 恒空 → "跑赢行业"硬门槛永远无法
+		// 确认 → A 路径进不了、四因子评分恒缺行业侧权重。现改为按行业名向 Provider
+		// 请求行业指数 K 线（needBars(shortWin) 口径, 与个股/宽基窗口端点语义一致）;
+		// 取不到诚实置 nil（"无法确认"→ 最高归 B, 评分走权重归一, 绝不猜测为正）。
+		// 同一行业名在批次内只请求一次。
+		type secResult struct {
+			chg *float64
+		}
+		sectorCache := map[string]secResult{}
+		fetchSector := func(name string) *float64 {
+			if c, hit := sectorCache[name]; hit {
+				return c.chg
+			}
+			var v *float64
+			if name != "" {
+				if bars, err := g.prov.IndexBars(ctx, name, needBars(shortWin), now); err == nil && len(bars) >= needBars(shortWin) {
+					v = pctChangeOver(bars, shortWin)
+				}
+			}
+			sectorCache[name] = secResult{chg: v}
+			return v
+		}
 		for i := range kept {
 			e := &kept[i]
 			if e.PrimarySource != sourceSector || e.SectorName == "" {
 				continue
 			}
-			v, hit := sectorCache[e.SectorName]
-			if !hit {
-				if bars, err := g.prov.IndexBars(ctx, e.SectorName, needBars(shortWin), now); err == nil && len(bars) >= needBars(shortWin) {
-					v = pctChangeOver(bars, shortWin)
-				} else {
-					v = nil
-				}
-				sectorCache[e.SectorName] = v
-			}
-			w.SectorR20[e.SectorName] = v
+			w.SectorR20[e.SectorName] = fetchSector(e.SectorName)
 		}
 		kept = g.applyStrengthPathsAndScores(kept, w, warnings)
 		g.strengthWiring = &w // 供 Generate() 在流动性闸门后二次精化(ADV因子)复用
