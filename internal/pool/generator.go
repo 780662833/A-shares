@@ -181,20 +181,18 @@ const (
 )
 
 var (
-	stRe      = regexp.MustCompile(`(?i)\*?ST`)
-	acodeRe   = regexp.MustCompile(`^\d{6}$`)
-	etfCodeRe = regexp.MustCompile(`^(sh)?(51|56|58|15|16)\d{4}$|^(\d{6})$`)
+	stRe    = regexp.MustCompile(`(?i)\*?ST`)
+	acodeRe = regexp.MustCompile(`^\d{6}$`)
 )
 
-// isETFCode 场内 ETF 代码启发式：沪 51/56/58 开头、深 15/16 开头的 6 位代码。
-func isETFCode(code string) bool {
-	c := strings.TrimPrefix(code, "sh")
-	c = strings.TrimPrefix(c, "sz")
-	if !acodeRe.MatchString(c) {
+// IsETFCode 启发式判断A股场内ETF代码，仅前置过滤，不可作为最终判定。
+// 覆盖: 沪市 51/56/58 开头、深市 15 开头（含 159 等全部 15xx 段）的 6 位纯数字代码。
+func IsETFCode(code string) bool {
+	if len(code) != 6 || !acodeRe.MatchString(code) {
 		return false
 	}
-	switch c[:2] {
-	case "51", "56", "58", "15", "16":
+	switch code[:2] {
+	case "51", "56", "58", "15":
 		return true
 	}
 	return false
@@ -517,7 +515,7 @@ func (g *Generator) genETFMomentum(ctx context.Context, now time.Time) ([]Entry,
 	etfCodes := make([]string, 0, len(codes)/2)
 	for _, c := range codes {
 		code := normalizeCode(c)
-		if code != "" && isETFCode(code) {
+		if code != "" && IsETFCode(code) {
 			etfCodes = append(etfCodes, code)
 		}
 	}

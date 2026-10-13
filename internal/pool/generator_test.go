@@ -377,9 +377,10 @@ func TestMomentumPct(t *testing.T) {
 
 func TestIsETFCodeAndNormalize(t *testing.T) {
 	for c, want := range map[string]bool{"510300": true, "159915": true, "561100": true, "588000": true,
-		"164900": true, "600519": false, "300750": false, "123456": false} {
-		if got := isETFCode(c); got != want {
-			t.Errorf("isETFCode(%s)=%v want %v", c, got, want)
+		"164900": false, "600519": false, "300750": false, "123456": false,
+		"sh510300": false, "15991": false, "1599155": false} {
+		if got := IsETFCode(c); got != want {
+			t.Errorf("IsETFCode(%s)=%v want %v", c, got, want)
 		}
 	}
 	if normalizeCode("sh600519") != "600519" || normalizeCode(" 600519 ") != "600519" || normalizeCode("hk00700") != "" {

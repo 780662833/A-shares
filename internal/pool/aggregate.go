@@ -401,7 +401,7 @@ const etfReasonWindow = 20
 
 // assetTypeOf 由代码前缀推断资产类型（主数据 Provider 接入后由其权威覆盖）。
 func assetTypeOf(code string) string {
-	if isETFCode(code) {
+	if IsETFCode(code) {
 		return "ETF"
 	}
 	return "STOCK"
