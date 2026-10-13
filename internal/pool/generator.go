@@ -41,8 +41,8 @@ type Config struct {
 
 	// ---- 全市场流动性初筛（Go 层新增闸门）----
 	MinPrice      float64 // 最低收盘价（元, 默认 1.0; 面值退市风险）
-	MinAvgAmount  float64 // 最低日均成交额（元, 默认 1e8 = 1 亿）
-	MinMarketCap  float64 // 最低总市值（元, 默认 5e9 = 50 亿; 0 表示缺失时放行）
+	MinAvgAmount  float64 // 最低日均成交额（元, 默认 5e7 = 5 千万, 对齐契约 StockMinADV20; 旧 Python 口径 1e8 偏严）
+	MinMarketCap  float64 // 最低总市值（元, 默认 5e8 = 5 亿; 0 表示缺失时放行）
 	ExcludeST     bool    // 剔除 ST/*ST（默认 true）
 	LiquidityTopN int     // 通过初筛的股票按成交额保留前 N 只做后续叠加（默认 400, 控制规模）
 
@@ -82,8 +82,8 @@ func DefaultConfig() Config {
 		LHBMinNetBuy:   5e7,
 		LHBLookbackD:   7,
 		MinPrice:       1.0,
-		MinAvgAmount:   1e8,
-		MinMarketCap:   5e9,
+		MinAvgAmount:   ContractStockMinADV20, // 5e7 = 5 千万（契约口径）
+		MinMarketCap:   5e8,                   // 5 亿
 		ExcludeST:      true,
 		LiquidityTopN:  400,
 
