@@ -40,11 +40,12 @@ type Config struct {
 	LHBLookbackD   int     // 来源3: 龙虎榜回看天数（默认 7）
 
 	// ---- 全市场流动性初筛（Go 层新增闸门）----
-	MinPrice      float64 // 最低收盘价（元, 默认 1.0; 面值退市风险）
-	MinAvgAmount  float64 // 最低日均成交额（元, 默认 5e7 = 5 千万, 对齐契约 StockMinADV20; 旧 Python 口径 1e8 偏严）
-	MinMarketCap  float64 // 最低总市值（元, 默认 5e8 = 5 亿; 0 表示缺失时放行）
-	ExcludeST     bool    // 剔除 ST/*ST（默认 true）
-	LiquidityTopN int     // 通过初筛的股票按成交额保留前 N 只做后续叠加（默认 400, 控制规模）
+	MinPrice             float64 // 最低收盘价（元, 默认 1.0; 面值退市风险）
+	MinAvgAmount         float64 // 最低日均成交额（元, 默认 5e7 = 5 千万, 对齐契约 StockMinADV20; 旧 Python 口径 1e8 偏严）
+	MinMarketCap         float64 // 最低总市值（元, 默认 5e8 = 5 亿; 0 表示缺失时放行）
+	FundFlowMinMarketCap float64 // 契约口径: FUND(龙虎榜)来源个股总市值下限（元, 默认 5e9 = 50 亿; 0 表示不启用）
+	ExcludeST            bool    // 剔除 ST/*ST（默认 true）
+	LiquidityTopN        int     // 通过初筛的股票按成交额保留前 N 只做后续叠加（默认 400, 控制规模）
 
 	// ---- 精筛管线：证券资格 / 财务状态 / 相对强度排序（Layer 0.75, Go 层新增）----
 	QualifyEnabled     bool    // 总开关（默认 true）; false 时行为与迁移版完全一致
@@ -73,19 +74,20 @@ type Config struct {
 // DefaultConfig 返回与 Python 版对齐的默认参数。
 func DefaultConfig() Config {
 	return Config{
-		SectorTopN:     3,
-		SectorLeadersK: 3,
-		ETFTopM:        8,
-		ETFLookback:    60,
-		ETFMomWindow:   20,
-		ETFPreFilterN:  60,
-		LHBMinNetBuy:   5e7,
-		LHBLookbackD:   7,
-		MinPrice:       1.0,
-		MinAvgAmount:   ContractStockMinADV20, // 5e7 = 5 千万（契约口径）
-		MinMarketCap:   5e8,                   // 5 亿
-		ExcludeST:      true,
-		LiquidityTopN:  400,
+		SectorTopN:           3,
+		SectorLeadersK:       3,
+		ETFTopM:              8,
+		ETFLookback:          60,
+		ETFMomWindow:         20,
+		ETFPreFilterN:        60,
+		LHBMinNetBuy:         5e7,
+		LHBLookbackD:         7,
+		MinPrice:             1.0,
+		MinAvgAmount:         ContractStockMinADV20, // 5e7 = 5 千万（契约口径）
+		MinMarketCap:         5e8,                   // 5 亿（流动性初筛口径）
+		FundFlowMinMarketCap: 5e9,                   // 50 亿（契约 FundFlowMinMarketCap, FUND 来源叠加）
+		ExcludeST:            true,
+		LiquidityTopN:        400,
 
 		QualifyEnabled:     true,
 		MinListedDays:      120,
@@ -309,7 +311,7 @@ func (g *Generator) Generate(ctx context.Context, manualSymbols []string, now ti
 	}
 
 	// ---- 来源 3: 龙虎榜机构净买入（叠加流动性门槛）----
-	fundEntries, err := g.genDragonTiger(ctx, now, liquidSet)
+	fundEntries, err := g.genDragonTiger(ctx, now, liquidSet, liquidIdx)
 	if err != nil {
 		warnings = append(warnings, "FUND_FLOW 失败(已跳过): "+err.Error())
 	} else {
@@ -589,7 +591,7 @@ func (g *Generator) genETFMomentum(ctx context.Context, now time.Time) ([]Entry,
 // 来源 3: 龙虎榜机构净买入
 // ---------------------------------------------------------------------------
 
-func (g *Generator) genDragonTiger(ctx context.Context, now time.Time, liquidSet map[string]bool) ([]Entry, error) {
+func (g *Generator) genDragonTiger(ctx context.Context, now time.Time, liquidSet map[string]bool, liquidIdx map[string]StockQuote) ([]Entry, error) {
 	start := now.AddDate(0, 0, -g.cfg.LHBLookbackD)
 	rows, err := g.prov.DragonTigerInstitution(ctx, start, now)
 	if err != nil {
@@ -606,6 +608,12 @@ func (g *Generator) genDragonTiger(ctx context.Context, now time.Time, liquidSet
 		}
 		if liquidSet != nil && !liquidSet[code] {
 			continue // 流动性初筛叠加
+		}
+		// 契约 FundFlowMinMarketCap=50亿: FUND 来源个股市值单独把关（比初筛 5 亿更严）。
+		// 市值未知（快照缺失该股票或字段为 0）时放行, 遵循"缺失数据不误杀"约定。
+		if q, ok := liquidIdx[code]; ok && g.cfg.FundFlowMinMarketCap > 0 &&
+			q.TotalMarketCap > 0 && q.TotalMarketCap < g.cfg.FundFlowMinMarketCap {
+			continue
 		}
 		e := g.entry(code, r.Name, sourceFund, "龙虎榜机构")
 		v := r.OrgNetAmount

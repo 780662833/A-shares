@@ -117,7 +117,8 @@ func Params() Config {
 	// SectorTopN=3, SectorLeadersK(SectorTopK)=3      已一致
 	// ETFTopM=8                                        已一致
 	// FundFlowMinNetBuy(LHBMinNetBuy)=5000万=5e7       已一致
-	// FundFlowMinMarketCap(MinMarketCap)=50亿=5e9      已一致
+	// FundFlowMinMarketCap(FundFlowMinMarketCap)=50亿=5e9   已一致（FUND 来源单独叠加）
+	// MinAvgAmount=契约 StockMinADV20(5e7); MinMarketCap(流动性初筛)=5e8(5亿, Go 层新增口径)
 	// StockMinPrice(MinPrice)=1元                      已一致
 	// MinListingTradingDays=120个有效交易日; 当前 MinListedDays=120 自然日,
 	//   自然日≈交易日*1.4, 阶段 1 由主数据 Provider 提供交易日计数后收紧。

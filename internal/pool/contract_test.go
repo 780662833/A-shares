@@ -35,8 +35,12 @@ func TestAmountUnitNormalization(t *testing.T) {
 	if p.LHBMinNetBuy != normalizeYiAmount(0.5) {
 		t.Fatalf("LHB threshold unit mismatch: %v vs %v", p.LHBMinNetBuy, normalizeYiAmount(0.5))
 	}
-	if p.MinMarketCap != normalizeYiAmount(50) {
-		t.Fatalf("market cap threshold unit mismatch: %v", p.MinMarketCap)
+	// FUND 来源契约市值门槛 = 50 亿（FundFlowMinMarketCap）; 流动性初筛 MinMarketCap = 5 亿为 Go 层新增口径
+	if p.FundFlowMinMarketCap != normalizeYiAmount(50) {
+		t.Fatalf("fund-flow market cap threshold unit mismatch: %v", p.FundFlowMinMarketCap)
+	}
+	if p.MinMarketCap != 5e8 {
+		t.Fatalf("liquidity screen market cap threshold mismatch: %v, want 5e8", p.MinMarketCap)
 	}
 	if formatYi(5e9) != "50.00亿" {
 		t.Fatalf("formatYi diag output wrong: %s", formatYi(5e9))
@@ -54,9 +58,10 @@ func TestParamsContractTable(t *testing.T) {
 		{"SectorTopN", float64(p.SectorTopN), 3},
 		{"SectorLeadersK", float64(p.SectorLeadersK), 3},
 		{"ETFTopM", float64(p.ETFTopM), 8},
-		{"FundFlowMinNetBuy", p.LHBMinNetBuy, 5e7},    // 5000 万元
-		{"FundFlowMinMarketCap", p.MinMarketCap, 5e9}, // 50 亿元
-		{"StockMinPrice", p.MinPrice, 1.0},            // 1 元
+		{"FundFlowMinNetBuy", p.LHBMinNetBuy, 5e7},            // 5000 万元
+		{"FundFlowMinMarketCap", p.FundFlowMinMarketCap, 5e9}, // 50 亿元（FUND 来源单独叠加）
+		{"LiquidityMinMarketCap", p.MinMarketCap, 5e8},        // 5 亿元（流动性初筛, Go 层新增口径）
+		{"StockMinPrice", p.MinPrice, 1.0},                    // 1 元
 		{"MinListingDays", float64(p.MinListedDays), 120},
 		{"RSWindow(R60)", float64(p.RSWindow), 60},
 	}

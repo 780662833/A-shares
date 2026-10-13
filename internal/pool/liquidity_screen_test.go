@@ -17,16 +17,16 @@ import (
 func sprintfCode(i int) string { return fmt.Sprintf("6000%02d", i) }
 
 // TestLiquidityScreenDefaultConfigThresholds 验证默认系统配置阈值下的过滤边界：
-// MinPrice=1.0 / MinAvgAmount=1e8 / MinMarketCap=5e9 / ExcludeST=true / LiquidityTopN=400。
+// MinPrice=1.0 / MinAvgAmount=5e7(契约 StockMinADV20) / MinMarketCap=5e8 / ExcludeST=true / LiquidityTopN=400。
 func TestLiquidityScreenDefaultConfigThresholds(t *testing.T) {
 	f := newFake()
 	f.stocks = []StockQuote{
 		quote("600001", "边界上", 1.0, 1.001e8, 5e9), // 价格/市值恰好等于下限、成交额略高于下限 -> 放行
 		quote("600002", "价格差一分", 0.99, 5e8, 1e11), // 低于 MinPrice -> 剔除
-		quote("600003", "缩量一分", 10, 9.99e7, 1e11), // 低于 MinAvgAmount -> 剔除
-		quote("600004", "市值差一点", 10, 5e8, 4.99e9), // 低于 MinMarketCap -> 剔除
+		quote("600003", "缩量一分", 10, 4.99e7, 1e11), // 低于 MinAvgAmount(5e7) -> 剔除
+		quote("600004", "市值差一点", 10, 5e8, 4.99e8), // 低于 MinMarketCap(5e8) -> 剔除
 		quote("600005", "*ST退市警示", 10, 5e8, 1e11), // ST 剔除
-		quote("600006", "缩量边界", 10, 1e8, 1e11),    // 恰好等于 MinAvgAmount -> 剔除（开区间，须严格大于门槛）
+		quote("600006", "缩量边界", 10, 5e7, 1e11),    // 恰好等于 MinAvgAmount -> 剔除（开区间，须严格大于门槛）
 	}
 	g := NewGenerator(f, DefaultConfig())
 	set, _, n, err := g.liquidityScreen(context.Background())

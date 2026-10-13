@@ -218,8 +218,10 @@ func weightedScore(f [4]*float64, pct [4]float64) (float64, int) {
 func (g *Generator) StrengthKnown() bool { return g.strengthWiring != nil }
 
 type strengthWiring struct {
-	BenchR20, BenchR60    *float64              // 基准指数双窗口收益率 %
-	SingleWindowShortOnly bool                  // 基准 R60 不可得而 R20 可得（阶段 5 退化口径）
+	BenchR20, BenchR60    *float64              // 基准指数双窗口收益率 %（全局口径）
+	StockBenchR20         map[string]*float64   // symbol -> 该票打分时实际使用的短窗基准收益（单票样本不足退化口径; 缺键=nil 沿用全局）
+	StockBenchR60         map[string]*float64   // symbol -> 长窗同上
+	SingleWindowShortOnly bool                  // 个股侧与基准侧短窗同时可得而长窗两侧皆不可得（阶段 5 单窗口退化口径）
 	SectorR20             map[string]*float64   // 行业名 -> R20 %（缺失/失败 -> nil 或键不存在）
 	Trend                 map[string]trendState // symbol -> 均线结构（缺键=未知）
 	Adv                   map[string]*float64   // symbol -> ADV20（元; 缺键=nil）
@@ -255,9 +257,20 @@ func (g *Generator) applyStrengthPathsAndScores(kept []AggEntry, w strengthWirin
 			continue
 		}
 		ts := w.Trend[e.Symbol]
+		// 单票样本不足退化口径（生产 bug 修复）：某只股票长窗样本不足而短窗可得时，
+		// 它实际打分用的是"只用短窗超额"；路径判定必须与打分用同一基准视图，
+		// 否则会出现"分数按短窗算、A/B 判定却要求 R60>0"的口径分裂——
+		// 单窗口退化场景下所有股票都会被误归 B/NONE。
+		benchR20, benchR60 := w.BenchR20, w.BenchR60
+		if v, ok := w.StockBenchR20[e.Symbol]; ok {
+			benchR20 = v
+		}
+		if v, ok := w.StockBenchR60[e.Symbol]; ok {
+			benchR60 = v
+		}
 		o := strengthOutcome{
 			R20Stock: e.RetShortRaw, R60Stock: e.RetLongRaw,
-			R20Index: w.BenchR20, R60Index: w.BenchR60,
+			R20Index: benchR20, R60Index: benchR60,
 			R20Sector:      w.SectorR20[e.SectorName],
 			CloseAboveMA20: ts.CloseGeMA20, MA20AboveMA60: ts.MA20GeMA60, TrendKnown: ts.Known,
 			EligPass:   e.Eligibility != EligBlocked,
@@ -265,7 +278,16 @@ func (g *Generator) applyStrengthPathsAndScores(kept []AggEntry, w strengthWirin
 			FinBlocked: e.Financial == FinBlocked,
 		}
 		det := classifyPathA_B(o)
-		if w.SingleWindowShortOnly && det.path == StrengthB && o.R20Stock != nil && o.R60Stock == nil {
+		singleWin := w.SingleWindowShortOnly
+		if _, hasS := w.StockBenchR20[e.Symbol]; hasS {
+			// 逐票退化标志：该票短窗两侧可得、长窗两侧皆不可得 -> 视同单窗口模式。
+			sB60 := w.BenchR60
+			if v, ok := w.StockBenchR60[e.Symbol]; ok {
+				sB60 = v
+			}
+			singleWin = o.R20Stock != nil && o.R60Stock == nil && benchR20 != nil && sB60 == nil
+		}
+		if singleWin && det.path == StrengthB && o.R20Stock != nil && o.R60Stock == nil {
 			if ex := rsExcess(o.R20Stock, o.R20Index); ex != nil && *ex > 0 {
 				// 阶段 5 锁定语义：基准长窗不可得、短期强于大盘 -> 视为短期强势 A（退化口径）。
 				det.path = StrengthA

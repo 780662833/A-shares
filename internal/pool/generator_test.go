@@ -162,7 +162,7 @@ func TestLiquidityScreen(t *testing.T) {
 		quote("600002", "ST杂毛", 10, 5e8, 1e11),   // ST 剔除
 		quote("600003", "仙股", 0.5, 5e8, 1e11),    // 价格剔除
 		quote("600004", "缩量股", 10, 1e6, 1e11),    // 成交额剔除
-		quote("600005", "微盘股", 10, 5e8, 1e9),     // 市值剔除
+		quote("600005", "微盘股", 10, 5e8, 4e8),     // 市值剔除（< 5 亿初筛门槛）
 		{Code: "abc123", Name: "非法代码", Price: 10, AvgAmount20D: 5e9},
 	}
 	g := NewGenerator(f, DefaultConfig())

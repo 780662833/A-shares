@@ -139,6 +139,12 @@ func (g *Generator) refinePoolWith(ctx context.Context, pool []AggEntry, warning
 	}
 	results := make([]outcome, len(stockIdx))
 
+	// 阶段 7 接线：记录每只股票打分时**实际使用**的基准窗口可得性（单票样本不足
+	// 退化口径）。路径 A/B 判定必须与打分共用同一基准视图，否则会出现"分数按短窗
+	// 算、判定却要求 R60>0"的口径分裂。nil 切片在接线处判空，无副作用。
+	stockBenchShort := make([]*float64, len(stockIdx))
+	stockBenchLong := make([]*float64, len(stockIdx))
+
 	// ---- 阶段 5: 双窗口口径解析（R20 短期 + R60 中期）----
 	longWin := g.cfg.RSLongWindow
 	if longWin <= 0 {
@@ -385,6 +391,17 @@ func (g *Generator) refinePoolWith(ctx context.Context, pool []AggEntry, warning
 				lExcess = *res.chg - *benchChg
 				haveL = true
 			}
+			// 接线：记录该票打分时实际参与的基准窗口可得性（与 haveS/haveL 同语义），
+			// 供阶段 7 路径判定复用同一基准视图——单票长窗样本不足时不得再用全局
+			// R60 基准去要求 "R60>0" 硬门槛（口径分裂 bug）。
+			if haveS {
+				v := *benchChgShort
+				stockBenchShort[k] = &v
+			}
+			if haveL {
+				v := *benchChg
+				stockBenchLong[k] = &v
+			}
 			switch {
 			case haveS && haveL:
 				w := g.cfg.RSShortWeightPct / 100
@@ -483,11 +500,20 @@ func (g *Generator) refinePoolWith(ctx context.Context, pool []AggEntry, warning
 	// 后续补算会覆盖 RankScore 为完整四因子口径。
 	{
 		w := strengthWiring{BenchR20: benchChgShort, BenchR60: benchChg, SingleWindowShortOnly: benchChgShort != nil && benchChg == nil,
+			StockBenchR20: map[string]*float64{}, StockBenchR60: map[string]*float64{},
 			SectorR20: map[string]*float64{}, Adv: map[string]*float64{},
 			Trend: map[string]trendState{}}
 		for k, idxK := range stockIdx {
 			if trendRes[k].Known || trendRes[k].CloseGeMA20 || trendRes[k].MA20GeMA60 {
 				w.Trend[pool[idxK].Symbol] = trendRes[k]
+			}
+		}
+		for k, idxK := range stockIdx {
+			if v := stockBenchShort[k]; v != nil {
+				w.StockBenchR20[pool[idxK].Symbol] = v
+			}
+			if v := stockBenchLong[k]; v != nil {
+				w.StockBenchR60[pool[idxK].Symbol] = v
 			}
 		}
 		// ---- 生产 bug 修复：行业相对强度 RS20_sector 的权威来源是**行业指数**。
