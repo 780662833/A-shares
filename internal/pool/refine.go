@@ -28,6 +28,82 @@ import (
 	"time"
 )
 
+// ---------------------------------------------------------------------------
+// 阶段 3：证券资格硬条件（eligibility ≠ tradability, 见 contract.go 注释）
+// ---------------------------------------------------------------------------
+
+// LimitState 常量：涨跌停/可交易状态。SDK 当前公开行情类型未提供权威
+// IsST / 停牌 / 涨跌停字段（见 provider.go 顶部说明），因此第一版采取
+// "诚实 UNKNOWN"策略：无法确认的状态一律 LimitUnknown —— 禁止生成可执行
+// 订单（tradability=UNKNOWN），但保留研究资格与观察记录，等待接入可靠的
+// 证券主数据 Provider 后升级为权威判定。绝不以名称含 "ST" 作为最终依据。
+const (
+	LimitNormal  = "NORMAL"
+	LimitUp      = "UP"
+	LimitDown    = "DOWN"
+	LimitUnknown = "UNKNOWN"
+)
+
+// barOHLC 日 K 一行完整 OHLC（阶段 3 完整性校验输入）。
+type barOHLC struct {
+	Date  string
+	Open  float64
+	High  float64
+	Low   float64
+	Close float64
+}
+
+// ohlcValid 单根 K 线完整性：High >= max(Open, Close) 且 Low <= min(Open, Close)，
+// 且各价为正。异常记录不能参与计算。
+func ohlcValid(o, h, l, c float64) bool {
+	if o <= 0 || h <= 0 || l <= 0 || c <= 0 {
+		return false
+	}
+	if h < math.Max(o, c) || l > math.Min(o, c) {
+		return false
+	}
+	return l <= h
+}
+
+// ohlcSeriesValid 近窗口内所有 K 线均满足完整性（任一异常即整条记录标记 OhlcInvalid）。
+func ohlcSeriesValid(bars []barOHLC) bool {
+	if len(bars) == 0 {
+		return false // 无数据 -> 未知（调用方按 unknown 处理）
+	}
+	for _, b := range bars {
+		if !ohlcValid(b.Open, b.High, b.Low, b.Close) {
+			return false
+		}
+	}
+	return true
+}
+
+// quoteAsOfMatches 行情时点校验：最近一根 K 线日期与本次 as_of 同一自然日
+// （或允许范围内——灰度期先取同日口径；周末/节假日运行由调用方传入交易日对齐的 as_of）。
+// 不一致 -> StaleQuote=true，tradability=UNKNOWN（禁止把过期行情当成当前有效信号）。
+func quoteAsOfMatches(bars []barOHLC, asOf time.Time) bool {
+	if len(bars) == 0 {
+		return false
+	}
+	last := bars[len(bars)-1].Date
+	if len(last) >= 10 {
+		last = last[:10]
+	}
+	return last == asOf.Format("2006-01-02")
+}
+
+// listingCalendarDays 上市至今的自然日数; ListingDate 为空返回 -1（未知）。
+func listingCalendarDays(listingDate string, now time.Time) int {
+	if listingDate == "" {
+		return -1
+	}
+	t, err := time.Parse("2006-01-02", listingDate[:10])
+	if err != nil {
+		return -1
+	}
+	return int(now.Sub(t).Hours() / 24)
+}
+
 // refinePool 对去重后的池执行资格/财务闸门 + RS 排序。warnings 追加写回。
 func (g *Generator) refinePool(ctx context.Context, pool []AggEntry, warnings *[]string, now time.Time) []AggEntry {
 	// 股票类下标（参与闸门与 RS）; MANUAL/ETF 直通。
@@ -48,6 +124,7 @@ func (g *Generator) refinePool(ctx context.Context, pool []AggEntry, warnings *[
 		unknown  bool   // 上游数据缺失 -> 未知放行
 		scored   bool   // 已实际执行资格/财务闸门判定
 		finBlock bool   // 财务维度明确否决（EPS<0 / ROE 不足）
+		hardFlag bool   // 阶段3硬条件异常标记（OHLC/时点/价格）——不剔除, 只降级 tradability
 		chg      *float64
 	}
 	results := make([]outcome, len(stockIdx))
@@ -77,6 +154,33 @@ func (g *Generator) refinePool(ctx context.Context, pool []AggEntry, warnings *[
 					res.rejected, res.reason = true, reason
 					res.finBlock = strings.Contains(reason, "EPS") || strings.Contains(reason, "ROE")
 				}
+			}
+
+			// ---- 阶段 3: 证券资格硬条件明细（OHLC 完整性 / 行情时点 / 价格下限）----
+			// 停牌与涨跌停状态：stock-go 公开行情类型无权威 IsST/停牌/涨跌停字段，
+			// 第一版诚实标记 LimitUnknown（tradability=UNKNOWN 禁止可执行订单），
+			// 等待证券主数据 Provider 接入后升级——见 contract.go / aggregate.go 注释。
+			// 注意：本段直接复用上方已取的 q（避免重复 RPC 两次画像不一致）。
+			e := &pool[idx]
+			e.LimitState = LimitUnknown // SDK 无权威来源 -> 诚实 UNKNOWN（不伪造 NORMAL）
+			if q != nil {
+				e.ListingDays = listingCalendarDays(q.ListingDate, now)
+			}
+			if bars, err := g.prov.BarsOHLC(ctx, code, 20, now); err == nil && len(bars) > 0 {
+				if !ohlcSeriesValid(bars) {
+					e.OhlcInvalid = true // 异常记录不能参与计算（保留观察, tradability=UNKNOWN）
+				}
+				if !quoteAsOfMatches(bars, now) {
+					e.StaleQuote = true // 行情截止日 != as_of -> STALE
+				}
+				if last := bars[len(bars)-1].Close; last > 0 && last < g.cfg.MinPrice {
+					e.PriceBelowMin = true // 最新有效价 < 1 元 -> 不入普通候选排名
+				}
+			} else {
+				res.unknown = true // OHLC 不可得 -> 无法校验, 按未知处理（不误杀）
+			}
+			if e.OhlcInvalid || e.StaleQuote || e.PriceBelowMin {
+				res.hardFlag = true
 			}
 
 			if !res.rejected && g.cfg.RSEnabled {

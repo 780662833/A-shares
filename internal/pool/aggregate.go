@@ -87,6 +87,17 @@ type AggEntry struct {
 
 	Tradability string `json:"tradability_status"` // ELIGIBLE / BLOCKED / UNKNOWN（派生, 见 ComputeTradability）
 
+	// ---- 阶段 3: 证券资格硬条件明细（eligibility 与 tradability 分离建模）----
+	// EligibilityStatus 表达"研究资格"（是否符合股票池准入），Tradability 表达
+	// "交易时点可交易性"（是否允许生成新订单）。一只股票可以 eligibility=PASS
+	// 但因停牌 tradability=BLOCKED——历史观察记录因此不会被不必要地删除。
+	TradingHalted bool   `json:"trading_halted,omitempty"` // 停牌中 -> 禁止新订单（不删记录）
+	LimitState    string `json:"limit_state,omitempty"`    // NORMAL/UP/DOWN/UNKNOWN; UNKNOWN 禁止可执行订单
+	OhlcInvalid   bool   `json:"ohlc_invalid,omitempty"`   // OHLC 完整性异常 -> 不参与计算, tradability=UNKNOWN
+	StaleQuote    bool   `json:"stale_quote,omitempty"`    // 行情截止日 != as_of -> STALE, tradability=UNKNOWN
+	PriceBelowMin bool   `json:"price_below_min,omitempty"`// 最新有效价 < StockMinPrice -> 不入普通候选排名
+	ListingDays int      `json:"listing_days,omitempty"`   // 上市自然日数（诊断用; MinListedDays=120 近似 120 交易日口径）
+
 	// Scored 标记该条目是否实际参与 RS 打分（refinePool 设置）。未打分的股票类
 	// 条目 Strength 保持 Unset、RankPos=0 —— 防止"未打分"被误判为"打分后落选"。
 	Scored bool `json:"scored,omitempty"`
@@ -112,6 +123,17 @@ func (e *AggEntry) ComputeTradability() {
 	case e.Financial == FinBlocked:
 		e.Tradability = TradBlocked
 		e.BlockedBy = "FINANCIAL"
+	case e.TradingHalted:
+		// 停牌：研究资格(eligibility)不受影响, 仅禁止新订单; 记录保留。
+		e.Tradability = TradBlocked
+		e.BlockedBy = "HALTED"
+	case e.PriceBelowMin:
+		e.Tradability = TradBlocked
+		e.BlockedBy = "PRICE_BELOW_MIN"
+	case e.OhlcInvalid || e.StaleQuote || e.LimitState == LimitUnknown:
+		// 数据异常/行情过期/涨跌停状态无法确认 -> 禁止生成"可执行"订单（UNKNOWN 不放行）。
+		e.Tradability = TradUnknown
+		e.BlockedBy = "QUOTE_STATE"
 	case e.Strength == StrengthNone && e.hasAutoSourceOnly():
 		// RS 管线**实际执行过**（Strength 被显式赋值为 A/B/NONE）且股票类条目两条
 		// 路径均未入选 -> 高优先级截断（软阻塞, 可人工放行）。

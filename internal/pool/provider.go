@@ -128,6 +128,10 @@ type Provider interface {
 	// StockBars 返回个股最近 lookback 个交易日日 K 收盘序列（升序; 不复权，
 	// RS 口径为区间涨跌幅，无需复权精度保证跨票一致性时优先前复权——见 generator.go 注释）。
 	StockBars(ctx context.Context, code string, lookback int, end time.Time) ([]DailyBar, error)
+	// BarsOHLC 返回个股最近 lookback 个交易日的完整 OHLC 序列（升序）。
+	// 阶段 3 证券资格硬条件（OHLC 完整性校验 + 行情时点 as_of 对齐）使用。
+	// SDK 未提供该能力时返回 error，调用方按"未知放行"退化（不误杀、不伪造通过）。
+	BarsOHLC(ctx context.Context, code string, lookback int, end time.Time) ([]barOHLC, error)
 	// IndexBars 返回基准指数（如 "000300" 沪深300）最近 lookback 个交易日日 K 收盘序列（升序）。
 	IndexBars(ctx context.Context, indexCode string, lookback int, end time.Time) ([]DailyBar, error)
 }
@@ -401,3 +405,33 @@ func (p *SDKProvider) bars(ctx context.Context, code string, lookback int, end t
 	}
 	return bars, nil
 }
+
+// BarsOHLC 个股完整 OHLC 日 K（前复权，与 StockBars 同口径），供阶段 3
+// OHLC 完整性校验与行情时点 as_of 对齐使用。Kline.CN 行含 Open/High/Low/Close。
+func (p *SDKProvider) BarsOHLC(ctx context.Context, code string, lookback int, end time.Time) ([]barOHLC, error) {
+	start := end.AddDate(0, 0, int(float64(lookback)*1.8)+10)
+	rows, err := p.sdk.Kline.CN(ctx, code, stock.HistoryKlineOptions{
+		Period:    stock.KlinePeriodDaily,
+		Adjust:    stock.AdjustQFQ,
+		StartDate: start.Format("2006-01-02"),
+		EndDate:   end.Format("2006-01-02"),
+	})
+	if err != nil {
+		return nil, err
+	}
+	bars := make([]barOHLC, 0, len(rows))
+	for _, r := range rows {
+		bars = append(bars, barOHLC{
+			Date:  r.Date,
+			Open:  f64(r.Open),
+			High:  f64(r.High),
+			Low:   f64(r.Low),
+			Close: f64(r.Close),
+		})
+	}
+	if len(bars) > lookback {
+		bars = bars[len(bars)-lookback:]
+	}
+	return bars, nil
+}
+
