@@ -1,5 +1,12 @@
 """动态自选股池生成器 (Layer 0.5: Watchlist Universe)。
 
+.. deprecated:: 2026-10-12
+    **候选池生成功能已迁移至 Go 层**（``internal/pool``，基于 stock-go SDK：
+    全市场流动性初筛 + 行业资金流 + 龙虎榜叠加）。本模块仅作为**灰度回退链路**
+    保留：当 Go 原生池生成失败时，Go 端自动回退调用 ``POST /api/watchlist/generate``。
+    Python 端在本架构中只负责 czsc 形态确认（/api/czsc/screen_pool、/api/czsc/refresh）。
+    灰度完成（ASHARE_POOL_SOURCE=go 稳定运行）后本模块与对应接口将被删除。
+
 四个数据来源 -> 合并去重后的每日动态股票池, 供 Go 端 UpdateWatchlist 节点消费:
 
   来源1 SECTOR_LEADER 行业龙头 : 资金净流入 Top N 行业板块 -> 每板块市值最大 Top K 成分股
@@ -256,6 +263,10 @@ def _gen_fund_flow_lhb() -> List[Dict[str, Any]]:
 
 def generate_watchlist(manual_symbols: Optional[List[str]] = None) -> Dict[str, Any]:
     """生成今日动态自选股池 (不含数据库写入, 纯计算)。
+
+    .. deprecated:: 2026-10-12
+        主链路已迁移至 Go 层 ``internal/pool``（stock-go SDK）。本函数仅在
+        Go 原生池失败时作为回退链路被调用, 灰度完成后将删除。
 
     优先级/去重顺序: MANUAL > ETF_MOMENTUM > SECTOR_LEADER > FUND_FLOW。
     任一来源失败仅记入 warnings, 不影响其余来源输出。

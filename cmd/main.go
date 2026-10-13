@@ -20,6 +20,10 @@
 //	ASHARE_DYNAMIC_WATCHLIST   =1 启用动态池模式（watchlist_items 表为 symbols 主来源）
 //	ASHARE_WATCHLIST_MAX       动态池参与粗筛的最大股票数，默认 100（持仓股不占配额）
 //	ASHARE_CRON_WATCHLIST      动态池更新 cron，默认 "0 15 * * 1-5"
+//	ASHARE_POOL_SOURCE         go | python（默认 python，灰度开关）；=go 时动态池改由
+//	                           Go 原生 internal/pool + stock-go SDK 生成，不再调用网关
+//	                           /api/watchlist/generate；Go 生成失败时自动回退 Python 链路
+//	ASHARE_POOL_TIMEOUT        Go 原生池单次生成超时，默认 6m
 //	ASHARE_LLM_BASE_URL / ASHARE_MODEL / ASHARE_API_KEY
 //	                    LLM 接入配置。MVP 未强依赖 eino-ext provider：
 //	                    未配置时系统以「降级模式」运行 —— 复盘任务将跳过 LLM 决策
@@ -50,6 +54,7 @@ import (
 	"ashare-quant/internal/broker"
 	"ashare-quant/internal/db"
 	dbmodel "ashare-quant/internal/model"
+	"ashare-quant/internal/pool"
 	datasync "ashare-quant/internal/sync"
 	"ashare-quant/internal/tool"
 )
@@ -70,6 +75,72 @@ type appConfig struct {
 	DynWatchOn   bool          // ASHARE_DYNAMIC_WATCHLIST=1 时启用动态池模式
 	DynWatchMax  int           // 每日动态池参与粗筛的最大股票数（持仓股不占配额）
 	WatchTimeout time.Duration // 网关 /api/watchlist/generate 单次调用超时
+	PoolSource   string        // ASHARE_POOL_SOURCE: go | python（默认 python, 灰度开关）
+	PoolTimeout  time.Duration // Go 原生池单次生成超时
+	PoolCfg      pool.Config   // Go 原生池精筛管线参数（ASHARE_REFINE_* / ASHARE_RS_* 环境变量覆盖 DefaultConfig）
+}
+
+// applyPoolEnvOverrides 用环境变量覆盖精筛管线参数；非法值告警并保持原值。
+func applyPoolEnvOverrides(c *pool.Config) {
+	if v := strings.TrimSpace(os.Getenv("ASHARE_REFINE_ENABLED")); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			c.QualifyEnabled = b
+		} else {
+			log.Printf("WARN: invalid ASHARE_REFINE_ENABLED=%q, keep %v", v, c.QualifyEnabled)
+		}
+	}
+	if v := strings.TrimSpace(os.Getenv("ASHARE_MIN_LISTED_DAYS")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			c.MinListedDays = n
+		} else {
+			log.Printf("WARN: invalid ASHARE_MIN_LISTED_DAYS=%q, keep %d", v, c.MinListedDays)
+		}
+	}
+	if v := strings.TrimSpace(os.Getenv("ASHARE_REQUIRE_POSITIVE_EPS")); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			c.RequirePositiveEPS = b
+		} else {
+			log.Printf("WARN: invalid ASHARE_REQUIRE_POSITIVE_EPS=%q, keep %v", v, c.RequirePositiveEPS)
+		}
+	}
+	if v := strings.TrimSpace(os.Getenv("ASHARE_MIN_ROE")); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			c.MinROE = f
+		} else {
+			log.Printf("WARN: invalid ASHARE_MIN_ROE=%q, keep %v", v, c.MinROE)
+		}
+	}
+	if v := strings.TrimSpace(os.Getenv("ASHARE_RS_ENABLED")); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			c.RSEnabled = b
+		} else {
+			log.Printf("WARN: invalid ASHARE_RS_ENABLED=%q, keep %v", v, c.RSEnabled)
+		}
+	}
+	if v := strings.TrimSpace(os.Getenv("ASHARE_RS_WINDOW")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			c.RSWindow = n
+		} else {
+			log.Printf("WARN: invalid ASHARE_RS_WINDOW=%q, keep %d", v, c.RSWindow)
+		}
+	}
+	if v := strings.TrimSpace(os.Getenv("ASHARE_RS_BENCHMARK")); v != "" {
+		c.RSBenchmark = v
+	}
+	if v := strings.TrimSpace(os.Getenv("ASHARE_RS_TOPK")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			c.RSTopK = n
+		} else {
+			log.Printf("WARN: invalid ASHARE_RS_TOPK=%q, keep %d", v, c.RSTopK)
+		}
+	}
+	if v := strings.TrimSpace(os.Getenv("ASHARE_RS_CONCURRENCY")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			c.RSConcurrency = n
+		} else {
+			log.Printf("WARN: invalid ASHARE_RS_CONCURRENCY=%q, keep %d", v, c.RSConcurrency)
+		}
+	}
 }
 
 func loadConfig() appConfig {
@@ -84,12 +155,26 @@ func loadConfig() appConfig {
 		CronWatch:    "0 15 * * 1-5",  // 收盘即更新动态池（Layer 0.5），10 分钟后 refresh 只对当日 ACTIVE 池增量预热
 		DynWatchMax:  100,
 		WatchTimeout: 4 * time.Minute,
+		PoolSource:   "python",
+		PoolTimeout:  6 * time.Minute,
 	}
 	if v := strings.TrimSpace(os.Getenv("ASHARE_CRON_REFRESH")); v != "" {
 		cfg.CronRefresh = v
 	}
 	if v := strings.TrimSpace(os.Getenv("ASHARE_CRON_WATCHLIST")); v != "" {
 		cfg.CronWatch = v
+	}
+	if v := strings.ToLower(strings.TrimSpace(os.Getenv("ASHARE_POOL_SOURCE"))); v == "go" {
+		cfg.PoolSource = "go"
+	} else if v != "" && v != "python" {
+		log.Printf("WARN: invalid ASHARE_POOL_SOURCE=%q, keep %q", v, cfg.PoolSource)
+	}
+	if v := strings.TrimSpace(os.Getenv("ASHARE_POOL_TIMEOUT")); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			cfg.PoolTimeout = d
+		} else {
+			log.Printf("WARN: invalid ASHARE_POOL_TIMEOUT=%q, keep %s", v, cfg.PoolTimeout)
+		}
 	}
 	cfg.DynWatchOn = strings.TrimSpace(os.Getenv("ASHARE_DYNAMIC_WATCHLIST")) == "1"
 	if v := strings.TrimSpace(os.Getenv("ASHARE_WATCHLIST_MAX")); v != "" {
@@ -99,6 +184,8 @@ func loadConfig() appConfig {
 			log.Printf("WARN: invalid ASHARE_WATCHLIST_MAX=%q, keep %d", v, cfg.DynWatchMax)
 		}
 	}
+	cfg.PoolCfg = pool.DefaultConfig()
+	applyPoolEnvOverrides(&cfg.PoolCfg)
 	for _, s := range strings.Split(envOr("ASHARE_WATCHLIST", ""), ",") {
 		if s = strings.TrimSpace(s); s != "" {
 			cfg.Watchlist = append(cfg.Watchlist, s)
@@ -462,10 +549,16 @@ func (a *app) runCzscRefresh(trigger string) error {
 
 const flowWatchlist = "watchlist"
 
-// runWatchlistUpdate 调用网关 POST /api/watchlist/generate 生成今日动态池，
-// 并按生命周期规则落库 watchlist_items（新增/续期/过期清理，MANUAL 与 BLACKLIST 不受侵蚀）。
+// runWatchlistUpdate 生成今日动态池并按生命周期规则落库 watchlist_items
+// （新增/续期/过期清理，MANUAL 与 BLACKLIST 不受侵蚀）。
 //
-// 降级语义：网关失败返回 error 但**绝不清空现有池子**——scanSymbols 会继续使用
+// 双链路（灰度迁移）：
+//   - ASHARE_POOL_SOURCE=go：优先走 Go 原生 internal/pool（stock-go SDK 直连,
+//     全市场流动性初筛 + 行业资金流 + 龙虎榜叠加），结果经 ToGenData 转同构载荷后
+//     复用同一套 ApplyWatchlistPool 落库逻辑；Go 链路彻底失败时自动回退 Python 网关。
+//   - 默认（python）：调用网关 POST /api/watchlist/generate（原链路, 行为不变）。
+//
+// 降级语义：两条链路均失败时返回 error 但**绝不清空现有池子**——scanSymbols 会继续使用
 // 昨日 ACTIVE 集合（未过期部分），复盘链路零感知。
 func (a *app) runWatchlistUpdate(trigger string) error {
 	if !a.tryLock(flowWatchlist) {
@@ -474,10 +567,22 @@ func (a *app) runWatchlistUpdate(trigger string) error {
 	defer a.unlock(flowWatchlist)
 
 	start := time.Now()
-	ctx, cancel := context.WithTimeout(context.Background(), a.cfg.WatchTimeout+30*time.Second)
-	defer cancel()
 
-	data, err := tool.FetchGeneratedWatchlist(ctx, a.cfg.GatewayURL, a.cfg.Watchlist, a.cfg.WatchTimeout)
+	var data *tool.WatchlistGenData
+	var err error
+	if a.cfg.PoolSource == "go" {
+		data, err = a.generatePoolNative(start)
+		if err != nil {
+			log.Printf("[watchlist] WARN go-native pool failed trigger=%s err=%v -> fallback to python gateway", trigger, err)
+			ctx, cancel := context.WithTimeout(context.Background(), a.cfg.WatchTimeout+30*time.Second)
+			defer cancel()
+			data, err = tool.FetchGeneratedWatchlist(ctx, a.cfg.GatewayURL, a.cfg.Watchlist, a.cfg.WatchTimeout)
+		}
+	} else {
+		ctx, cancel := context.WithTimeout(context.Background(), a.cfg.WatchTimeout+30*time.Second)
+		defer cancel()
+		data, err = tool.FetchGeneratedWatchlist(ctx, a.cfg.GatewayURL, a.cfg.Watchlist, a.cfg.WatchTimeout)
+	}
 	if err != nil {
 		log.Printf("[watchlist] FAILED trigger=%s err=%v (沿用现有池子)", trigger, err)
 		return fmt.Errorf("update watchlist: %w", err)
@@ -498,6 +603,55 @@ func (a *app) runWatchlistUpdate(trigger string) error {
 	}
 	log.Printf("[watchlist] ===== 池子更新完成 elapsed=%s =====", time.Since(start))
 	return nil
+}
+
+// generatePoolNative Go 原生动态池链路（ASHARE_POOL_SOURCE=go）：
+// stock-go SDK 直连生成 -> ToGenData 转 WatchlistGenData 同构载荷, 供既有
+// ApplyWatchlistPool 复用落库。整体超时 ASHARE_POOL_TIMEOUT（默认 6m）。
+func (a *app) generatePoolNative(now time.Time) (*tool.WatchlistGenData, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), a.cfg.PoolTimeout)
+	defer cancel()
+
+	gen := pool.NewGenerator(pool.NewSDKProvider(15*time.Second), a.cfg.PoolCfg)
+	// 阶段 2: 把持久层事实位（BLACKLIST / first_seen / last_seen / expire）回填进
+	// 聚合器, 使黑名单优先压制 MANUAL、FAILED/STALE 不批量失效等生命周期规则
+	// 基于真实 DB 状态而非仅本次运行内存态。
+	if gdb := a.db(); gdb != nil {
+		gen.PersistentStatus = func(ctx context.Context) map[string]pool.AggEntry {
+			m := make(map[string]pool.AggEntry)
+			var items []model.WatchlistItem
+			if err := gdb.WithContext(ctx).Find(&items).Error; err != nil {
+				log.Printf("[watchlist] WARN load persistent status failed: %v", err)
+				return m
+			}
+			for _, it := range items {
+				agg := pool.AggEntry{Symbol: it.Code, Blacklisted: it.Status == model.WatchStatusBlacklist}
+				if !it.AddedDate.IsZero() {
+					agg.FirstSeenAt = it.AddedDate
+				}
+				if it.LastSeenAt != nil {
+					agg.LastSeenAt = *it.LastSeenAt
+				}
+				if it.ExpireDate != nil {
+					exp := *it.ExpireDate
+					agg.ExpireDate = &exp
+				}
+				m[it.Code] = agg
+			}
+			return m
+		}
+	}
+	res, err := gen.Generate(ctx, a.cfg.Watchlist, now)
+	if err != nil {
+		return nil, fmt.Errorf("go-native pool generate: %w", err)
+	}
+	data, err := res.ToGenData()
+	if err != nil {
+		return nil, err
+	}
+	log.Printf("[watchlist] go-native generated=%d liquidity_passed=%d by_source=%v warnings=%d",
+		res.Total, res.LiquidityPassed, res.BySource, len(res.Warnings))
+	return data, nil
 }
 
 // ---------------------------------------------------------------------------
