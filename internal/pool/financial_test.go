@@ -12,9 +12,13 @@ import (
 	"time"
 )
 
-// finAsOf 比 testNow(当日15:00) 晚一天: classifyFinSnapshot 的公告日校验是
-// d.After(asOf) 严格比较 —— 同日但更早时刻的 asOf 会把公告判成未来数据。
-var finAsOf = testNow.AddDate(0, 0, 1)
+// finAsOf 必须与测试夹具的数据截止日一致（cleanSnapshot.DataAsOf = 2026-09-30）。
+// 旧夹具取 testNow+1 天(2026-10-13)，距 DataAsOf 413 天 > FinMaxAgeDays=400，
+// classifyFinSnapshot 会把所有"健康快照"误判为 DATA_INSUFFICIENT(数据过期)，
+// WARN/BLOCKED/PASS 全部维度被时效闸门吞掉——管线集成测试因此失真。
+// 现改为 testNow-7 天：既保证公告日(2026-03-31)不落入未来，又使快照年龄
+// (2026-09-30 → 2026-10-05 = 5 天)稳定处于契约时效内。
+var finAsOf = testNow.AddDate(0, 0, -7)
 
 func fptr(v float64) *float64 { return &v }
 

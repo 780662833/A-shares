@@ -1,3 +1,2 @@
-__pycache__/
-*.pyc
-data_gateway/.cache/
+.env.local
+.env.*.local

@@ -163,14 +163,12 @@ func (e *AggEntry) ComputeTradability(strengthKnown ...bool) {
 		e.Tradability = TradBlocked
 		e.BlockedBy = "HALTED"
 	case e.PriceBelowMin:
+		// 优先级修复（生产 Bug）：最新有效价 <1 元是**明确证据**的确定性否决，必须先于
+		// QUOTE_STATE 判定——精筛恒置 LimitState=LimitUnknown（SDK 无权威涨跌停来源），
+		// 旧顺序下已打分条目永远先命中 QUOTE_STATE/UNKNOWN，把"明确不可入池"稀释成
+		// "待人工确认"。无论是否参与 RS 打分，低价格式硬条件一律 BLOCKED。
 		e.Tradability = TradBlocked
 		e.BlockedBy = "PRICE_BELOW_MIN"
-	case (e.OhlcInvalid || e.StaleQuote || e.LimitState == LimitUnknown) && e.Scored:
-		// 阶段 7 冲突修复：QUOTE_STATE 仅对参与 RS 打分的股票类条目生效；
-		// ETF/MANUAL-only/未打分条目若误带标记, 不得吞掉 FINANCIAL_DATA/LIQUIDITY_DATA 等更具体诚实结论。
-		// 数据异常/行情过期/涨跌停状态无法确认 -> 禁止生成"可执行"订单（UNKNOWN 不放行）。
-		e.Tradability = TradUnknown
-		e.BlockedBy = "QUOTE_STATE"
 	case e.Strength == StrengthNone && e.hasAutoSourceOnly() && len(strengthKnown) != 0 && !strengthKnown[0]:
 		// 阶段 7 冲突修复：管线**已执行**且股票类条目两条路径均未入选 -> 软阻塞 STRENGTH；
 		// 管线未执行(如流动性闸门复算路径)时不得把"未重新判定"猜测成"打分后落选",
@@ -201,6 +199,16 @@ func (e *AggEntry) ComputeTradability(strengthKnown ...bool) {
 		// 阶段 6: 财务快照缺失/过期 -> UNKNOWN（不放行也不剔除, 显示缺失原因）
 		e.Tradability = TradUnknown
 		e.BlockedBy = "FINANCIAL_DATA"
+	case (e.OhlcInvalid || e.StaleQuote || e.LimitState == LimitUnknown) && e.Scored:
+		// QUOTE_STATE 重插到全部数据缺失诚实分支之后（生产 Bug 修复·优先级）：
+		// 精筛恒置 LimitState=LimitUnknown（SDK 无权威涨跌停来源），旧顺序把它放在前段
+		// 会把 FINANCIAL_DATA / ELIGIBILITY_DATA / LIQUIDITY_DATA 等更具体的诚实结论
+		// 吞成泛化的 QUOTE_STATE；同时 PriceBelowMin 的明确否决也必须先于它命中
+		// （见上方 PRICE_BELOW_MIN 注释）。QUOTE_STATE 仅对参与 RS 打分的股票类条目
+		// 生效，ETF/MANUAL-only/未打分条目不得误触。数据异常/行情过期/涨跌停状态无法
+		// 确认 -> 禁止生成"可执行"订单（UNKNOWN 不放行）。
+		e.Tradability = TradUnknown
+		e.BlockedBy = "QUOTE_STATE"
 	default:
 		e.Tradability = TradEligible
 	}
