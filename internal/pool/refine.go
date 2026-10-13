@@ -126,13 +126,13 @@ func (g *Generator) refinePoolWith(ctx context.Context, pool []AggEntry, warning
 	}
 
 	type outcome struct {
-		rejected bool   // 被闸门剔除
-		reason   string // 剔除原因（诊断用）
-		unknown  bool   // 上游数据缺失 -> 未知放行
-		scored   bool   // 已实际执行资格/财务闸门判定
-		finBlock bool   // 财务维度明确否决（EPS<0 / ROE 不足）
-		hardFlag bool   // 阶段3硬条件异常标记（OHLC/时点/价格）——不剔除, 只降级 tradability
-		chg      *float64
+		rejected bool     // 被闸门剔除
+		reason   string   // 剔除原因（诊断用）
+		unknown  bool     // 上游数据缺失 -> 未知放行
+		scored   bool     // 已实际执行资格/财务闸门判定
+		finBlock bool     // 财务维度明确否决（EPS<0 / ROE 不足）
+		hardFlag bool     // 阶段3硬条件异常标记（OHLC/时点/价格）——不剔除, 只降级 tradability
+		chg      *float64 // R60 个股收益率 %（原始值, 非超额）
 		chgShort *float64 // 阶段5: R20 区间涨跌幅（短期动量）
 	}
 	results := make([]outcome, len(stockIdx))
@@ -159,6 +159,7 @@ func (g *Generator) refinePoolWith(ctx context.Context, pool []AggEntry, warning
 
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, g.cfg.RSConcurrency)
+	trendRes := make([]trendState, len(stockIdx)) // kept 下标(k)对齐的均线结构判定
 	for k, idx := range stockIdx {
 		wg.Add(1)
 		go func(k, idx int) {
@@ -215,6 +216,14 @@ func (g *Generator) refinePoolWith(ctx context.Context, pool []AggEntry, warning
 			if !res.rejected && g.cfg.RSEnabled {
 				// 阶段 5: 一次取 max(R20,R60)+1 根 K 线, 同序列上计算双窗口收益（避免两次 RPC 口径不一致）
 				bars, err := g.prov.StockBars(ctx, code, needBars(maxWin), now)
+				if err == nil && len(bars) > 0 {
+					closes := make([]float64, len(bars))
+					for bi, bb := range bars {
+						closes[bi] = bb.Close
+					}
+					cge, mge, known := maTrendFromBars(closes)
+					trendRes[k] = trendState{CloseGeMA20: cge, MA20GeMA60: mge, Known: known}
+				}
 				if err != nil || len(bars) < needBars(shortWin) {
 					res.unknown = true
 				} else {
@@ -397,6 +406,15 @@ func (g *Generator) refinePoolWith(ctx context.Context, pool []AggEntry, warning
 				v := round2(lExcess)
 				e.RetLongExcess = &v
 			}
+			// 阶段 7: 保存个股原始双窗口收益率（路径 A/B 硬门槛看的是绝对收益正负, 不是超额）
+			if res.chgShort != nil {
+				v := round2(*res.chgShort)
+				e.RetShortRaw = &v
+			}
+			if res.chg != nil {
+				v := round2(*res.chg)
+				e.RetLongRaw = &v
+			}
 			// 阶段 6: WARN 财务质量弱项 -> 排序降权（PASS=1.0, WARN=0.5）。
 			// 只影响名次, 不删除记录；BLOCKED 已在上方硬排除, 不会走到这里。
 			if g.cfg.QualifyEnabled {
@@ -478,34 +496,53 @@ func (g *Generator) refinePoolWith(ctx context.Context, pool []AggEntry, warning
 			if !kept[i].Scored {
 				continue
 			}
-			// 阶段 5: 强度路径按契约语义判定（看窗口超额, 不看加权总分符号）：
-			//   A = R20 超额为正 且 位于"短期超额降序"列的前 1/3
-			//       （单窗口退化时唯一正超额窗口即视为短期强）
-			//   B = 非 A 但 R60 超额为正（中期强）
-			//   NONE = 两窗口超额均不为正（或不可得）
-			// 总分只用于排序与 TopK 截断；短期强（R20 超额为正）即使中期
-			// 弱于基准拉负总分，仍应标 A（czsc 形态确认层会二次把关）。
-			onlyShort := kept[i].RetLongExcess == nil && kept[i].RetShortExcess != nil
-			inShortTopThird := false
-			if r, ok := shortRank[i]; ok && shortN > 0 {
-				inShortTopThird = r*3 <= shortN
-			}
-			switch {
-			case kept[i].RetShortExcess != nil && *kept[i].RetShortExcess > 0 &&
-				(onlyShort || inShortTopThird):
-				kept[i].Strength = StrengthA
-				t1 := true
-				_ = t1
-			case kept[i].RetLongExcess != nil && *kept[i].RetLongExcess > 0:
-				kept[i].Strength = StrengthB
-			default:
-				kept[i].Strength = StrengthNone
-			}
+			// 阶段 7: 旧版"前1/3近似"A/B/NONE 判定已废弃 —— strength_path 改由
+			// applyStrengthPathsAndScores 按契约硬门槛(6.2/6.3)统一判定并覆盖。
+			// 此处仅保留 RankScore(双窗口加权超额)作为粗排输入与灰度对照基线。
+			_ = shortRank
+			_ = shortN
 		}
 		if g.cfg.RSTopK > 0 && len(kept) > g.cfg.RSTopK {
 			*warnings = append(*warnings, fmt.Sprintf("RS_TOPK 截断弱尾 %d 只(保留前 %d)", len(kept)-g.cfg.RSTopK, g.cfg.RSTopK))
 			kept = kept[:g.cfg.RSTopK]
 		}
+	}
+
+	// ---- 阶段 7: 契约口径的 A/B/NONE 路径判定 + 四因子百分位评分 + 分段排序 ----
+	// 输入全部来自本次已采集数据（趋势结构 trendRes、基准 benchChgShort/benchChg）；
+	// ADV20 与行业指数 R20 属流动性/板块侧数据, 由调用方在 liquidityGatePool 之后
+	// 通过 ApplyStrengthStage2 补齐（见 generator.go）——本函数先用"可得因子"打分,
+	// 后续补算会覆盖 RankScore 为完整四因子口径。
+	{
+		w := strengthWiring{BenchR20: benchChgShort, BenchR60: benchChg,
+			SectorR20: map[string]*float64{}, Adv: map[string]*float64{},
+			Trend: map[string]trendState{}}
+		for k, idxK := range stockIdx {
+			_ = idxK
+			if trendRes[k].Known || trendRes[k].CloseGeMA20 || trendRes[k].MA20GeMA60 {
+				w.Trend[pool[idxK].Symbol] = trendRes[k]
+			}
+		}
+		// 行业基准：同名行业只请求一次（缓存于 sectorCache）
+		sectorCache := map[string]*float64{}
+		for i := range kept {
+			e := &kept[i]
+			if e.PrimarySource != sourceSector || e.SectorName == "" {
+				continue
+			}
+			v, hit := sectorCache[e.SectorName]
+			if !hit {
+				if bars, err := g.prov.IndexBars(ctx, e.SectorName, needBars(shortWin), now); err == nil && len(bars) >= needBars(shortWin) {
+					v = pctChangeOver(bars, shortWin)
+				} else {
+					v = nil
+				}
+				sectorCache[e.SectorName] = v
+			}
+			w.SectorR20[e.SectorName] = v
+		}
+		kept = g.applyStrengthPathsAndScores(kept, w, warnings)
+		g.strengthWiring = &w // 供 Generate() 在流动性闸门后二次精化(ADV因子)复用
 	}
 
 	// ---- 重组整池: 非股票条目保持原位相对顺序, 股票类整体插到其后 ----

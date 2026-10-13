@@ -56,6 +56,8 @@ type Config struct {
 	RSBenchmark        string  // 相对强度基准指数代码（默认 "000300" 沪深300）
 	RSEnabled          bool    // 是否执行 RS 打分与排序（默认 true; 失败自动退化保持原顺序）
 	RSTopK             int     // RS 排序后仅保留前 K 名股票类条目（默认 0 = 全部保留但仍排序）
+	PathATopN          int     // 阶段7: 路径A(趋势强势股)独立TopN上限（默认 0 = 不截断）
+	PathBTopN          int     // 阶段7: 路径B(趋势修复候选)独立TopN上限（默认 0 = 不截断; B 整体排在 A 之后）
 	RSConcurrency      int     // RS/资格计算并发度（默认 6）
 
 	// ---- 阶段 4：流动性过滤与交易容量（liquidity.go）----
@@ -94,6 +96,8 @@ func DefaultConfig() Config {
 		RSBenchmark:        "000300",
 		RSEnabled:          true,
 		RSTopK:             0,
+		PathATopN:          0,
+		PathBTopN:          0,
 		RSConcurrency:      6,
 
 		LiquidityEnabled:    true,
@@ -177,6 +181,9 @@ type Generator struct {
 	// 诚实输出 FinDataInsufficient —— 绝不把"财务未知"默认成"财务已通过"。
 	// 由 SetFinancialProvider 注入; 单测注入 fake 实现。
 	finProv FinancialProvider
+	// strengthWiring 阶段 7: refinePool 产出的强度管线输入包（趋势/基准/行业因子）。
+	// liquidityGatePool 计算 ADV20 后由 Generate 回填 Adv 并调用 RefineScores 二次精化。
+	strengthWiring *strengthWiring
 }
 
 // SetFinancialProvider 注入阶段 6 财务数据供应商（外部财报服务 / 测试 fake）。
@@ -273,6 +280,9 @@ func (g *Generator) Generate(ctx context.Context, manualSymbols []string, now ti
 	}
 	// 阶段 4：流动性闸门（ADV20）与交易容量标注，在精筛之后、落库之前。
 	pool = g.liquidityGatePool(ctx, pool, &warnings, now)
+	// 阶段 7: ADV20 已由流动性闸门写入条目快照(AvgAmount20D), 用它对四因子评分做
+	// 最终精化(补 P(ADV20) 权重)并按 A→B→其余重排。弱依赖：无强度包时原样返回。
+	pool = g.RefineScores(pool, &warnings)
 
 	bySource := map[string]int{}
 	for _, e := range pool {

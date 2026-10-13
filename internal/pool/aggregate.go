@@ -75,6 +75,13 @@ type AggEntry struct {
 	RetShortExcess *float64 `json:"ret_short_excess,omitempty"` // R20 - 基准同期
 	RetLongExcess  *float64 `json:"ret_long_excess,omitempty"`  // R60 - 基准同期
 
+	// ---- 阶段 7: 个股原始收益率与行业维度超额（strength.go 路径判定/评分输入）----
+	RetShortRaw      *float64 `json:"ret_short_raw,omitempty"`      // 个股 R20 %
+	RetLongRaw       *float64 `json:"ret_long_raw,omitempty"`       // 个股 R60 %
+	RS20IndexExcess  *float64 `json:"rs20_index_excess,omitempty"`  // R20 - 基准指数（评分因子1）
+	RS20SectorExcess *float64 `json:"rs20_sector_excess,omitempty"` // R20 - 行业指数（评分因子3; nil=行业不可确认）
+	StrengthReason   string   `json:"strength_reason,omitempty"`    // A/B/NONE 判定依据（审计）
+
 	// ---- 独立状态字段（不受主来源优先级影响）----
 	Eligibility EligibilityStatus `json:"eligibility_status"` // PASS/BLOCKED/UNKNOWN
 	Liquidity   LiquidityStatus   `json:"liquidity_status"`
