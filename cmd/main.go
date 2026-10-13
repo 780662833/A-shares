@@ -616,16 +616,16 @@ func (a *app) generatePoolNative(now time.Time) (*tool.WatchlistGenData, error) 
 	// 阶段 2: 把持久层事实位（BLACKLIST / first_seen / last_seen / expire）回填进
 	// 聚合器, 使黑名单优先压制 MANUAL、FAILED/STALE 不批量失效等生命周期规则
 	// 基于真实 DB 状态而非仅本次运行内存态。
-	if gdb := a.db(); gdb != nil {
+	if gdb := a.gdb; gdb != nil {
 		gen.PersistentStatus = func(ctx context.Context) map[string]pool.AggEntry {
 			m := make(map[string]pool.AggEntry)
-			var items []model.WatchlistItem
+			var items []dbmodel.WatchlistItem
 			if err := gdb.WithContext(ctx).Find(&items).Error; err != nil {
 				log.Printf("[watchlist] WARN load persistent status failed: %v", err)
 				return m
 			}
 			for _, it := range items {
-				agg := pool.AggEntry{Symbol: it.Code, Blacklisted: it.Status == model.WatchStatusBlacklist}
+				agg := pool.AggEntry{Symbol: it.Code, Blacklisted: it.Status == dbmodel.WatchStatusBlacklist}
 				if !it.AddedDate.IsZero() {
 					agg.FirstSeenAt = it.AddedDate
 				}
