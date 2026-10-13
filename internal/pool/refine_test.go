@@ -153,6 +153,8 @@ func TestRefineMinROEThreshold(t *testing.T) {
 }
 
 func TestRefineRSSortTopKAndFuse(t *testing.T) {
+	// 阶段 5 双窗口口径下, 本用例固定单窗口退化模式（长期窗口=短期窗口）,
+	// 使总分 = R20 超额收益, 与旧断言保持同一数值基准。
 	f := newFake()
 	f.qualify = func(code string) *StockQualification {
 		return qual("2020-01-01", 1, 5)
@@ -173,6 +175,8 @@ func TestRefineRSSortTopKAndFuse(t *testing.T) {
 		return nil
 	}
 	cfg := refineCfg()
+	cfg.RSShortWindow = 20
+	cfg.RSLongWindow = 20 // 单窗口退化: 总分 = R20 超额
 	poolIn := []AggEntry{
 		entryOf("600003", sourceSector),
 		entryOf("600001", sourceFund),
@@ -317,3 +321,198 @@ func join(ws []string) string {
 }
 
 var _ = time.Now
+
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// 阶段 5: 双窗口相对强度（R20 + R60）专项测试
+// ---------------------------------------------------------------------------
+
+// mkOHLCFromDaily 由收盘价序列生成合法 OHLC（High/Low 围绕收盘对称，满足
+// High >= max(Open,Close)、Low <= min(Open,Close)）。
+func mkOHLCFromDaily(bars []DailyBar) []barOHLC {
+	out := make([]barOHLC, 0, len(bars))
+	for _, b := range bars {
+		out = append(out, barOHLC{Date: b.Date, Open: b.Close, High: b.Close * 1.01, Low: b.Close * 0.99, Close: b.Close})
+	}
+	return out
+}
+
+// runRefineDual 以显式短/长窗口执行精筛（仅供测试构造退化场景；传 0 走配置解析）。
+func runRefineDual(t *testing.T, f *fakeProvider, cfg Config, pool []AggEntry, shortWin, longWin int) ([]AggEntry, []string) {
+	t.Helper()
+	g := NewGenerator(f, cfg)
+	warns := []string{}
+	out := g.refinePoolWith(context.Background(), pool, &warns, testNow, shortWin, longWin)
+	return out, warns
+}
+
+func TestRefineDualWindowWeightedScore(t *testing.T) {
+	f := newFake()
+	f.qualify = func(code string) *StockQualification { return qual("2020-01-01", 1, 5) }
+	// 基准单序列: R20 +4%（bars[n-21]=100）、R60 +8%（bars[n-61]=96.296）
+	f.indexBars = func(idx string, lookback int) []DailyBar {
+		return mkFlat(61, 104, 100, 96.296) // 104/100-1=4%, 104/96.296-1≈8%
+	}
+	// 个股 X: R20 +14% (超额+10), R60 +2% (超额-6) -> 总分 = 0.6*10 + 0.4*(-6) = 3.6
+	sb := mkFlat(61, 13, 11.4035, 12.7451) // 13/11.4035-1≈14%, 13/12.7451-1≈2%
+	f.stockBars = func(code string, lookback int) []DailyBar { return sb }
+	// 阶段 3 硬条件校验单独取 OHLC: 复用同一序列生成合法 OHLC,
+	// 尾部日期与 as_of(testNow=asOfDate 当日) 对齐。
+	f.barsOHLC = func(code string, lookback int) []barOHLC { return mkOHLCFromDaily(sb) }
+	cfg := refineCfg() // RSShortWindow=20, RSLongWindow=60, weight=60%
+	// 显式注入短/长窗口 20/60: 基准与个股都是固定 61 根序列, R20/R60 端点语义唯一,
+	// 不依赖 fake 钩子对 lookback 的透传方式。
+	out, _ := runRefineDual(t, f, cfg, []AggEntry{entryOf("600001", sourceSector)}, 20, 60)
+	if len(out) != 1 {
+		t.Fatalf("entry must survive, got %d", len(out))
+	}
+	e := out[0]
+	if e.RankScore < 3.5 || e.RankScore > 3.7 {
+		t.Fatalf("dual-window weighted score want ~3.6, got %v", e.RankScore)
+	}
+	if e.RetShortExcess == nil || *e.RetShortExcess < 9.9 || *e.RetShortExcess > 10.1 {
+		t.Errorf("want R20 excess ~10, got %v", e.RetShortExcess)
+	}
+	if e.RetLongExcess == nil || *e.RetLongExcess < -6.1 || *e.RetLongExcess > -5.9 {
+		t.Errorf("want R60 excess ~-6, got %v", e.RetLongExcess)
+	}
+	// 阶段 5 语义修正：A/B 判定看的是"窗口超额"而非加权总分符号——
+	// 短期强(R20 超额为正)且排名列前 1/3（池内唯一打分者 rank=1/1）-> A 路径，
+	// 即使中期大幅弱于基准拉负总分，仍应标 A（总分仅用于排序截断，不否决路径）。
+	if e.Strength != StrengthA {
+		t.Errorf("short-dominant stock should be path A, got %v", e.Strength)
+	}
+}
+
+func TestRefineStrengthPathSemantics(t *testing.T) {
+	f := newFake()
+	f.qualify = func(code string) *StockQualification { return qual("2020-01-01", 1, 5) }
+	// 基准两窗口均为 +0%（横盘：现价=R20端点=R60端点=100）
+	f.indexBars = func(idx string, lookback int) []DailyBar {
+		return mkFlat(61, 100, 100, 100)
+	}
+	f.stockBars = func(code string, lookback int) []DailyBar {
+		switch code {
+		case "600001": // R20 +10, R60 +10 -> 总分 +10, 短期超额正, 排名1 -> A
+			return mkFlat(61, 110, 100, 100)
+		case "600002": // R20 -5, R60 +20 -> 总分 0.6*(-5)+0.4*20=5, 中期强 -> B
+			return mkFlat(61, 120, 126.316, 100) // 120/126.316-1=-5%, 120/100-1=+20%
+		case "600003": // R20 -10, R60 -10 -> 总分 -10 -> NONE
+			return mkFlat(61, 90, 100, 100)
+		}
+		return nil
+	}
+	cfg := refineCfg()
+	in := []AggEntry{
+		entryOf("600002", sourceSector),
+		entryOf("600003", sourceSector),
+		entryOf("600001", sourceSector),
+	}
+	out, _ := runRefine(t, f, cfg, in)
+	var byCode = map[string]AggEntry{}
+	for _, e := range out {
+		byCode[e.Symbol] = e
+	}
+	if byCode["600001"].Strength != StrengthA {
+		t.Errorf("600001 want A, got %v (score %v)", byCode["600001"].Strength, byCode["600001"].RankScore)
+	}
+	if byCode["600002"].Strength != StrengthB {
+		t.Errorf("600002 want B (mid-term strong only), got %v (score %v)", byCode["600002"].Strength, byCode["600002"].RankScore)
+	}
+	if byCode["600003"].Strength != StrengthNone {
+		t.Errorf("600003 want NONE (both windows weak), got %v", byCode["600003"].Strength)
+	}
+	// 排序按总分降序: 600001(+10) > 600002(+5) > 600003(-10)
+	if byCode["600001"].RankPos != 1 || byCode["600002"].RankPos != 2 || byCode["600003"].RankPos != 3 {
+		t.Errorf("rank pos wrong: %+v", []int{byCode["600001"].RankPos, byCode["600002"].RankPos, byCode["600003"].RankPos})
+	}
+}
+
+// mkFlat 生成恰好 n 根的升序三段式日 K，显式指定三个锚点价格消除歧义：
+//   - 现价 last（bars[n-1]）
+//   - R20 端点价 shortBase（bars[n-21]）→ R20 = last/shortBase - 1
+//   - R60 端点价 longBase（bars[n-61]）→ R60 = last/longBase - 1
+//
+// n 不足对应段长度时该段不存在（调用方按样本不足处理）。索引一律按尾部定位，
+// 因此同一序列在任意 lookback 请求下 R20/R60 端点语义一致。
+func mkFlat(n int, last, shortBase, longBase float64) []DailyBar {
+	bars := make([]DailyBar, 0, n)
+	base := asOfDate.AddDate(0, 0, -(n - 1))
+	for i := 0; i < n; i++ {
+		var c float64
+		switch {
+		case i >= n-20:
+			c = last
+		case i >= n-60:
+			c = shortBase
+		default:
+			c = longBase
+		}
+		bars = append(bars, DailyBar{Date: base.AddDate(0, 0, i).Format("2006-01-02"), Close: c})
+	}
+	return bars
+}
+
+// asOfDate 与 testNow 同日: 使 quoteAsOfMatches 校验通过（尾部 K 线截止日 == as_of）。
+var asOfDate = time.Date(2026, 10, 12, 0, 0, 0, 0, time.UTC)
+
+func TestRefineSingleWindowDegeneration(t *testing.T) {
+	f := newFake()
+	f.qualify = func(code string) *StockQualification { return qual("2020-01-01", 1, 5) }
+	// 基准只有短期窗口可得：mkFlat(21,...) 无 R60 端点段（21 < needBars(60)=61），
+	// 且本用例以显式长窗=60 执行（绕过配置解析），精确构造"长期不可得"。
+	f.indexBars = func(idx string, lookback int) []DailyBar {
+		return mkFlat(21, 105, 100, 100) // R20 = 105/100-1 = +5%; R60 不可得
+	}
+	// 个股 R20 +15%、R60 样本不足不可得 -> 只用短窗口打分, 超额 = 15 - 5 = 10
+	f.stockBars = func(code string, lookback int) []DailyBar {
+		return mkFlat(21, 11.5, 10, 10) // 11.5/10-1 = +15%
+	}
+	cfg := refineCfg()
+	out, _ := runRefineDual(t, f, cfg, []AggEntry{entryOf("600001", sourceSector)}, 0, 60)
+	if len(out) != 1 {
+		t.Fatalf("entry must survive, got %d", len(out))
+	}
+	e := out[0]
+	if !e.Scored {
+		t.Fatalf("should score with available short window only")
+	}
+	if e.RankScore < 9.9 || e.RankScore > 10.1 {
+		t.Errorf("single-window degeneration want score=R20 excess ~10, got %v", e.RankScore)
+	}
+	if e.RetLongExcess != nil {
+		t.Errorf("long excess must stay nil when long window unavailable, got %v", *e.RetLongExcess)
+	}
+	// 契约注释语义：单窗口退化时唯一正超额窗口即视为短期强 -> A
+	if e.Strength != StrengthA {
+		t.Errorf("want A via short-only window, got %v", e.Strength)
+	}
+}
+
+func TestRefineInvalidWindowsFallback(t *testing.T) {
+	f := newFake()
+	f.qualify = func(code string) *StockQualification { return qual("2020-01-01", 1, 5) }
+	// 基准固定 61 根: R20 端点=现价=100 -> 基准R20=0; R60 端点=80 -> 基准R60=+25%
+	f.indexBars = func(idx string, lookback int) []DailyBar { return mkFlat(61, 100, 100, 80) }
+	// 个股固定 61 根: 现价 13、R20 端点 10、R60 端点 10 -> R20=R60=+30%
+	// 回落正确(short=20,long=60): R20超额=30-0=30, R60超额=30-25=5
+	//   总分 = 0.6*30 + 0.4*5 = 20。
+	// 若非法 short=90 未回落被直接采用: needBars(90)=91 > 61 -> 短窗样本不足,
+	//   单窗口退化只用长窗打分 -> 总分=5 ≠ 20，断言可区分两种口径。
+	f.stockBars = func(code string, lookback int) []DailyBar { return mkFlat(61, 13, 10, 10) }
+	cfg := refineCfg()
+	cfg.RSShortWindow = 90 // >= longWin(60) -> 非法, 应回落 20
+	cfg.RSLongWindow = 0   // 非法 -> 取 RSWindow=60
+	out, _ := runRefine(t, f, cfg, []AggEntry{entryOf("600001", sourceSector)})
+	if len(out) != 1 {
+		t.Fatalf("entry must survive, got %d", len(out))
+	}
+	e := out[0]
+	if e.RankScore < 19.9 || e.RankScore > 20.1 {
+		t.Errorf("invalid config must fall back to contract defaults (20/60), score want ~20 (0.6*30+0.4*5), got %v", e.RankScore)
+	}
+	if e.RetShortExcess == nil || *e.RetShortExcess < 29.9 || *e.RetShortExcess > 30.1 {
+		t.Errorf("want R20 excess ~30 after fallback, got %v", e.RetShortExcess)
+	}
+}

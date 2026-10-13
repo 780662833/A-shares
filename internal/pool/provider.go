@@ -98,6 +98,13 @@ type DailyBar struct {
 	Close float64
 }
 
+// DailyAmountRow 个股日 K 成交额行（阶段 4：ADV20 / 交易容量计算输入）。
+// Amount 单位人民币元；<=0 表示当日成交额缺失（不是零！见 liquidity.go 契约注释）。
+type DailyAmountRow struct {
+	Date   string
+	Amount float64
+}
+
 // ---------------------------------------------------------------------------
 // Provider 接口
 // ---------------------------------------------------------------------------
@@ -128,6 +135,15 @@ type Provider interface {
 	// StockBars 返回个股最近 lookback 个交易日日 K 收盘序列（升序; 不复权，
 	// RS 口径为区间涨跌幅，无需复权精度保证跨票一致性时优先前复权——见 generator.go 注释）。
 	StockBars(ctx context.Context, code string, lookback int, end time.Time) ([]DailyBar, error)
+	// BarsOHLC 返回个股最近 lookback 个交易日的完整 OHLC 序列（升序）。
+	// 阶段 3 证券资格硬条件（OHLC 完整性校验 + 行情时点 as_of 对齐）使用。
+	// SDK 未提供该能力时返回 error，调用方按"未知放行"退化（不误杀、不伪造通过）。
+	BarsOHLC(ctx context.Context, code string, lookback int, end time.Time) ([]barOHLC, error)
+
+	// StockAmounts 返回个股最近 lookback 个交易日"未复权"日成交额序列（升序，元）。
+	// 阶段 4 ADV20/交易容量专用口径：流动性必须使用实际成交额，Provider 实现
+	// 必须以 AdjustNone 拉取——不得用复权价格×成交量反推成交额（见 liquidity.go）。
+	StockAmounts(ctx context.Context, code string, lookback int, end time.Time) ([]DailyAmountRow, error)
 	// IndexBars 返回基准指数（如 "000300" 沪深300）最近 lookback 个交易日日 K 收盘序列（升序）。
 	IndexBars(ctx context.Context, indexCode string, lookback int, end time.Time) ([]DailyBar, error)
 }
@@ -400,4 +416,63 @@ func (p *SDKProvider) bars(ctx context.Context, code string, lookback int, end t
 		bars = bars[len(bars)-lookback:]
 	}
 	return bars, nil
+}
+
+// BarsOHLC 个股完整 OHLC 日 K（前复权，与 StockBars 同口径），供阶段 3
+// OHLC 完整性校验与行情时点 as_of 对齐使用。Kline.CN 行含 Open/High/Low/Close。
+func (p *SDKProvider) BarsOHLC(ctx context.Context, code string, lookback int, end time.Time) ([]barOHLC, error) {
+	start := end.AddDate(0, 0, int(float64(lookback)*1.8)+10)
+	rows, err := p.sdk.Kline.CN(ctx, code, stock.HistoryKlineOptions{
+		Period:    stock.KlinePeriodDaily,
+		Adjust:    stock.AdjustQFQ,
+		StartDate: start.Format("2006-01-02"),
+		EndDate:   end.Format("2006-01-02"),
+	})
+	if err != nil {
+		return nil, err
+	}
+	bars := make([]barOHLC, 0, len(rows))
+	for _, r := range rows {
+		bars = append(bars, barOHLC{
+			Date:  r.Date,
+			Open:  f64(r.Open),
+			High:  f64(r.High),
+			Low:   f64(r.Low),
+			Close: f64(r.Close),
+		})
+	}
+	if len(bars) > lookback {
+		bars = bars[len(bars)-lookback:]
+	}
+	return bars, nil
+}
+
+// StockAmounts 个股日成交额序列（阶段 4 ADV20/交易容量专用）。
+//
+// 单位与复权口径说明（契约，见 liquidity.go）：
+//   - stock-go HistoryKline.Amount 为当日实际成交金额，公开口径为人民币元；
+//     适配层不做任何缩放，直接透传——若上游变更单位，唯一需要修改的就是这里。
+//   - Adjust 必须为 AdjustNone（未复权）：流动性判断使用实际成交额，
+//     绝不以复权价格×成交量反推（该值未经数据源验证，且除权日会失真）。
+//   - Amount 缺失（nil/<=0）的行保留 Date 并置 Amount=0，由计算层按
+//     "缺失≠零"规则处理（见 adv20），不在适配层悄悄剔除样本。
+func (p *SDKProvider) StockAmounts(ctx context.Context, code string, lookback int, end time.Time) ([]DailyAmountRow, error) {
+	start := end.AddDate(0, 0, int(float64(lookback)*1.8)+10)
+	rows, err := p.sdk.Kline.CN(ctx, code, stock.HistoryKlineOptions{
+		Period:    stock.KlinePeriodDaily,
+		Adjust:    stock.AdjustNone, // 流动性=实际成交额口径，禁止复权
+		StartDate: start.Format("2006-01-02"),
+		EndDate:   end.Format("2006-01-02"),
+	})
+	if err != nil {
+		return nil, err
+	}
+	out := make([]DailyAmountRow, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, DailyAmountRow{Date: r.Date, Amount: f64(r.Amount)})
+	}
+	if len(out) > lookback {
+		out = out[len(out)-lookback:]
+	}
+	return out, nil
 }

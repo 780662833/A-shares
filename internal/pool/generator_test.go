@@ -29,6 +29,10 @@ type fakeProvider struct {
 	// 精筛管线测试钩子（nil = 数据缺失，走未知放行退化路径）
 	qualify   func(code string) *StockQualification
 	stockBars func(code string, lookback int) []DailyBar
+	// 阶段4: nil -> 取数失败（DATA_INSUFFICIENT 退化路径）
+	stockAmounts func(code string, lookback int) []DailyAmountRow
+	// 阶段3: nil -> 复用 stockBars 生成合法 OHLC；可注入异常 K 线
+	barsOHLC  func(code string, lookback int) []barOHLC
 	indexBars func(indexCode string, lookback int) []DailyBar
 }
 
@@ -72,6 +76,32 @@ func (f *fakeProvider) ETFCloseSeries(ctx context.Context, code string, lookback
 }
 
 // ---- 精筛管线三方法（默认"数据缺失"退化：旧测试全部走未知放行路径）----
+
+func (f *fakeProvider) StockAmounts(ctx context.Context, code string, lookback int, end time.Time) ([]DailyAmountRow, error) {
+	func() { f.mu.Lock(); defer f.mu.Unlock(); f.calls["Amounts:"+code]++ }()
+	if f.stockAmounts != nil {
+		return f.stockAmounts(code, lookback), nil
+	}
+	return nil, errors.New("no amounts")
+}
+
+// BarsOHLC 完整 OHLC 序列（阶段 3 校验输入）。默认复用 stockBars 收盘价生成
+// 合法 OHLC；测试可通过 barsOHLC 钩子注入异常 K 线。
+func (f *fakeProvider) BarsOHLC(ctx context.Context, code string, lookback int, end time.Time) ([]barOHLC, error) {
+	func() { f.mu.Lock(); defer f.mu.Unlock(); f.calls["OHLC:"+code]++ }()
+	if f.barsOHLC != nil {
+		return f.barsOHLC(code, lookback), nil
+	}
+	if f.stockBars != nil {
+		bars := f.stockBars(code, lookback)
+		out := make([]barOHLC, 0, len(bars))
+		for _, b := range bars {
+			out = append(out, barOHLC{Date: b.Date, Open: b.Close, High: b.Close * 1.01, Low: b.Close * 0.99, Close: b.Close})
+		}
+		return out, nil
+	}
+	return nil, errors.New("no ohlc bars")
+}
 
 func (f *fakeProvider) StockQualification(ctx context.Context, code string) (*StockQualification, error) {
 	func() { f.mu.Lock(); defer f.mu.Unlock(); f.calls["Qualify:"+code]++ }()
