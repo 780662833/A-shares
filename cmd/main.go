@@ -177,6 +177,28 @@ func applyPoolEnvOverrides(c *pool.Config) {
 			log.Printf("WARN: invalid ASHARE_MAX_PARTICIPATION_PCT=%q, keep %v", v, c.MaxParticipationPct)
 		}
 	}
+	// ---- 阶段 5：双窗口相对强度（R20 + R60）----
+	if v := strings.TrimSpace(os.Getenv("ASHARE_RS_SHORT_WINDOW")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			c.RSShortWindow = n
+		} else {
+			log.Printf("WARN: invalid ASHARE_RS_SHORT_WINDOW=%q, keep %d", v, c.RSShortWindow)
+		}
+	}
+	if v := strings.TrimSpace(os.Getenv("ASHARE_RS_LONG_WINDOW")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			c.RSLongWindow = n
+		} else {
+			log.Printf("WARN: invalid ASHARE_RS_LONG_WINDOW=%q, keep %d", v, c.RSLongWindow)
+		}
+	}
+	if v := strings.TrimSpace(os.Getenv("ASHARE_RS_SHORT_WEIGHT")); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil && f >= 0 && f <= 100 {
+			c.RSShortWeightPct = f
+		} else {
+			log.Printf("WARN: invalid ASHARE_RS_SHORT_WEIGHT=%q, keep %v", v, c.RSShortWeightPct)
+		}
+	}
 }
 
 func loadConfig() appConfig {

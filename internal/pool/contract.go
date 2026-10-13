@@ -121,7 +121,7 @@ func Params() Config {
 	// StockMinPrice(MinPrice)=1元                      已一致
 	// MinListingTradingDays=120个有效交易日; 当前 MinListedDays=120 自然日,
 	//   自然日≈交易日*1.4, 阶段 1 由主数据 Provider 提供交易日计数后收紧。
-	// R20/R60: 当前 RSWindow=60 单窗口; 双窗口(R20+R60)打分属阶段 1 强度排序扩展。
+	// R20/R60: 阶段 5 已实现双窗口打分（RSShortWindow=20 + RSLongWindow=60, 加权 RSShortWeightPct=60%）。
 	// StrengthTopN: 对应 RSTopK, 建议区间 50~100; 默认 0(不截断)保持灰度期全量观察。
 	c.RSTopK = 0 // 验收口径: 上线初期不截断, 回测后再设 50~100
 	return c

@@ -71,6 +71,10 @@ type AggEntry struct {
 	RankPos   int          `json:"rank_pos,omitempty"`
 	Strength  StrengthPath `json:"strength_path,omitempty"`
 
+	// ---- 阶段 5: 双窗口相对强度明细（R20/R60 超额收益, 单位 %）----
+	RetShortExcess *float64 `json:"ret_short_excess,omitempty"` // R20 - 基准同期
+	RetLongExcess  *float64 `json:"ret_long_excess,omitempty"`  // R60 - 基准同期
+
 	// ---- 独立状态字段（不受主来源优先级影响）----
 	Eligibility EligibilityStatus `json:"eligibility_status"` // PASS/BLOCKED/UNKNOWN
 	Liquidity   LiquidityStatus   `json:"liquidity_status"`

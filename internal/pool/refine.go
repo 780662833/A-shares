@@ -105,7 +105,14 @@ func listingCalendarDays(listingDate string, now time.Time) int {
 }
 
 // refinePool 对去重后的池执行资格/财务闸门 + RS 排序。warnings 追加写回。
+// 阶段 5: 委托给带显式窗口覆盖的 refinePoolWith（cfg 值传 0 -> 走配置解析）。
 func (g *Generator) refinePool(ctx context.Context, pool []AggEntry, warnings *[]string, now time.Time) []AggEntry {
+	return g.refinePoolWith(ctx, pool, warnings, now, 0, 0)
+}
+
+// refinePoolWith 双窗口口径可注入版本：shortOverride/longOverride > 0 时直接采用
+// （仅供测试精确构造"基准长窗样本不足"等退化场景），否则按配置解析并做非法值回落。
+func (g *Generator) refinePoolWith(ctx context.Context, pool []AggEntry, warnings *[]string, now time.Time, shortOverride, longOverride int) []AggEntry {
 	// 股票类下标（参与闸门与 RS）; MANUAL/ETF 直通。
 	stockIdx := make([]int, 0, len(pool))
 	for i, e := range pool {
@@ -126,8 +133,29 @@ func (g *Generator) refinePool(ctx context.Context, pool []AggEntry, warnings *[
 		finBlock bool   // 财务维度明确否决（EPS<0 / ROE 不足）
 		hardFlag bool   // 阶段3硬条件异常标记（OHLC/时点/价格）——不剔除, 只降级 tradability
 		chg      *float64
+		chgShort *float64 // 阶段5: R20 区间涨跌幅（短期动量）
 	}
 	results := make([]outcome, len(stockIdx))
+
+	// ---- 阶段 5: 双窗口口径解析（R20 短期 + R60 中期）----
+	longWin := g.cfg.RSLongWindow
+	if longWin <= 0 {
+		longWin = g.cfg.RSWindow // 兼容旧配置键
+	}
+	shortWin := g.cfg.RSShortWindow
+	if shortWin <= 0 || shortWin >= longWin {
+		shortWin = 20 // 非法配置回落契约默认，绝不静默改变长期窗口
+	}
+	if longOverride > 0 {
+		longWin = longOverride
+	}
+	if shortOverride > 0 {
+		shortWin = shortOverride
+	}
+	maxWin := longWin
+	if shortWin > maxWin {
+		maxWin = shortWin
+	}
 
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, g.cfg.RSConcurrency)
@@ -184,12 +212,18 @@ func (g *Generator) refinePool(ctx context.Context, pool []AggEntry, warnings *[
 			}
 
 			if !res.rejected && g.cfg.RSEnabled {
-				bars, err := g.prov.StockBars(ctx, code, g.cfg.RSWindow, now)
-				if err != nil || len(bars) < needBars(g.cfg.RSWindow) {
+				// 阶段 5: 一次取 max(R20,R60)+1 根 K 线, 同序列上计算双窗口收益（避免两次 RPC 口径不一致）
+				bars, err := g.prov.StockBars(ctx, code, maxWin, now)
+				if err != nil || len(bars) < needBars(shortWin) {
 					res.unknown = true
 				} else {
-					res.chg = pctChangeOver(bars, g.cfg.RSWindow)
-					if res.chg == nil {
+					// 各窗口独立判定样本充分性: 短窗口可得即打短分; 长窗口缺样仅置 nil(单窗口退化),
+					// 绝不因长窗口样本不足而把整只股票踢出打分。
+					res.chgShort = pctChangeOver(bars, shortWin)
+					if len(bars) >= needBars(longWin) {
+						res.chg = pctChangeOver(bars, longWin)
+					}
+					if res.chg == nil && res.chgShort == nil {
 						res.unknown = true
 					}
 				}
@@ -199,14 +233,17 @@ func (g *Generator) refinePool(ctx context.Context, pool []AggEntry, warnings *[
 	}
 	wg.Wait()
 
-	// ---- 基准指数同期涨跌幅 ----
-	var benchChg *float64
+	// ---- 基准指数同期涨跌幅（阶段 5: 双窗口, 与个股同一条 K 线序列计算）----
+	var benchChg, benchChgShort *float64
 	if g.cfg.RSEnabled {
-		bars, err := g.prov.IndexBars(ctx, g.cfg.RSBenchmark, g.cfg.RSWindow, now)
-		if err == nil && len(bars) >= needBars(g.cfg.RSWindow) {
-			benchChg = pctChangeOver(bars, g.cfg.RSWindow)
+		bars, err := g.prov.IndexBars(ctx, g.cfg.RSBenchmark, maxWin, now)
+		if err == nil && len(bars) >= needBars(shortWin) {
+			benchChgShort = pctChangeOver(bars, shortWin)
+			if len(bars) >= needBars(longWin) {
+				benchChg = pctChangeOver(bars, longWin)
+			}
 		}
-		if benchChg == nil {
+		if benchChg == nil && benchChgShort == nil {
 			*warnings = append(*warnings, fmt.Sprintf("RS_BENCHMARK 基准指数 %s 不可得(已跳过 RS 排序)", g.cfg.RSBenchmark))
 		}
 	}
@@ -240,9 +277,45 @@ func (g *Generator) refinePool(ctx context.Context, pool []AggEntry, warnings *[
 		if res.unknown {
 			unknownN++
 		}
-		if res.chg != nil && benchChg != nil {
-			e.RankScore = round2(*res.chg - *benchChg)
-			e.Scored = true // 参与 RS 打分（RankPos/Strength 仅对 Scored 条目赋值）
+		if res.chg != nil || res.chgShort != nil {
+			// 阶段 5: 双窗口加权总分。缺哪个窗口就只用另一个（单窗口退化），
+			// 权重按实际可得窗口归一化, 绝不把缺失当 0 参与加权。
+			var sExcess, lExcess float64
+			var haveS, haveL bool
+			if res.chgShort != nil && benchChgShort != nil {
+				sExcess = *res.chgShort - *benchChgShort
+				haveS = true
+			}
+			if res.chg != nil && benchChg != nil {
+				lExcess = *res.chg - *benchChg
+				haveL = true
+			}
+			switch {
+			case haveS && haveL:
+				w := g.cfg.RSShortWeightPct / 100
+				if w < 0 {
+					w = 0
+				}
+				if w > 1 {
+					w = 1
+				}
+				e.RankScore = round2(w*sExcess + (1-w)*lExcess)
+				e.Scored = true
+			case haveS:
+				e.RankScore = round2(sExcess)
+				e.Scored = true
+			case haveL:
+				e.RankScore = round2(lExcess)
+				e.Scored = true
+			}
+			if haveS {
+				v := round2(sExcess)
+				e.RetShortExcess = &v
+			}
+			if haveL {
+				v := round2(lExcess)
+				e.RetLongExcess = &v
+			}
 		}
 		kept = append(kept, e)
 	}
@@ -251,7 +324,7 @@ func (g *Generator) refinePool(ctx context.Context, pool []AggEntry, warnings *[
 	}
 	// 可观测性: 只要实际执行过闸门判定就输出统计 warning（即使 0 剔除/0 缺失）,
 	// 使每次运行的通过/拒绝计数可审计。
-	if benchChg != nil {
+	if benchChg != nil || benchChgShort != nil {
 		*warnings = append(*warnings, fmt.Sprintf("QUALIFY 闸门完成: %d 只参与判定, 剔除 %d, 未知放行 %d, 保留 %d", len(stockIdx), rejectedN, unknownN, len(kept)))
 	} else {
 		*warnings = append(*warnings, fmt.Sprintf("QUALIFY 闸门完成(未打分): %d 只参与判定, 剔除 %d, 未知放行 %d, 保留 %d", len(stockIdx), rejectedN, unknownN, len(kept)))
@@ -272,8 +345,8 @@ func (g *Generator) refinePool(ctx context.Context, pool []AggEntry, warnings *[
 		*warnings = append(*warnings, fmt.Sprintf("QUALIFY 闸门基于明确证据剔除全部 %d 只股票类条目(不复活)", len(dropped)))
 	}
 
-	// ---- RS 降序排序 + TopK 截断（仅在基准可得时执行排序）----
-	if benchChg != nil {
+	// ---- RS 降序排序 + TopK 截断（任一基准窗口可得即执行排序）----
+	if benchChg != nil || benchChgShort != nil {
 		sort.SliceStable(kept, func(i, j int) bool { return kept[i].RankScore > kept[j].RankScore })
 		rankedN := 0
 		for i := range kept {
@@ -283,18 +356,60 @@ func (g *Generator) refinePool(ctx context.Context, pool []AggEntry, warnings *[
 			rankedN++
 			kept[i].RankPos = rankedN
 		}
+		// 短期维度单独排名: RankPos 是加权总分的排名位——若用总分名次判"短期排名",
+		// 会出现"短强中极弱被总分挤出前 1/3 -> 误判 NONE"的自相矛盾。因此 A 路径的
+		// "位于前列"必须按 R20 超额降序单独排名（仅在参与打分的股票类条目中比较）。
+		shortRank := map[int]int{} // kept 下标 -> 短期超额名次(1 起)
+		shortN := 0
+		{
+			order := make([]int, 0, len(kept))
+			for i := range kept {
+				if kept[i].Scored {
+					order = append(order, i)
+				}
+			}
+			sort.SliceStable(order, func(a, b int) bool {
+				ea, eb := &kept[order[a]], &kept[order[b]]
+				va, vb := -1e18, -1e18
+				if ea.RetShortExcess != nil {
+					va = *ea.RetShortExcess
+				}
+				if eb.RetShortExcess != nil {
+					vb = *eb.RetShortExcess
+				}
+				return va > vb
+			})
+			for pos, idxK := range order {
+				if kept[idxK].RetShortExcess != nil {
+					shortN++
+					shortRank[idxK] = pos + 1
+				}
+			}
+		}
 		for i := range kept {
 			if !kept[i].Scored {
 				continue
 			}
-			// 强度路径：A=短期强(灰度期以单窗口得分前 1/3 近似 R20 口径), B=中期强(其余正超额), NONE=打分后落选
+			// 阶段 5: 强度路径按契约语义判定（看窗口超额, 不看加权总分符号）：
+			//   A = R20 超额为正 且 位于"短期超额降序"列的前 1/3
+			//       （单窗口退化时唯一正超额窗口即视为短期强）
+			//   B = 非 A 但 R60 超额为正（中期强）
+			//   NONE = 两窗口超额均不为正（或不可得）
+			// 总分只用于排序与 TopK 截断；短期强（R20 超额为正）即使中期
+			// 弱于基准拉负总分，仍应标 A（czsc 形态确认层会二次把关）。
+			onlyShort := kept[i].RetLongExcess == nil && kept[i].RetShortExcess != nil
+			inShortTopThird := false
+			if r, ok := shortRank[i]; ok && shortN > 0 {
+				inShortTopThird = r*3 <= shortN
+			}
 			switch {
-			case kept[i].RankScore <= 0:
-				kept[i].Strength = StrengthNone
-			case kept[i].RankPos*3 <= rankedN:
-				kept[i].Strength = StrengthA
-			default:
+			case kept[i].RetShortExcess != nil && *kept[i].RetShortExcess > 0 &&
+				(onlyShort || inShortTopThird):
+				kept[i].Strength = StrengthA; t1 := true; _ = t1
+			case kept[i].RetLongExcess != nil && *kept[i].RetLongExcess > 0:
 				kept[i].Strength = StrengthB
+			default:
+				kept[i].Strength = StrengthNone
 			}
 		}
 		if g.cfg.RSTopK > 0 && len(kept) > g.cfg.RSTopK {
@@ -358,13 +473,11 @@ func (g *Generator) qualifyReject(q *StockQualification, now time.Time) (string,
 	return "", false
 }
 
-// needBars RS 计算所需最少 K 线根数（容忍小幅缺数据, 75% 覆盖）。
+// needBars RS 计算所需最少 K 线根数。注意：pctChangeOver 要求 len(bars) > window，
+// 即至少 window+1 根——若只按窗口的 75% 放行，短窗口(R20)在长窗口取数(maxWin=60)下
+// 会因基期与现期落在同一平台价上而恒得 0% 收益，属静默口径错误，绝不允许。
 func needBars(window int) int {
-	n := window * 3 / 4
-	if n < 2 {
-		n = 2
-	}
-	return n
+	return window + 1
 }
 
 // pctChangeOver 最近 window 个交易日区间涨跌幅 %（首尾收盘）。

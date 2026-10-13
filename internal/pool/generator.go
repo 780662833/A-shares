@@ -49,7 +49,10 @@ type Config struct {
 	MinListedDays      int     // 证券资格: 上市满 N 自然日方可入池（默认 120; 次新波动大且无足够 RS 样本）
 	RequirePositiveEPS bool    // 财务状态: 最近一期基本 EPS < 0 剔除（默认 true; 数据缺失放行）
 	MinROE             float64 // 财务状态: 加权 ROE 下限 %（默认 0 = 仅剔除明确负 ROE; -1e9 可关闭）
-	RSWindow           int     // 相对强度: 回看交易日数（默认 60）
+	RSWindow           int     // 相对强度主窗口 R60: 回看交易日数（默认 60; 兼容旧配置键）
+	RSShortWindow      int     // 阶段5: 短期动量窗口 R20（默认 20）
+	RSLongWindow       int     // 阶段5: 中期动量窗口 R60（默认 60; 为 0 时取 RSWindow）
+	RSShortWeightPct   float64 // 阶段5: R20 超额收益在总分中的权重百分比（默认 60）
 	RSBenchmark        string  // 相对强度基准指数代码（默认 "000300" 沪深300）
 	RSEnabled          bool    // 是否执行 RS 打分与排序（默认 true; 失败自动退化保持原顺序）
 	RSTopK             int     // RS 排序后仅保留前 K 名股票类条目（默认 0 = 全部保留但仍排序）
@@ -85,6 +88,9 @@ func DefaultConfig() Config {
 		RequirePositiveEPS: true,
 		MinROE:             0,
 		RSWindow:           60,
+		RSShortWindow:      20,
+		RSLongWindow:       60,
+		RSShortWeightPct:   60,
 		RSBenchmark:        "000300",
 		RSEnabled:          true,
 		RSTopK:             0,
