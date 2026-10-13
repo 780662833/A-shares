@@ -632,6 +632,7 @@ func (a *app) runWatchlistUpdate(trigger string) error {
 		data, err = a.generatePoolNative(start)
 		if err != nil {
 			log.Printf("[watchlist] WARN go-native pool failed trigger=%s err=%v -> fallback to python gateway", trigger, err)
+			a.saveFallbackRun(start, err) // 阶段 8: FALLBACK 审计行（screening_runs.status=FALLBACK）
 			ctx, cancel := context.WithTimeout(context.Background(), a.cfg.WatchTimeout+30*time.Second)
 			defer cancel()
 			data, err = tool.FetchGeneratedWatchlist(ctx, a.cfg.GatewayURL, a.cfg.Watchlist, a.cfg.WatchTimeout)
@@ -671,6 +672,8 @@ func (a *app) generatePoolNative(now time.Time) (*tool.WatchlistGenData, error) 
 	defer cancel()
 
 	gen := pool.NewGenerator(pool.NewSDKProvider(15*time.Second), a.cfg.PoolCfg)
+	// 阶段 8: run_id 由 cron 注入（时间戳口径, 幂等键——同一次运行重复落库不产生重复行）。
+	gen.SetRunID(now.UTC().Format("20060102T150405"))
 	// 阶段 2: 把持久层事实位（BLACKLIST / first_seen / last_seen / expire）回填进
 	// 聚合器, 使黑名单优先压制 MANUAL、FAILED/STALE 不批量失效等生命周期规则
 	// 基于真实 DB 状态而非仅本次运行内存态。
@@ -702,6 +705,27 @@ func (a *app) generatePoolNative(now time.Time) (*tool.WatchlistGenData, error) 
 	res, err := gen.Generate(ctx, a.cfg.Watchlist, now)
 	if err != nil {
 		return nil, fmt.Errorf("go-native pool generate: %w", err)
+	}
+	// 阶段 8: 运行审计与快照落库（screening_runs / source_run_status /
+	// watchlist_source_hits / daily_stock_metrics）。落库失败不影响池子生成
+	// 结果——审计缺失要报警但不能反向阻断交易链路。
+	runStatus := "SUCCESS"
+	for _, st := range res.SourceStatuses {
+		if st == pool.StatusPartial {
+			runStatus = "PARTIAL_SUCCESS"
+			break
+		}
+	}
+	if a.gdb != nil {
+		runID, serr := db.SaveScreeningRun(db.SaveScreeningRunInputs{
+			GDB: a.gdb, Result: res, Started: now, Status: runStatus,
+		})
+		if serr != nil {
+			log.Printf("[watchlist] WARN save screening run failed (pool result still applied): %v", serr)
+		} else {
+			log.Printf("[watchlist] screening run saved run_id=%s status=%s config_hash=%s version=%s pool=%d",
+				runID, runStatus, res.ConfigHash, res.StrategyVersion, res.Total)
+		}
 	}
 	data, err := res.ToGenData()
 	if err != nil {
@@ -912,4 +936,27 @@ func shanghaiLocation() *time.Location {
 	}
 	log.Printf("WARN: tzdata unavailable, falling back to fixed UTC+8 for cron scheduling")
 	return time.FixedZone("CST", 8*3600)
+}
+
+// saveFallbackRun 阶段 8: Go 原生链路整体失败时写一条 status=FALLBACK 的审计行。
+// 注意：此时不落任何 source_hits/metrics——FAILED 不是"今天没有命中"，旧池数据
+// 原样保留（生命周期红线），仅记录本次回退事实供监控 deprecated 触发率。
+func (a *app) saveFallbackRun(start time.Time, cause error) {
+	if a.gdb == nil {
+		return
+	}
+	now := time.Now()
+	run := dbmodel.ScreeningRun{
+		RunID:           now.UTC().Format("20060102T150405") + "F",
+		StrategyVersion: a.cfg.PoolCfg.StrategyVersion(),
+		ConfigHash:      a.cfg.PoolCfg.Hash(),
+		AsOf:            now.Format("2006-01-02"),
+		StartedAt:       start,
+		CompletedAt:     &now,
+		Status:          "FALLBACK",
+		ErrorReason:     cause.Error(),
+	}
+	if err := a.gdb.Create(&run).Error; err != nil {
+		log.Printf("[watchlist] WARN save fallback run failed: %v", err)
+	}
 }

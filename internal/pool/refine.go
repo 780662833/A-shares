@@ -134,6 +134,8 @@ func (g *Generator) refinePoolWith(ctx context.Context, pool []AggEntry, warning
 		hardFlag bool     // 阶段3硬条件异常标记（OHLC/时点/价格）——不剔除, 只降级 tradability
 		chg      *float64 // R60 个股收益率 %（原始值, 非超额）
 		chgShort *float64 // 阶段5: R20 区间涨跌幅（短期动量）
+		// 阶段 8: MA 快照透传（daily_stock_metrics 落库输入）
+		closePx, ma20, ma60 *float64
 	}
 	results := make([]outcome, len(stockIdx))
 
@@ -223,6 +225,7 @@ func (g *Generator) refinePoolWith(ctx context.Context, pool []AggEntry, warning
 					}
 					cge, mge, known := maTrendFromBars(closes)
 					trendRes[k] = trendState{CloseGeMA20: cge, MA20GeMA60: mge, Known: known}
+					results[k].closePx, results[k].ma20, results[k].ma60 = maValuesFromBars(closes)
 				}
 				if err != nil || len(bars) < needBars(shortWin) {
 					res.unknown = true
@@ -318,6 +321,8 @@ func (g *Generator) refinePoolWith(ctx context.Context, pool []AggEntry, warning
 	for k, idx := range stockIdx {
 		e := pool[idx]
 		res := results[k]
+		// 阶段 8: MA/收盘价快照透传（供 daily_stock_metrics 落库; nil = 样本不足, 诚实缺失）
+		e.Close, e.MA20, e.MA60 = res.closePx, res.ma20, res.ma60
 		// 契约状态回填（独立保存, 不受主来源优先级影响）
 		switch {
 		case res.rejected && res.finBlock:
@@ -462,46 +467,6 @@ func (g *Generator) refinePoolWith(ctx context.Context, pool []AggEntry, warning
 			rankedN++
 			kept[i].RankPos = rankedN
 		}
-		// 短期维度单独排名: RankPos 是加权总分的排名位——若用总分名次判"短期排名",
-		// 会出现"短强中极弱被总分挤出前 1/3 -> 误判 NONE"的自相矛盾。因此 A 路径的
-		// "位于前列"必须按 R20 超额降序单独排名（仅在参与打分的股票类条目中比较）。
-		shortRank := map[int]int{} // kept 下标 -> 短期超额名次(1 起)
-		shortN := 0
-		{
-			order := make([]int, 0, len(kept))
-			for i := range kept {
-				if kept[i].Scored {
-					order = append(order, i)
-				}
-			}
-			sort.SliceStable(order, func(a, b int) bool {
-				ea, eb := &kept[order[a]], &kept[order[b]]
-				va, vb := -1e18, -1e18
-				if ea.RetShortExcess != nil {
-					va = *ea.RetShortExcess
-				}
-				if eb.RetShortExcess != nil {
-					vb = *eb.RetShortExcess
-				}
-				return va > vb
-			})
-			for pos, idxK := range order {
-				if kept[idxK].RetShortExcess != nil {
-					shortN++
-					shortRank[idxK] = pos + 1
-				}
-			}
-		}
-		for i := range kept {
-			if !kept[i].Scored {
-				continue
-			}
-			// 阶段 7: 旧版"前1/3近似"A/B/NONE 判定已废弃 —— strength_path 改由
-			// applyStrengthPathsAndScores 按契约硬门槛(6.2/6.3)统一判定并覆盖。
-			// 此处仅保留 RankScore(双窗口加权超额)作为粗排输入与灰度对照基线。
-			_ = shortRank
-			_ = shortN
-		}
 		if g.cfg.RSTopK > 0 && len(kept) > g.cfg.RSTopK {
 			*warnings = append(*warnings, fmt.Sprintf("RS_TOPK 截断弱尾 %d 只(保留前 %d)", len(kept)-g.cfg.RSTopK, g.cfg.RSTopK))
 			kept = kept[:g.cfg.RSTopK]
@@ -509,12 +474,15 @@ func (g *Generator) refinePoolWith(ctx context.Context, pool []AggEntry, warning
 	}
 
 	// ---- 阶段 7: 契约口径的 A/B/NONE 路径判定 + 四因子百分位评分 + 分段排序 ----
+	// 每次运行先重置强度包：精筛关闭/基准不可得时保持 nil（StrengthKnown=false）,
+	// 防止上一轮的 wiring 指针残留把"管线未执行"误标成"打分后落选 STRENGTH"。
+	g.strengthWiring = nil
 	// 输入全部来自本次已采集数据（趋势结构 trendRes、基准 benchChgShort/benchChg）；
 	// ADV20 与行业指数 R20 属流动性/板块侧数据, 由调用方在 liquidityGatePool 之后
 	// 通过 ApplyStrengthStage2 补齐（见 generator.go）——本函数先用"可得因子"打分,
 	// 后续补算会覆盖 RankScore 为完整四因子口径。
 	{
-		w := strengthWiring{BenchR20: benchChgShort, BenchR60: benchChg,
+		w := strengthWiring{BenchR20: benchChgShort, BenchR60: benchChg, SingleWindowShortOnly: benchChgShort != nil && benchChg == nil,
 			SectorR20: map[string]*float64{}, Adv: map[string]*float64{},
 			Trend: map[string]trendState{}}
 		for k, idxK := range stockIdx {
@@ -563,7 +531,7 @@ func (g *Generator) refinePoolWith(ctx context.Context, pool []AggEntry, warning
 	out = append(out, kept...)
 	// 交易资格统一推导（黑名单优先; 强度路径 NONE 的纯自动股票条目软阻塞）
 	for i := range out {
-		out[i].ComputeTradability()
+		out[i].ComputeTradability(g.StrengthKnown())
 	}
 	return out
 }

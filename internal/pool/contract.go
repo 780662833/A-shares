@@ -139,3 +139,10 @@ const (
 	ContractETFMinADV20    = 2e7 // 元
 	ContractETFHistoryBars = 90  // ETF 日线观察窗口（当前 ETFLookback=60, 阶段 1 扩至 90）
 )
+
+// StrategyVersion 策略版本标识（阶段 8: daily_stock_metrics/screening_runs 的口径键）。
+// 由参数指纹派生——修改 ADV20 门槛、RS 权重或财务规则后版本号自动变化, 历史快照
+// 因此可按规则版本区分比较, 不需要手工维护版本常量。
+func (c Config) StrategyVersion() string {
+	return "pool-v1-" + c.Hash()
+}

@@ -100,6 +100,13 @@ func autoMigrate(gdb *gorm.DB) error {
 		&model.CandidatePool{},
 		&model.AIDecisionLog{},
 		&model.WatchlistItem{},
+		// 阶段 8：候选池审计与快照五表（screening_runs / source_run_status /
+		// watchlist_source_hits / daily_stock_metrics；watchlist_entries 角色由
+		// 既有 watchlist_items 承担，不另建互不关联的第二套名单）。
+		&model.ScreeningRun{},
+		&model.SourceRunStatus{},
+		&model.WatchlistSourceHit{},
+		&model.DailyStockMetrics{},
 	}
 	if err := gdb.AutoMigrate(models...); err != nil {
 		return fmt.Errorf("db: automigrate: %w", err)

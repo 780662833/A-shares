@@ -24,6 +24,8 @@ import (
 	"time"
 
 	"ashare-quant/internal/tool"
+	"crypto/sha256"
+	"encoding/hex"
 )
 
 // Config 生成器可调参数（默认值对齐原 Python 实现）。
@@ -127,6 +129,16 @@ type Entry struct {
 	EligibilityStatus EligibilityStatus `json:"eligibility_status,omitempty"`
 	FinancialStatusV  FinancialStatus   `json:"financial_status,omitempty"`
 	StrengthPathV     StrengthPath      `json:"strength_path,omitempty"`
+
+	// HitStatus 本条命中证据的来源刷新状态（阶段 8: source_run_status / SourceHit.Status）。
+	// 零值在聚合层按 StatusOK 处理（兼容 Python 链路无此字段的旧载荷）。
+	HitStatus SourceStatus `json:"hit_status,omitempty"`
+
+	// ---- 阶段 8: MA20/MA60 趋势快照（refine.go 在同一条收盘序列上计算后透传给
+	// 聚合层, 供 daily_stock_metrics 落库; 样本不足时保持 nil, 绝不伪造）----
+	Close *float64 `json:"close,omitempty"` // 截止 as_of 的最新有效收盘价（元）
+	MA20  *float64 `json:"ma20,omitempty"`  // 20 日均价（收盘价口径, 单位元）
+	MA60  *float64 `json:"ma60,omitempty"`  // 60 日均价（收盘价口径, 单位元）
 }
 
 // Result 一次生成的完整输出（tool.WatchlistGenData 的同构体 + Go 层新增诊断字段）。
@@ -136,6 +148,23 @@ type Result struct {
 	BySource  map[string]int `json:"by_source"`
 	Pool      []AggEntry     `json:"pool"`
 	Warnings  []string       `json:"warnings"`
+
+	// ---- 阶段 8: 落库审计字段（screening_runs / source_run_status 数据源）----
+	// RunID 由调用方注入（cmd cron 用时间戳生成）; 为空时持久化层自行生成。
+	RunID string `json:"run_id,omitempty"`
+	// AsOf 本次计算的业务截止日期（YYYY-MM-DD, 与 TradeDate 同值但语义独立:
+	// TradeDate 面向展示, AsOf 是 daily_stock_metrics UNIQUE(symbol, as_of, version) 的键）。
+	AsOf string `json:"as_of,omitempty"`
+	// SourceStatuses 四个自动来源 + 全市场初筛的本轮执行状态。FAILED 只更新该
+	// 来源的错误状态并保留最后一次有效结果——绝不把请求失败解释成"今天没有命中"。
+	SourceStatuses map[string]SourceStatus `json:"source_statuses,omitempty"`
+	// SourceErrors 记录 FAILED/PARTIAL 来源的具体错误原因（source_run_status.error_reason）。
+	SourceErrors map[string]string `json:"source_errors,omitempty"`
+	// ConfigHash 参数配置指纹（sha256 前 12 位）, 每次成功运行随 screening_runs 保存,
+	// 供日后比较不同规则版本对候选池的影响。
+	ConfigHash string `json:"config_hash,omitempty"`
+	// StrategyVersion 策略版本号（daily_stock_metrics/screening_runs 的口径标识）。
+	StrategyVersion string `json:"strategy_version,omitempty"`
 
 	// LiquidityPassed 通过全市场流动性初筛的股票数（诊断字段, Go 层迁移新增;
 	// 不在 WatchlistGenData 中, ToGenData round-trip 时自然丢弃）。
@@ -171,8 +200,9 @@ func isETFCode(code string) bool {
 
 // Generator Go 原生动态池生成器。零值不可用，请用 NewGenerator。
 type Generator struct {
-	prov Provider
-	cfg  Config
+	prov  Provider
+	cfg   Config
+	runID string
 	// PersistentStatus 可选钩子：从持久层（watchlist_items）回填每条记录的
 	// 黑名单事实位与 first/last_seen 生命周期锚点, 供聚合阶段消费。
 	// nil-safe: 单测可不接 DB。由 cmd/main.go 接线。
@@ -214,6 +244,10 @@ func NewGenerator(prov Provider, cfg Config) *Generator {
 
 // Generate 生成今日动态池。manualSymbols 为人工白名单（透传标记, 优先级最高）。
 // now 注入以便测试时间边界。
+// SetRunID 注入本次筛选运行 ID（阶段 8: screening_runs.run_id; cmd cron 用时间戳生成,
+// 单测可不注入——持久化层会自行兜底生成）。
+func (g *Generator) SetRunID(id string) { g.runID = id }
+
 func (g *Generator) Generate(ctx context.Context, manualSymbols []string, now time.Time) (*Result, error) {
 	warnings := []string{}
 	raw := []Entry{}
@@ -231,9 +265,20 @@ func (g *Generator) Generate(ctx context.Context, manualSymbols []string, now ti
 	// ---- 全市场流动性初筛（Go 层新增, 供 SECTOR/FUND 两来源做前置门槛）----
 	// 弱依赖: 初筛失败仅记入 warnings 并退化为"不设门槛", 绝不阻断池子生成。
 	liquidSet, liquidityCount, err := g.liquidityScreen(ctx)
+	srcStatus := map[string]SourceStatus{"LIQUIDITY_SCREEN": StatusOK}
+	srcErrs := map[string]string{}
+	markSrc := func(name string, e error) {
+		if e != nil {
+			srcStatus[name] = StatusFailed // FAILED: 保留上次有效结果, 不伪装成 SUCCESS_EMPTY
+			srcErrs[name] = e.Error()
+		} else {
+			srcStatus[name] = StatusOK
+		}
+	}
 	if err != nil {
 		warnings = append(warnings, "LIQUIDITY_SCREEN 失败(已跳过, 资金流来源退化为不设门槛): "+err.Error())
 		log.Printf("[pool] WARN liquidity screen failed: %v", err)
+		markSrc("LIQUIDITY_SCREEN", err)
 	}
 
 	// ---- 来源 2: ETF 动量 ----
@@ -243,6 +288,10 @@ func (g *Generator) Generate(ctx context.Context, manualSymbols []string, now ti
 	} else {
 		raw = append(raw, etfEntries...)
 	}
+	markSrc("ETF_MOMENTUM", err)
+	if err == nil && len(etfEntries) == 0 {
+		srcStatus["ETF_MOMENTUM"] = StatusSuccessEmpty // 成功取到空结果(与 FAILED 严格区分)
+	}
 
 	// ---- 来源 1: 行业龙头（行业资金流 Top N -> 板块成分股 Top K, 流动性门槛叠加）----
 	sectorEntries, err := g.genSectorLeaders(ctx, liquidSet)
@@ -250,6 +299,10 @@ func (g *Generator) Generate(ctx context.Context, manualSymbols []string, now ti
 		warnings = append(warnings, "SECTOR_LEADER 失败(已跳过): "+err.Error())
 	} else {
 		raw = append(raw, sectorEntries...)
+	}
+	markSrc("SECTOR_LEADER", err)
+	if err == nil && len(sectorEntries) == 0 {
+		srcStatus["SECTOR_LEADER"] = StatusSuccessEmpty
 	}
 
 	// ---- 来源 3: 龙虎榜机构净买入（叠加流动性门槛）----
@@ -259,6 +312,11 @@ func (g *Generator) Generate(ctx context.Context, manualSymbols []string, now ti
 	} else {
 		raw = append(raw, fundEntries...)
 	}
+	markSrc("FUND_FLOW", err)
+	if err == nil && len(fundEntries) == 0 {
+		srcStatus["FUND_FLOW"] = StatusSuccessEmpty
+	}
+	markSrc("MANUAL", nil) // 人工来源无外部取数; 已保存的人工记录不因自动刷新清除(聚合层保证)
 
 	// ---- 持久层状态注入（黑名单事实位 + 既有生命周期锚点; nil-safe, 单测可不接 DB）----
 	var statusOf func(string) *AggEntry
@@ -270,6 +328,15 @@ func (g *Generator) Generate(ctx context.Context, manualSymbols []string, now ti
 				return nil
 			}
 			return &v
+		}
+	}
+	// 阶段 8: 给每条命中证据打上其来源本轮刷新状态（FAILED 不伪装成正常空结果）;
+	// MANUAL 恒为 OK（人工记录不因自动刷新而失效, 由聚合层保护逻辑保证）。
+	for i := range raw {
+		if st, ok := srcStatus[raw[i].SourceType]; ok && raw[i].HitStatus == "" {
+			raw[i].HitStatus = st
+		} else if raw[i].SourceType == sourceManual {
+			raw[i].HitStatus = StatusOK
 		}
 	}
 	pool := aggregateEntries(raw, tradeDate, now, statusOf)
@@ -296,6 +363,12 @@ func (g *Generator) Generate(ctx context.Context, manualSymbols []string, now ti
 		Pool:            pool,
 		Warnings:        warnings,
 		LiquidityPassed: liquidityCount,
+		AsOf:            tradeDate,
+		RunID:           g.runID,
+		SourceStatuses:  srcStatus,
+		SourceErrors:    srcErrs,
+		ConfigHash:      g.cfg.Hash(),
+		StrategyVersion: g.cfg.StrategyVersion(),
 	}, nil
 }
 
@@ -547,6 +620,18 @@ func (r *Result) ToGenData() (*tool.WatchlistGenData, error) {
 	return &data, nil
 }
 
+// Hash 返回当前参数配置的指纹（sha256 前 12 位十六进制）。
+// 通过 JSON 序列化实现——新增字段自动纳入指纹, 无需手工维护字段清单;
+// screening_runs.config_hash 用它比较不同规则版本对候选池的影响。
+func (c Config) Hash() string {
+	raw, err := json.Marshal(c)
+	if err != nil {
+		return "ERR"
+	}
+	sum := sha256.Sum256(raw)
+	return hex.EncodeToString(sum[:])[:12]
+}
+
 func normalizeCode(s string) string {
 	s = strings.TrimSpace(s)
 	s = strings.TrimPrefix(s, "sh")
@@ -575,20 +660,6 @@ func momentumPct(closes []float64, window int) *float64 {
 	}
 	v := (last/base - 1.0) * 100.0
 	return &v
-}
-
-// dedupEntries 按 symbol 去重, 保留先出现的来源（追加顺序即优先级: MANUAL > ETF > SECTOR > FUND）。
-func dedupEntries(entries []Entry) []Entry {
-	seen := make(map[string]bool, len(entries))
-	out := make([]Entry, 0, len(entries))
-	for _, e := range entries {
-		if e.Symbol == "" || seen[e.Symbol] {
-			continue
-		}
-		seen[e.Symbol] = true
-		out = append(out, e)
-	}
-	return out
 }
 
 func warningsPtr(w *[]string) *[]string { return w }

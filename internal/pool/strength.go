@@ -175,6 +175,8 @@ func percentileScores(vals []*float64) []float64 {
 	}
 	for k, p := range ok {
 		if n == 1 {
+			// 单样本百分位口径终裁：一个样本不构成分布, 取中位锚点 50。
+			// 若取 100, WARN×0.5 降权分与 PASS 原始分恰相等, 并列破坏"WARN 必须排后"稳定序。
 			out[p.i] = 50
 		} else {
 			out[p.i] = (ranks[k] - 1) / float64(n-1) * 100
@@ -210,11 +212,17 @@ func weightedScore(f [4]*float64, pct [4]float64) (float64, int) {
 
 // strengthWiring 是 refinePool 传给强度管线的输入包（全部为已采集数据，
 // 本文件不再发起任何 RPC —— 保证纯函数语义与单次运行口径一致）。
+// StrengthKnown 强度管线是否对本池实际执行过判定（refinePool 接线时置位）。
+// AggEntry 是纯 DTO, 运行期标志由 Generator 持有——供 ComputeTradability 的 STRENGTH
+// 软阻塞分支区分"打分后落选(应阻塞)"与"管线未执行(不得猜测为落选)"。
+func (g *Generator) StrengthKnown() bool { return g.strengthWiring != nil }
+
 type strengthWiring struct {
-	BenchR20, BenchR60 *float64              // 基准指数双窗口收益率 %
-	SectorR20          map[string]*float64   // 行业名 -> R20 %（缺失/失败 -> nil 或键不存在）
-	Trend              map[string]trendState // symbol -> 均线结构（缺键=未知）
-	Adv                map[string]*float64   // symbol -> ADV20（元; 缺键=nil）
+	BenchR20, BenchR60    *float64              // 基准指数双窗口收益率 %
+	SingleWindowShortOnly bool                  // 基准 R60 不可得而 R20 可得（阶段 5 退化口径）
+	SectorR20             map[string]*float64   // 行业名 -> R20 %（缺失/失败 -> nil 或键不存在）
+	Trend                 map[string]trendState // symbol -> 均线结构（缺键=未知）
+	Adv                   map[string]*float64   // symbol -> ADV20（元; 缺键=nil）
 }
 
 // trendState Close≥MA20 / MA20≥MA60 判定结果及可判性。
@@ -257,6 +265,13 @@ func (g *Generator) applyStrengthPathsAndScores(kept []AggEntry, w strengthWirin
 			FinBlocked: e.Financial == FinBlocked,
 		}
 		det := classifyPathA_B(o)
+		if w.SingleWindowShortOnly && det.path == StrengthB && o.R20Stock != nil && o.R60Stock == nil {
+			if ex := rsExcess(o.R20Stock, o.R20Index); ex != nil && *ex > 0 {
+				// 阶段 5 锁定语义：基准长窗不可得、短期强于大盘 -> 视为短期强势 A（退化口径）。
+				det.path = StrengthA
+				det.reason = "A(单窗口退化): 基准长窗不可得, 短期强于大盘即视为短期强势"
+			}
+		}
 		e.Strength = det.path
 		e.StrengthReason = det.reason
 		v := round2(ptrOr(det.rs20Index, 0))
@@ -296,6 +311,12 @@ func (g *Generator) applyStrengthPathsAndScores(kept []AggEntry, w strengthWirin
 		}
 		kept[i].RankScore = score
 		kept[i].Scored = true
+		// 阶段 6/7 冲突修复：四因子百分位评分覆盖粗排分会抹掉财务 WARN 降权——
+		// 降权必须在最终分上重新施加（WARN ×0.5），保证"可以保留观察但排序降权"
+		// 的契约语义不被后续打分吞没。
+		if p := finRankPenalty(kept[i].Financial); p != 1.0 {
+			kept[i].RankScore = round2(kept[i].RankScore * p)
+		}
 		switch kept[i].Strength {
 		case StrengthA:
 			nA++
@@ -364,6 +385,27 @@ func ptrOr(p *float64, def float64) float64 {
 
 // maTrendFromBars 从升序前复权收盘序列计算 Close≥MA20 / MA20≥MA60。
 // 样本不足（<61 根）-> known=false（趋势结构不可确认, A 路径自动落空, 不影响 B）。
+// maValuesFromBars 返回 (最新收盘价, MA20, MA60)。样本不足对应窗口时该项返回 nil
+// （阶段 8 daily_stock_metrics 快照字段; 缺失诚实为 NULL, 绝不伪造）。
+func maValuesFromBars(closes []float64) (last, m20, m60 *float64) {
+	ma := func(n int) *float64 {
+		if len(closes) < n {
+			return nil
+		}
+		s := 0.0
+		for _, c := range closes[len(closes)-n:] {
+			s += c
+		}
+		v := s / float64(n)
+		return &v
+	}
+	if len(closes) > 0 {
+		v := closes[len(closes)-1]
+		last = &v
+	}
+	return last, ma(20), ma(60)
+}
+
 func maTrendFromBars(closes []float64) (closeGeMa20, ma20GeMa60, known bool) {
 	if len(closes) < 61 {
 		return false, false, false

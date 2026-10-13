@@ -82,6 +82,11 @@ type AggEntry struct {
 	RS20SectorExcess *float64 `json:"rs20_sector_excess,omitempty"` // R20 - 行业指数（评分因子3; nil=行业不可确认）
 	StrengthReason   string   `json:"strength_reason,omitempty"`    // A/B/NONE 判定依据（审计）
 
+	// ---- 阶段 8: 日度指标快照补充字段（daily_stock_metrics 落库输入; refine 透传）----
+	Close *float64 `json:"close,omitempty"` // 最新有效收盘价（元）
+	MA20  *float64 `json:"ma20,omitempty"`  // 20 日均价（元; nil=样本不足）
+	MA60  *float64 `json:"ma60,omitempty"`  // 60 日均价（元; nil=样本不足）
+
 	// ---- 独立状态字段（不受主来源优先级影响）----
 	Eligibility EligibilityStatus `json:"eligibility_status"` // PASS/BLOCKED/UNKNOWN
 	Liquidity   LiquidityStatus   `json:"liquidity_status"`
@@ -138,7 +143,11 @@ const (
 
 // ComputeTradability 按固定顺序推导交易资格：黑名单 > 证券资格 > 财务 > 强度路径。
 // 注意与来源有效性无关——一只来源 ACTIVE 的股票也可能 tradability=BLOCKED。
-func (e *AggEntry) ComputeTradability() {
+// ComputeTradability 推导交易资格。strengthKnown 表示强度管线是否实际执行过判定
+// （由 Generator 调用时传入 g.StrengthKnown(); 独立 DTO 场景传 false 即"未执行"）。
+// 旧调用点保持兼容: 无参语义 = 管线状态未知, 仅当 Strength 已被显式赋为 NONE 且
+// 来源全为自动时保守阻塞（与 aggregate_test 直接调用锁定语义一致）。
+func (e *AggEntry) ComputeTradability(strengthKnown ...bool) {
 	switch {
 	case e.Blacklisted:
 		e.Tradability = TradBlocked
@@ -156,11 +165,17 @@ func (e *AggEntry) ComputeTradability() {
 	case e.PriceBelowMin:
 		e.Tradability = TradBlocked
 		e.BlockedBy = "PRICE_BELOW_MIN"
-	case e.OhlcInvalid || e.StaleQuote || e.LimitState == LimitUnknown:
+	case (e.OhlcInvalid || e.StaleQuote || e.LimitState == LimitUnknown) && e.Scored:
+		// 阶段 7 冲突修复：QUOTE_STATE 仅对参与 RS 打分的股票类条目生效；
+		// ETF/MANUAL-only/未打分条目若误带标记, 不得吞掉 FINANCIAL_DATA/LIQUIDITY_DATA 等更具体诚实结论。
 		// 数据异常/行情过期/涨跌停状态无法确认 -> 禁止生成"可执行"订单（UNKNOWN 不放行）。
 		e.Tradability = TradUnknown
 		e.BlockedBy = "QUOTE_STATE"
-	case e.Strength == StrengthNone && e.hasAutoSourceOnly():
+	case e.Strength == StrengthNone && e.hasAutoSourceOnly() && len(strengthKnown) != 0 && !strengthKnown[0]:
+		// 阶段 7 冲突修复：管线**已执行**且股票类条目两条路径均未入选 -> 软阻塞 STRENGTH；
+		// 管线未执行(如流动性闸门复算路径)时不得把"未重新判定"猜测成"打分后落选",
+		// 否则会吞掉 FINANCIAL_DATA/LIQUIDITY_DATA 等更具体的诚实结论。
+	case e.Strength == StrengthNone && e.hasAutoSourceOnly() && len(strengthKnown) == 0:
 		// RS 管线**实际执行过**（Strength 被显式赋值为 A/B/NONE）且股票类条目两条
 		// 路径均未入选 -> 高优先级截断（软阻塞, 可人工放行）。
 		// StrengthUnset（精筛关闭 / RS 失败退化 / ETF / MANUAL-only）不参与此判定,
@@ -210,6 +225,14 @@ func srcPriority(t string) int {
 
 // aggregateEntries 按统一证券身份合并重复记录：标准化代码 -> 合并 sources[] ->
 // 保留全部理由 -> 按优先级选 primary_source。name/指标取首个非空值。
+// orDefault 零值 SourceStatus（未注入状态的旧载荷, 含 Python 链路）按 OK 处理。
+func (s SourceStatus) orDefault(def SourceStatus) SourceStatus {
+	if s == "" {
+		return def
+	}
+	return s
+}
+
 // statusOf(code) 返回该股票在持久层的黑名单事实位与既有生命周期锚点（可为 nil）。
 func aggregateEntries(entries []Entry, asOf string, now time.Time, statusOf func(string) *AggEntry) []AggEntry {
 	type slot struct {
@@ -272,7 +295,7 @@ func aggregateEntries(entries []Entry, asOf string, now time.Time, statusOf func
 				Reason:     sourceReason(e),
 				SectorName: e.SectorName,
 				AsOf:       asOf,
-				Status:     StatusOK,
+				Status:     e.HitStatus.orDefault(StatusOK),
 			})
 		}
 		// 最新指标透传（指针非 nil 即覆盖, 语义与原单来源一致）
@@ -290,6 +313,19 @@ func aggregateEntries(entries []Entry, asOf string, now time.Time, statusOf func
 		}
 		if e.RankScore != 0 {
 			a.RankScore = e.RankScore
+		}
+		// 阶段 8: MA/收盘快照透传（refinePool 已写入 Entry; 指针非 nil 即覆盖）
+		if e.Close != nil {
+			v := *e.Close
+			a.Close = &v
+		}
+		if e.MA20 != nil {
+			v := *e.MA20
+			a.MA20 = &v
+		}
+		if e.MA60 != nil {
+			v := *e.MA60
+			a.MA60 = &v
 		}
 		if e.RankPos != 0 {
 			a.RankPos = e.RankPos
