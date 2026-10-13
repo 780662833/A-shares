@@ -1,0 +1,16 @@
+# A股数据网关依赖清单
+# 开发验证环境: Python 3.12（下为实测锁定版本，pip install -r 将按此精确安装）
+# 如需放宽约束，可把 == 改回 >=；最低兼容版本见行尾注释。
+# 安装: pip install -r requirements.txt
+
+fastapi==0.116.1          # 最低 >=0.110.0
+uvicorn[standard]==0.35.0 # 最低 >=0.29.0
+akshare==1.19.1           # 最低 >=1.14.0（news/公告接口维护活跃，建议跟随新版）
+baostock==0.9.4           # 最低 >=0.8.8
+pandas==3.0.6             # 最低 >=1.5.0（3.x API 已在本仓库全量回归测试通过）
+requests==2.32.4          # 最低 >=2.31.0
+czsc==1.0.1               # 最低 >=1.0.0
+numpy==2.5.4              # 最低 >=1.24.0（2.x 与 pandas 3.x 兼容）
+vectorbt==1.1.2           # 最低 >=0.26.0
+pytest==9.1.1             # 测试专用，生产部署可不装
+httpx==0.28.1             # FastAPI TestClient 依赖，测试专用
