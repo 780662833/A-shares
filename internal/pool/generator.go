@@ -54,6 +54,13 @@ type Config struct {
 	RSEnabled          bool    // 是否执行 RS 打分与排序（默认 true; 失败自动退化保持原顺序）
 	RSTopK             int     // RS 排序后仅保留前 K 名股票类条目（默认 0 = 全部保留但仍排序）
 	RSConcurrency      int     // RS/资格计算并发度（默认 6）
+
+	// ---- 阶段 4：流动性过滤与交易容量（liquidity.go）----
+	LiquidityEnabled    bool    // 总开关（默认 true）; false 时跳过 ADV20 闸门, 行为与阶段 3 版一致
+	MinADV20Stock       float64 // 普通 A 股最低 20 日均成交额（元; <=0 时用契约值 5e7）
+	MinADV20ETF         float64 // ETF 最低 20 日均成交额（元; <=0 时用契约值 2e7; 不套用股票规则）
+	PlanNotional        float64 // 计划下单金额（元; 默认 0 = 候选池阶段未知 -> capacity=UNCHECKED）
+	MaxParticipationPct float64 // 参与率上限 %（默认 1.0; 真正下单前必须按最终数量重算）
 }
 
 // DefaultConfig 返回与 Python 版对齐的默认参数。
@@ -82,6 +89,12 @@ func DefaultConfig() Config {
 		RSEnabled:          true,
 		RSTopK:             0,
 		RSConcurrency:      6,
+
+		LiquidityEnabled:    true,
+		MinADV20Stock:       ContractStockMinADV20,
+		MinADV20ETF:         ContractETFMinADV20,
+		PlanNotional:        0, // 候选池阶段不知道最终仓位 -> UNCHECKED
+		MaxParticipationPct: 1.0,
 	}
 }
 
@@ -245,6 +258,8 @@ func (g *Generator) Generate(ctx context.Context, manualSymbols []string, now ti
 	if g.cfg.QualifyEnabled {
 		pool = g.refinePool(ctx, pool, &warnings, now)
 	}
+	// 阶段 4：流动性闸门（ADV20）与交易容量标注，在精筛之后、落库之前。
+	pool = g.liquidityGatePool(ctx, pool, &warnings, now)
 
 	bySource := map[string]int{}
 	for _, e := range pool {

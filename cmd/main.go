@@ -141,6 +141,42 @@ func applyPoolEnvOverrides(c *pool.Config) {
 			log.Printf("WARN: invalid ASHARE_RS_CONCURRENCY=%q, keep %d", v, c.RSConcurrency)
 		}
 	}
+	// ---- 阶段 4：流动性过滤与交易容量（ASHARE_LIQ_*）----
+	if v := strings.TrimSpace(os.Getenv("ASHARE_LIQ_ENABLED")); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			c.LiquidityEnabled = b
+		} else {
+			log.Printf("WARN: invalid ASHARE_LIQ_ENABLED=%q, keep %v", v, c.LiquidityEnabled)
+		}
+	}
+	if v := strings.TrimSpace(os.Getenv("ASHARE_MIN_ADV20_STOCK")); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil && f >= 0 {
+			c.MinADV20Stock = f
+		} else {
+			log.Printf("WARN: invalid ASHARE_MIN_ADV20_STOCK=%q, keep %v", v, c.MinADV20Stock)
+		}
+	}
+	if v := strings.TrimSpace(os.Getenv("ASHARE_MIN_ADV20_ETF")); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil && f >= 0 {
+			c.MinADV20ETF = f
+		} else {
+			log.Printf("WARN: invalid ASHARE_MIN_ADV20_ETF=%q, keep %v", v, c.MinADV20ETF)
+		}
+	}
+	if v := strings.TrimSpace(os.Getenv("ASHARE_PLAN_NOTIONAL")); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil && f >= 0 {
+			c.PlanNotional = f
+		} else {
+			log.Printf("WARN: invalid ASHARE_PLAN_NOTIONAL=%q, keep %v", v, c.PlanNotional)
+		}
+	}
+	if v := strings.TrimSpace(os.Getenv("ASHARE_MAX_PARTICIPATION_PCT")); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil && f > 0 {
+			c.MaxParticipationPct = f
+		} else {
+			log.Printf("WARN: invalid ASHARE_MAX_PARTICIPATION_PCT=%q, keep %v", v, c.MaxParticipationPct)
+		}
+	}
 }
 
 func loadConfig() appConfig {
