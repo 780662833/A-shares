@@ -134,6 +134,7 @@ func (g *Generator) refinePoolWith(ctx context.Context, pool []AggEntry, warning
 		hardFlag bool     // 阶段3硬条件异常标记（OHLC/时点/价格）——不剔除, 只降级 tradability
 		chg      *float64 // R60 个股收益率 %（原始值, 非超额）
 		chgShort *float64 // 阶段5: R20 区间涨跌幅（短期动量）
+		rsScore  float64  // 阶段5: RS 双窗口加权总分快照（百分位精化覆盖前的粗排口径）
 		// 阶段 8: MA 快照透传（daily_stock_metrics 落库输入）
 		closePx, ma20, ma60 *float64
 	}
@@ -375,18 +376,28 @@ func (g *Generator) refinePoolWith(ctx context.Context, pool []AggEntry, warning
 		if res.chg != nil || res.chgShort != nil {
 			// 阶段 5: 双窗口加权总分。缺哪个窗口就只用另一个（单窗口退化），
 			// 权重按实际可得窗口归一化, 绝不把缺失当 0 参与加权。
+			// 基准某窗口不可得时, 个股对应窗口端点必须同步失效——否则
+			// "haveS/haveL"判定会随 lookback 透传方式漂移, 同一序列在不同
+			// 用例里得出不同口径（伪精度）。统一以 maxWin 端点存在性为准。
 			var sExcess, lExcess float64
 			var haveS, haveL bool
-			if res.chgShort != nil && benchChgShort != nil {
+			benchHasLong := benchChg != nil
+			benchHasShort := benchChgShort != nil
+			if res.chgShort != nil && benchHasShort {
 				sExcess = *res.chgShort - *benchChgShort
 				haveS = true
 			}
-			if res.chg != nil && benchChg != nil {
+			if res.chg != nil && benchHasLong {
 				lExcess = *res.chg - *benchChg
 				haveL = true
 			}
+			// 单窗口退化模式的唯一判据是"基准长窗不可得"（见 strength.go
+			// SingleWindowShortOnly 锁定语义）；基准两窗齐备而个股长窗样本
+			// 不足时, 短窗超额必须与长窗超额(记 0)按配置权重加权, 而不是
+			// 退化为纯短窗分数——两种场景的口径必须可区分。
+			longUsable := haveL || (res.chg == nil && benchHasLong)
 			switch {
-			case haveS && haveL:
+			case haveS && longUsable:
 				w := g.cfg.RSShortWeightPct / 100
 				if w < 0 {
 					w = 0
@@ -427,9 +438,19 @@ func (g *Generator) refinePoolWith(ctx context.Context, pool []AggEntry, warning
 					e.RankScore = round2(e.RankScore * p)
 				}
 			}
+			// 阶段5 口径快照：RS 双窗口加权总分（超额收益百分点）。下游强度管线
+			// 会把 RankScore 重写为四因子百分位口径（0-100）——两者量纲不同、语义
+			// 互补，必须分别保留，供审计与"非法窗口回落契约默认值"类断言精确区分：
+			// RankScore 跟随最终精化口径, RSScore 恒为本阶段粗排结论。
+			// 注意必须直接写入 kept 尾部条目: 循环变量 e 是 pool[idx] 的值拷贝,
+			// 若只记在 results[k].rsScore 上再回填, 会因下方"同 Symbol 去重取最后
+			// 得分"策略而丢失快照（重复代码场景）——e.RSScore 与 e.RankScore 同源同值,
+			// 天然与最终保留条目一致, 无需回填。
+			e.RSScore = e.RankScore
 		}
 		kept = append(kept, e)
 	}
+
 	if unknownN > 0 {
 		*warnings = append(*warnings, fmt.Sprintf("QUALIFY/RS %d 只股票数据缺失(已按未知放行, 不参与打分)", unknownN))
 	}
@@ -467,9 +488,21 @@ func (g *Generator) refinePoolWith(ctx context.Context, pool []AggEntry, warning
 			rankedN++
 			kept[i].RankPos = rankedN
 		}
-		if g.cfg.RSTopK > 0 && len(kept) > g.cfg.RSTopK {
+		if g.cfg.RSTopK > 0 && len(kept) > g.cfg.RSTopK && !g.cfg.TieredPipeline {
 			*warnings = append(*warnings, fmt.Sprintf("RS_TOPK 截断弱尾 %d 只(保留前 %d)", len(kept)-g.cfg.RSTopK, g.cfg.RSTopK))
 			kept = kept[:g.cfg.RSTopK]
+		} else if g.cfg.RSTopK > 0 && len(kept) > g.cfg.RSTopK {
+			// 分层口径(TieredPipeline=true): RSTopK 是"确认队列名额"而非删除开关——
+			// 弱尾降级保留在观察队列尾部(L4 P0 研究池), 不占 RankPos 段位。
+			for i := range kept {
+				if !kept[i].Scored {
+					continue
+				}
+				if kept[i].RankPos > g.cfg.RSTopK {
+					kept[i].Scored = false // 移出确认段位, 保留记录与分数快照(观察队列)
+				}
+			}
+			*warnings = append(*warnings, fmt.Sprintf("L2 分层保留: RS_TOPK=%d 之外的 %d 只弱尾降级进入观察队列(不删除)", g.cfg.RSTopK, len(kept)-g.cfg.RSTopK))
 		}
 	}
 
@@ -484,7 +517,7 @@ func (g *Generator) refinePoolWith(ctx context.Context, pool []AggEntry, warning
 	{
 		w := strengthWiring{BenchR20: benchChgShort, BenchR60: benchChg, SingleWindowShortOnly: benchChgShort != nil && benchChg == nil,
 			SectorR20: map[string]*float64{}, Adv: map[string]*float64{},
-			Trend: map[string]trendState{}}
+			Trend: map[string]trendState{}, RSPrescore: map[string]float64{}, ScoredSymbols: map[string]bool{}}
 		for k, idxK := range stockIdx {
 			_ = idxK
 			if trendRes[k].Known || trendRes[k].CloseGeMA20 || trendRes[k].MA20GeMA60 {

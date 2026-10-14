@@ -223,6 +223,16 @@ type strengthWiring struct {
 	SectorR20             map[string]*float64   // 行业名 -> R20 %（缺失/失败 -> nil 或键不存在）
 	Trend                 map[string]trendState // symbol -> 均线结构（缺键=未知）
 	Adv                   map[string]*float64   // symbol -> ADV20（元; 缺键=nil）
+	// RSPrescore symbol -> 阶段5 RS 双窗口加权总分快照（超额收益百分点口径）。
+	// applyStrengthPathsAndScores 重写 RankScore 为百分位口径时，RankScore 的
+	// WARN×0.5 降权必须同步镜像到该快照——否则粗排量纲字段与最终名次脱节
+	// （WARN 票在旧版 RS 口径下名次应低于同分 PASS 票）。
+	RSPrescore map[string]float64
+	// ScoredSymbols 本轮实际进入四因子打分的股票集合。RefineScores 二次精化
+	// （整池输入、含未经 refinePool 打分链路的条目）据此把"未参与打分"与
+	// "打分后落选"区分开：不在集合内的股票类条目保持 Strength=Unset，
+	// 绝不伪造 NONE 结论（诚实性契约）。
+	ScoredSymbols map[string]bool
 }
 
 // trendState Close≥MA20 / MA20≥MA60 判定结果及可判性。
@@ -238,6 +248,12 @@ type trendState struct {
 //  3. A、B 分别排序，各按 PathATopN / PathBTopN 截断，NONE 保留在后；
 //  4. 输出顺序 A 段 → B 段 → NONE/非股票段，RankPos 全局连续编号。
 //
+// 分层口径（TieredPipeline=true, L2 趋势分类降级）：R20/R60/RS 是"分类与评分"
+// 特征而不是统一淘汰条件——下跌末端潜在反转股（缠论一买观察对象）R20≤0 时
+// 仍保留在研究观察队列（Strength=NONE, 不截断、不删除），仅不能进入 A/B 确认
+// 路径；tradability 由聚合层 STRENGTH 软阻塞保证不会误标可执行。
+// 同时输出 TREND_CLASS 审计统计（强势/转强/震荡/弱势/数据不足五档）。
+//
 // kept 必须已按旧版总分粗排（上游职责），本函数会重写 RankScore 为百分位口径。
 func (g *Generator) applyStrengthPathsAndScores(kept []AggEntry, w strengthWiring, warnings *[]string) []AggEntry {
 	if !g.cfg.RSEnabled || (w.BenchR20 == nil && w.BenchR60 == nil) {
@@ -252,6 +268,12 @@ func (g *Generator) applyStrengthPathsAndScores(kept []AggEntry, w strengthWirin
 	for i := range kept {
 		e := &kept[i]
 		if !isStock(*e) {
+			continue
+		}
+		// RefineScores 二次精化以整池为输入（含流动性闸门 FAIL/未知放行等未经
+		// refinePool 打分链路的股票条目）：不在本轮打分集合内的条目保持
+		// Strength=Unset，绝不伪造"打分后落选 NONE"结论。
+		if w.ScoredSymbols != nil && !w.ScoredSymbols[e.Symbol] {
 			continue
 		}
 		ts := w.Trend[e.Symbol]
@@ -289,6 +311,9 @@ func (g *Generator) applyStrengthPathsAndScores(kept []AggEntry, w strengthWirin
 		if !isStock(kept[i]) {
 			continue
 		}
+		if w.ScoredSymbols != nil && !w.ScoredSymbols[kept[i].Symbol] {
+			continue // 未经本轮打分链路 -> 不参与百分位, 保持 Unset（不伪造结论）
+		}
 		fIdx[0] = append(fIdx[0], kept[i].RS20IndexExcess)
 		fIdx[1] = append(fIdx[1], kept[i].RetLongRaw)
 		fIdx[2] = append(fIdx[2], kept[i].RS20SectorExcess)
@@ -313,9 +338,21 @@ func (g *Generator) applyStrengthPathsAndScores(kept []AggEntry, w strengthWirin
 		kept[i].Scored = true
 		// 阶段 6/7 冲突修复：四因子百分位评分覆盖粗排分会抹掉财务 WARN 降权——
 		// 降权必须在最终分上重新施加（WARN ×0.5），保证"可以保留观察但排序降权"
-		// 的契约语义不被后续打分吞没。
+		// 的契约语义不被后续打分吞没。同一惩罚必须同步镜像到 RSScore 快照
+		// （阶段5 粗排量纲）：两口径的 WARN 名次关系必须一致，否则审计字段
+		// 与最终排序脱节（TestPipelineWarnDownrankAndProvenance 锁定）。
 		if p := finRankPenalty(kept[i].Financial); p != 1.0 {
 			kept[i].RankScore = round2(kept[i].RankScore * p)
+			if w.RSPrescore != nil {
+				if v, ok := w.RSPrescore[kept[i].Symbol]; ok {
+					kept[i].RSScore = round2(v * p)
+				}
+			}
+		} else if w.RSPrescore != nil {
+			// PASS/WARN 之外状态保持阶段5原快照（未被打断）
+			if v, ok := w.RSPrescore[kept[i].Symbol]; ok {
+				kept[i].RSScore = v
+			}
 		}
 		switch kept[i].Strength {
 		case StrengthA:
@@ -328,15 +365,32 @@ func (g *Generator) applyStrengthPathsAndScores(kept []AggEntry, w strengthWirin
 	}
 	*warnings = append(*warnings, fmt.Sprintf("STRENGTH 路径判定完成: A %d, B %d, NONE %d, 未打分 %d(评分口径 0.35·P(RS20_index)+0.25·P(R60)+0.25·P(RS20_sector)+0.15·P(ADV20), 百分位0-100)", nA, nB, nNone, nUnscored))
 
-	// ---- 3. A/B 分别排序 + 独立 TopN 截断 ----
-	trunc := func(list []AggEntry, topN int, label string) []AggEntry {
-		sort.SliceStable(list, func(a, b int) bool { return list[a].RankScore > list[b].RankScore })
-		if topN > 0 && len(list) > topN {
-			*warnings = append(*warnings, fmt.Sprintf("STRENGTH 路径%s 截断弱尾 %d 只(保留前 %d)", label, len(list)-topN, topN))
-			list = list[:topN]
+	// ---- L2 趋势分类审计（分层架构: R20/R60/RS 是分类特征, 不是统一淘汰条件）----
+	// 五档口径：强势(A 完整确认) / 转强(B 短期修复) / 震荡(R20≤0 但 R60>0 或结构未知)
+	// / 弱势(R20、R60 均为负——潜在一买观察对象, 保留研究资格) / 数据不足。
+	if g.cfg.TieredPipeline {
+		nStrong, nTurn, nRange, nWeak, nInsuf2 := 0, 0, 0, 0, 0
+		for m, i := range partIdx {
+			_ = m
+			e := &kept[i]
+			switch {
+			case e.Strength == StrengthA:
+				nStrong++
+			case e.Strength == StrengthB:
+				nTurn++
+			case e.RetShortRaw == nil && e.RetLongRaw == nil:
+				nInsuf2++
+			case ptrOr(e.RetShortRaw, 0) <= 0 && ptrOr(e.RetLongRaw, 0) <= 0:
+				nWeak++
+			default:
+				nRange++
+			}
 		}
-		return list
+		*warnings = append(*warnings, fmt.Sprintf("TREND_CLASS 分类(L2, 不淘汰): 强势 %d, 转强 %d, 震荡 %d, 弱势 %d(潜在反转观察, 保留入池), 数据不足 %d",
+			nStrong, nTurn, nRange, nWeak, nInsuf2))
 	}
+
+	// ---- 3. A/B 分别排序 + 独立 TopN 截断（分层口径下被截者降级保留, 不删除）----
 	var segA, segB, segRest []AggEntry
 	for i := range kept {
 		switch {
@@ -350,8 +404,25 @@ func (g *Generator) applyStrengthPathsAndScores(kept []AggEntry, w strengthWirin
 			segRest = append(segRest, kept[i])
 		}
 	}
-	segA = trunc(segA, g.cfg.PathATopN, "A")
-	segB = trunc(segB, g.cfg.PathBTopN, "B")
+	sort.SliceStable(segA, func(a, b int) bool { return segA[a].RankScore > segA[b].RankScore })
+	sort.SliceStable(segB, func(a, b int) bool { return segB[a].RankScore > segB[b].RankScore })
+	demote := func(list []AggEntry, topN int, label string) ([]AggEntry, []AggEntry) {
+		if topN > 0 && len(list) > topN {
+			*warnings = append(*warnings, fmt.Sprintf("STRENGTH 路径%s 截断弱尾 %d 只(保留前 %d)", label, len(list)-topN, topN))
+			return list[:topN], list[topN:]
+		}
+		return list, nil
+	}
+	var demotedA, demotedB []AggEntry
+	segA, demotedA = demote(segA, g.cfg.PathATopN, "A")
+	segB, demotedB = demote(segB, g.cfg.PathBTopN, "B")
+	if g.cfg.TieredPipeline && (len(demotedA)+len(demotedB)) > 0 {
+		// 分层口径：PathA/PathB TopN 是"确认队列名额", 不是删除开关——被截掉的
+		// 强势/转强股票降级保留在观察队列尾部（segRest, 不占 A/B 段位与连续 RankPos）。
+		// 非分层模式维持旧行为（直接丢弃）以兼容既有回归测试基线。
+		*warnings = append(*warnings, fmt.Sprintf("L2 分层保留: A/B TopN 截断的 %d 只降级进入观察队列(不删除)", len(demotedA)+len(demotedB)))
+		segRest = append(append(segRest, demotedA...), demotedB...)
+	}
 
 	// ---- 4. 重组输出: A 段 -> B 段 -> 其余段; RankPos 只对打分股票连续编号 ----
 	out := make([]AggEntry, 0, len(kept))

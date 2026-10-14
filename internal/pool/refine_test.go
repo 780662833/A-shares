@@ -194,8 +194,8 @@ func TestRefineRSSortTopKAndFuse(t *testing.T) {
 	if out[1].Symbol != "600001" || out[2].Symbol != "600002" || out[3].Symbol != "600003" {
 		t.Errorf("want RS desc [600001 600002 600003], got %+v", out)
 	}
-	if out[1].RankScore < 19.9 || out[1].RankScore > 20.1 {
-		t.Errorf("RS score want ~20, got %v", out[1].RankScore)
+	if out[1].RSScore < 19.9 || out[1].RSScore > 20.1 {
+		t.Errorf("RS score want ~20, got %v", out[1].RSScore) // RSScore: 阶段5 RS 双窗口加权快照(百分位精化不改写)
 	}
 	if out[1].RankPos != 1 || out[3].RankPos != 3 {
 		t.Errorf("rank pos wrong: %v %v", out[1].RankPos, out[3].RankPos)
@@ -368,8 +368,8 @@ func TestRefineDualWindowWeightedScore(t *testing.T) {
 		t.Fatalf("entry must survive, got %d", len(out))
 	}
 	e := out[0]
-	if e.RankScore < 3.5 || e.RankScore > 3.7 {
-		t.Fatalf("dual-window weighted score want ~3.6, got %v", e.RankScore)
+	if e.RSScore < 3.5 || e.RSScore > 3.7 {
+		t.Fatalf("dual-window weighted score want ~3.6, got %v", e.RSScore) // RSScore: 阶段5 RS 加权快照(RankScore 已被百分位口径重写)
 	}
 	if e.RetShortExcess == nil || *e.RetShortExcess < 9.9 || *e.RetShortExcess > 10.1 {
 		t.Errorf("want R20 excess ~10, got %v", e.RetShortExcess)
@@ -478,8 +478,8 @@ func TestRefineSingleWindowDegeneration(t *testing.T) {
 	if !e.Scored {
 		t.Fatalf("should score with available short window only")
 	}
-	if e.RankScore < 9.9 || e.RankScore > 10.1 {
-		t.Errorf("single-window degeneration want score=R20 excess ~10, got %v", e.RankScore)
+	if e.RSScore < 9.9 || e.RSScore > 10.1 {
+		t.Errorf("single-window degeneration want score=R20 excess ~10, got %v", e.RSScore) // RSScore: 阶段5 快照口径
 	}
 	if e.RetLongExcess != nil {
 		t.Errorf("long excess must stay nil when long window unavailable, got %v", *e.RetLongExcess)
@@ -509,8 +509,8 @@ func TestRefineInvalidWindowsFallback(t *testing.T) {
 		t.Fatalf("entry must survive, got %d", len(out))
 	}
 	e := out[0]
-	if e.RankScore < 19.9 || e.RankScore > 20.1 {
-		t.Errorf("invalid config must fall back to contract defaults (20/60), score want ~20 (0.6*30+0.4*5), got %v", e.RankScore)
+	if e.RSScore < 19.9 || e.RSScore > 20.1 {
+		t.Errorf("invalid config must fall back to contract defaults (20/60), score want ~20 (0.6*30+0.4*5), got %v", e.RSScore) // RSScore: 阶段5 RS 加权快照(RankScore 已被百分位口径重写)
 	}
 	if e.RetShortExcess == nil || *e.RetShortExcess < 29.9 || *e.RetShortExcess > 30.1 {
 		t.Errorf("want R20 excess ~30 after fallback, got %v", e.RetShortExcess)
