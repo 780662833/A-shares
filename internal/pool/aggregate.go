@@ -26,6 +26,7 @@ package pool
 import (
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -42,7 +43,8 @@ type SourceHit struct {
 	SourceType string       `json:"source_type"`
 	Reason     string       `json:"reason"`      // 本来源的入选理由（如 "近5日主力净流入Top1行业[半导体]龙头"）
 	SectorName string       `json:"sector_name"` // 本来源语境下的板块/ETF 名
-	AsOf       string       `json:"as_of"`       // 本来源数据的业务截止日期
+	AsOf       string       `json:"as_of"`       // 本来源数据的业务截止日期（Entry.AsOf/GeneratedAt; 空=上游未提供, 诚实未知——不再伪装成聚合级 asOf）
+	RunAsOf    string       `json:"run_as_of"`   // 本次候选池任务的目标时点（新鲜度审计三维: AsOf=数据截止 / RunAsOf=任务时点 / LastSeenAt=确认命中时刻）
 	Status     SourceStatus `json:"status"`      // 本来源本次刷新状态（契约枚举）
 }
 
@@ -154,33 +156,138 @@ type AggEntry struct {
 
 // Tradability 状态常量（最终交易资格, 进入审批流程的唯一闸门）。
 const (
-	TradEligible = "ELIGIBLE" // 允许进入交易审批流程
+	TradEligible = "ELIGIBLE" // 允许进入交易审批流程（前提：全部闸门**明确通过**, 见闸门状态常量表）
 	TradBlocked  = "BLOCKED"  // 禁止（黑名单优先, 其次资格/财务明确否决）
 	TradUnknown  = "UNKNOWN"  // 主数据缺失 -> 默认不放行, 需人工确认
 )
 
+// ELIGIBLE 闸门最小合法集（fail-closed 契约的白名单形式）：只有拿到**明确结论**的
+// 维度才允许放行。空字符串 ""（未运行）、非法枚举、DATA_INSUFFICIENT / UNKNOWN /
+// UNCHECKED（诚实未知）一律不在集合内——绝不以"排除已知坏值"的方式兜底放行,
+// 因为那种写法一旦将来新增状态值就会被 default 逻辑静默放过（评审信 P0-4）。
+//
+// 容量维度的特判说明：CapacityStatus 是**下单前闸门**, 候选池阶段无最终仓位时恒为
+// UNCHECKED（liquidity.go 契约："流动性通过"不等于"执行可行"）。因此本闸门把
+// UNCHECKED 视为"容量维度已定界"（诚实未校验 -> CAPACITY_UNCHECKED 软阻塞）,
+// 而 ""/非法值仍归 INVALID_STATE；OVER 在硬性否决区处理。
+var (
+	eligibleLiquidity  = map[LiquidityStatus]bool{LiqPass: true, LiqWarn: true}
+	eligibleElig       = map[EligibilityStatus]bool{EligPass: true}
+	eligibleFinancial  = map[FinancialStatus]bool{FinPass: true, FinWarn: true}
+	// knownLimitStates 涨跌停状态"已定界"集合：NORMAL / UNKNOWN / UP / DOWN 均为检查
+	// 实际运行后给出的诚实结论（UNKNOWN = SDK 无权威来源的锁定语义, refine.go 不伪造
+	// NORMAL；UP/DOWN 属当日成交约束, 下单控制由执行层承担）。""（检查根本没运行）与
+	// 非法枚举不在集合内 -> LIMIT_STATE 软阻塞（空值不得当作通过）。
+	knownLimitStates = map[string]bool{LimitNormal: true, LimitUnknown: true, "UP": true, "DOWN": true}
+	// 容量合法枚举全集（OK 放行; UNCHECKED 诚实未校验; OVER 硬阻断; ""/非法 INVALID）。
+	validCapacityStates = map[string]bool{CapacityOK: true, CapacityOver: true, CapacityUnchecked: true}
+)
+
 // ComputeTradability 按固定顺序推导交易资格：黑名单 > 证券资格 > 财务 > 强度路径。
 // 注意与来源有效性无关——一只来源 ACTIVE 的股票也可能 tradability=BLOCKED。
-// ComputeTradability 推导交易资格。strengthKnown 表示强度管线是否实际执行过判定
-// （由 Generator 调用时传入 g.StrengthKnown(); 独立 DTO 场景传 false 即"未执行"）。
-// 旧调用点保持兼容: 无参语义 = 管线状态未知, 仅当 Strength 已被显式赋为 NONE 且
-// 来源全为自动时保守阻塞（与 aggregate_test 直接调用锁定语义一致）。
+// strengthPipelineExecuted 报告强度管线是否实际执行过 A/B/NONE 判定。
+//   - 显式传参（Generator 调用点传 g.StrengthKnown()）时以参数为准；
+//   - 无参（独立 DTO / 旧调用点）时按字段推断：股票类条目只要 Strength 被显式赋值
+//     （A/B/NONE）即可证明管线实际执行过；Unset 则视为"未执行"（诚实降级, 不猜测）。
+func (e *AggEntry) strengthPipelineExecuted(strengthKnown []bool) bool {
+	if len(strengthKnown) > 0 {
+		return strengthKnown[0]
+	}
+	// 无参推断的适用范围必须与 STRENGTH 分支闸门（isStockLike）一致：ETF / MANUAL-only
+	// 条目从不参与 A/B/NONE 判定, 若其 Strength 携带陈旧值（上游透传、历史快照或测试
+	// 夹具残留）会被误判为"管线执行过且落选", 把不适用强度闸门的条目错误硬阻塞。
+	return e.stockGatesApplicable() && e.Strength != StrengthUnset
+}
+
+// isStockLike 是否为股票类条目（主来源为 SECTOR_LEADER / FUND_FLOW, 与 refinePool
+// 的股票类判定口径一致）。MANUAL / ETF 主来源不适用股票强度/资格/财务闸门。
+func (e *AggEntry) isStockLike() bool {
+	return e.PrimarySource == sourceSector || e.PrimarySource == sourceFund
+}
+
+// tradReasons 收集本条目当前全部不放行原因（黑名单 / 硬性否决在前, 诚实数据缺失在后）。
+type tradReasons struct {
+	hard []string // BLOCKED 级：明确证据的否决（黑名单/资格BLOCKED/财务BLOCKED/停牌/低价/强度落选/流动性FAIL/容量OVER）
+	soft []string // UNKNOWN 级：数据缺失/未知状态（*_DATA / QUOTE_STATE / INVALID_STATE）
+}
+
+func (r *tradReasons) addHard(veto string) { r.hard = append(r.hard, veto) }
+func (r *tradReasons) addSoft(why string)  { r.soft = append(r.soft, why) }
+
+// deriveTradability 由原因集合推导最终资格与 BlockedBy：
+//   - 任一硬性否决 -> BLOCKED, BlockedBy = 首个硬性原因（固定优先级）；
+//   - 否则任一软性原因 -> UNKNOWN, BlockedBy = 首个软性原因；
+//   - 全部检查明确通过 -> ELIGIBLE, BlockedBy = ""。
+//
+// 多因并存时的展示优先级（P0-② 定案, 2026-10-14）：
+//
+//	BLOCKED 链: BLACKLIST > ELIGIBILITY > FINANCIAL > HALTED > PRICE_BELOW_MIN
+//	            > STRENGTH > LIQUIDITY > CAPACITY
+//	UNKNOWN 链: LIQUIDITY_DATA > ELIGIBILITY_DATA > FINANCIAL_DATA > QUOTE_STATE
+//	            > INVALID_STATE
+//	STRENGTH 位于 FINANCIAL(BLOCKED) 之后、LIQUIDITY(LiqFail) 之前：
+//	"打分后落选"是软阻塞（可人工放行）, 但不得掩盖黑名单与确定性资格/财务否决。
+//
+// 关键修复：**多因全量记录**。旧实现在 FINANCIAL_DATA 处提前 return, 把同一股票的
+// STRENGTH（打分后落选）整体吞掉——financial_test 集成用例暴露了该遮蔽：财务供应商
+// 未接入时, 已打分落选的股票只剩 FINANCIAL_DATA 一个可见原因, 审计侧误以为强度结论
+// 不存在。现所有命中原因全部写入 BlockedBy（"; " 连接, 首位为主因）, 不再丢失任何
+// 一条否决依据。
+func deriveTradability(r tradReasons) (string, string) {
+	if len(r.hard) > 0 {
+		return TradBlocked, strings.Join(r.hard, "; ")
+	}
+	if len(r.soft) > 0 {
+		return TradUnknown, strings.Join(r.soft, "; ")
+	}
+	return TradEligible, ""
+}
+
+// ComputeTradability 推导交易资格（最终交易闸门, fail-closed）。
+//
+// strengthKnown 表示强度管线是否**实际执行过** A/B/NONE 判定：
+//   - 传 true（Generator 调用点传 g.StrengthKnown()）：股票类条目 Strength==NONE 是
+//     "打分后落选"的确定结论 -> 软阻塞 STRENGTH；
+//   - 传 false：管线未执行（精筛关闭 / 基准不可得 / 流动性闸门复算路径）——绝不允许
+//     把"未重新判定"猜测成"打分后落选"；
+//   - 无参（独立 DTO / 旧调用点）：按字段推断——股票类条目 Strength 已被显式赋值
+//     （A/B/NONE）即证明管线实际执行过, NONE 保守阻塞（与 aggregate_test 锁定语义
+//     一致）；Unset 视为未执行, 不触发 STRENGTH 分支。
+//
+// 修复说明（相对上一版）：
+//  1. 旧实现存在**空 case 分支**（Go 的 switch 命中空 case 后直接退出, Tradability
+//     保持零值 ""——既不是 ELIGIBLE 也不是诚实的 UNKNOWN），且两个 STRENGTH 分支的
+//     条件互相写反（传 true 反而永不命中, 传 false 反而阻塞）。现改为确定性顺序判定。
+//  2. default 放行前先做枚举合法性校验：任何空值/非法枚举（Eligibility/Liquidity/
+//     Financial/LimitState/CapacityStatus/Strength）一律 UNKNOWN + INVALID_STATE,
+//     绝不把"空数据"当作通过（contract.go 头注释契约）。
+//  3. 行情完整性（OHLC 异常 / 行情过期 / 涨跌停不可确认）不再依赖 Scored——即使
+//     未参加 RS 打分, 实际交易前仍必须验证行情与交易状态（fail-closed）。Scored
+//     只表示是否参与评分, 不决定数据是否可信。
+//  4. 入口清空 BlockedBy：股票从阻断恢复为 ELIGIBLE 后, 旧阻塞原因不得残留
+//     （评审信 TestTradabilityClearsOldBlockedBy 契约）。
+//  5. 多因并存不再短路遮蔽（见 deriveTradability 注释）。
 func (e *AggEntry) ComputeTradability(strengthKnown ...bool) {
-	switch {
-	case e.Blacklisted:
-		e.Tradability = TradBlocked
-		e.BlockedBy = "BLACKLIST"
-	case e.Eligibility == EligBlocked:
-		e.Tradability = TradBlocked
-		e.BlockedBy = "ELIGIBILITY"
-	case e.Financial == FinBlocked:
-		e.Tradability = TradBlocked
-		e.BlockedBy = "FINANCIAL"
-	case e.TradingHalted:
+	// 每次重算都是全新推导：先清空派生字段, 防止旧 BlockedBy 在恢复 ELIGIBLE 后残留。
+	e.BlockedBy = ""
+	var r tradReasons
+	pipelineRan := e.strengthPipelineExecuted(strengthKnown)
+
+	// ---- 硬性否决（BLOCKED 级, 按固定优先级收集）----
+	if e.Blacklisted {
+		r.addHard("BLACKLIST")
+	}
+	if e.Eligibility == EligBlocked {
+		r.addHard("ELIGIBILITY")
+	}
+	if e.Financial == FinBlocked {
+		r.addHard("FINANCIAL")
+	}
+	if e.TradingHalted {
 		// 停牌：研究资格(eligibility)不受影响, 仅禁止新订单; 记录保留。
-		e.Tradability = TradBlocked
-		e.BlockedBy = "HALTED"
-	case e.PriceBelowMin:
+		r.addHard("HALTED")
+	}
+	if e.PriceBelowMin {
 		// 优先级修复（生产 Bug）：最新有效价 <1 元是**明确证据**的确定性否决，必须先于
 		// QUOTE_STATE 判定——精筛恒置 LimitState=LimitUnknown（SDK 无权威涨跌停来源），
 		// 旧顺序下已打分条目永远先命中 QUOTE_STATE/UNKNOWN，把"明确不可入池"稀释成
@@ -203,49 +310,154 @@ func (e *AggEntry) ComputeTradability(strengthKnown ...bool) {
 		// 路径均未入选 -> 高优先级截断（软阻塞, 可人工放行）。
 		// StrengthUnset（精筛关闭 / RS 失败退化 / ETF / MANUAL-only）不参与此判定,
 		// 否则会把"未打分"吞成"打分后落选", 违反阈值语义诚实原则。
-		e.Tradability = TradBlocked
-		e.BlockedBy = "STRENGTH"
-	case e.Liquidity == LiqFail:
-		// 阶段 4：ADV20 明确不达标 -> 禁止新订单（研究记录保留, 不删除历史观察）。
-		e.Tradability = TradBlocked
-		e.BlockedBy = "LIQUIDITY"
-	case e.CapacityStatus == CapacityOver:
-		// 计划参与率超限 -> 需降低数量或分析执行成本后方可交易。
-		e.Tradability = TradBlocked
-		e.BlockedBy = "CAPACITY"
-	case e.Liquidity == LiqDataInsufficient:
-		// 样本不足无法计算 ADV -> 诚实 UNKNOWN（不放行也不剔除）。
-		e.Tradability = TradUnknown
-		e.BlockedBy = "LIQUIDITY_DATA"
-	case e.Eligibility == EligUnknown:
-		e.Tradability = TradUnknown
-		e.BlockedBy = "ELIGIBILITY_DATA"
-	case e.Financial == FinDataInsufficient:
-		// 阶段 6: 财务快照缺失/过期 -> UNKNOWN（不放行也不剔除, 显示缺失原因）
-		e.Tradability = TradUnknown
-		e.BlockedBy = "FINANCIAL_DATA"
-	case (e.OhlcInvalid || e.StaleQuote || e.LimitState == LimitUnknown) && e.Scored:
-		// QUOTE_STATE 重插到全部数据缺失诚实分支之后（生产 Bug 修复·优先级）：
-		// 精筛恒置 LimitState=LimitUnknown（SDK 无权威涨跌停来源），旧顺序把它放在前段
-		// 会把 FINANCIAL_DATA / ELIGIBILITY_DATA / LIQUIDITY_DATA 等更具体的诚实结论
-		// 吞成泛化的 QUOTE_STATE；同时 PriceBelowMin 的明确否决也必须先于它命中
-		// （见上方 PRICE_BELOW_MIN 注释）。QUOTE_STATE 仅对参与 RS 打分的股票类条目
-		// 生效，ETF/MANUAL-only/未打分条目不得误触。数据异常/行情过期/涨跌停状态无法
-		// 确认 -> 禁止生成"可执行"订单（UNKNOWN 不放行）。
-		e.Tradability = TradUnknown
-		e.BlockedBy = "QUOTE_STATE"
-	default:
-		e.Tradability = TradEligible
+		r.addHard("STRENGTH")
 	}
+	liqFail := e.Liquidity == LiqFail
+	if e.CapacityStatus == CapacityOver {
+		// 计划参与率超限 -> 需降低数量或分析执行成本后方可交易。
+		r.addHard("CAPACITY")
+	}
+	// ---- 诚实数据缺失（UNKNOWN 级, 仅当无任何硬性否决时才生效）----
+	//
+	// ①定案（评审信 6.1 TestManualDoesNotBypassFinancialState / P0-4）：**数据不足类
+	// 软阻塞优先于强度落选**。旧实现中 STRENGTH 位于硬链首位——财务/资格供应商未接入
+	// （DATA_INSUFFICIENT/UNKNOWN）时, 已打分落选的股票被显示为 BLOCKED(STRENGTH),
+	// 审计侧看不到"闸门根本没运行"这一真实状态, 且 BLOCKED（确定性剔除）比 UNKNOWN
+	// （待补数据）更强地误导人工处置。现规则：
+	//   - 存在 *_DATA / INVALID_STATE 类软阻塞时 -> UNKNOWN, 原因链 = 全部数据不足项
+	//     + STRENGTH（多因全量记录, 一条都不丢）；BLOCKED 集合中的 STRENGTH 只是
+	//     "尚未复核"的占位结论, 不得掩盖闸门未运行的事实；
+	//   - 闸门全部有确定结论（PASS/WARN/诚实 N/A）且无其他硬性否决时 -> STRENGTH
+	//     维持 BLOCKED（打分后确定性落选, 可人工放行）。
+	softData := tradReasons{} // 仅数据不足类（*_DATA / QUOTE_STATE / LIMIT_STATE / CAPACITY_UNCHECKED / INVALID_STATE）
+	if e.Liquidity == LiqDataInsufficient {
+		softData.addSoft("LIQUIDITY_DATA")
+	} else if !eligibleLiquidity[e.Liquidity] && !liqFail {
+		// 空值/非法枚举: 流动性闸门未运行不得当作通过（fail-closed 白名单）。
+		// LiqFail 属明确证据, 在下方统一以 LIQUIDITY 主因处理, 不进软区重复。
+		softData.addSoft("INVALID_STATE")
+	}
+	if e.Eligibility == EligUnknown {
+		softData.addSoft("ELIGIBILITY_DATA")
+	} else if !eligibleElig[e.Eligibility] {
+		softData.addSoft("INVALID_STATE")
+	}
+	if e.Financial == FinDataInsufficient && e.stockGatesApplicable() {
+		// 阶段 6: 财务快照缺失/过期 -> UNKNOWN（不放行也不剔除, 显示缺失原因）。
+		// 适用范围限定：股票 EPS/ROE 画像**不适用于** ETF / MANUAL-only 条目——
+		// 这些条目的 DATA_INSUFFICIENT 只是聚合层"未经确认"的占位值, 把它伪装成
+		// "财务数据缺失"会污染归因（评审信 P0-2：不适用 ≠ 未通过, 更 ≠ 待补数据）。
+		// 其容量维度仍由下方 CAPACITY_UNCHECKED 诚实拦截, 不存在放行缺口。
+		softData.addSoft("FINANCIAL_DATA")
+	} else if !eligibleFinancial[e.Financial] {
+		softData.addSoft("INVALID_STATE")
+	}
+	if e.OhlcInvalid || e.StaleQuote {
+		// 行情完整性异常（OHLC / 过期）-> 禁止"可执行"订单。数据有效性不依赖
+		// Scored（fail-closed）：即使未参加 RS 打分也必须验证行情。TradUnknown
+		// 本身就不进入审批流程; 若未来需要区分"可提交人工审查的候选"与"可执行
+		// 订单资格", 应另行建模执行资格, 而不是放宽本分支。
+		softData.addSoft("QUOTE_STATE")
+	}
+	if !knownLimitStates[e.LimitState] {
+		// 涨跌停状态**未定界**才拦截：""（检查根本没运行）或非法枚举 -> LIMIT_STATE
+		// （评审信 P0-4：default 放行必须要求全部必需检查有确定结论, 空值不得当作通过）。
+		// NORMAL / UNKNOWN / UP / DOWN 是"检查已运行并给出诚实结论"：UNKNOWN 为 SDK 无
+		// 权威涨跌停来源下的锁定语义（refine.go 不伪造 NORMAL）, UP/DOWN 属当日成交约束
+		// ——三者的下单控制由执行层承担（涨跌停价上不得追单、委托待状态确认后重试）,
+		// 不在研究池层面把已定界的诚实结论吞成泛化阻塞。ETF / MANUAL-only 同一口径。
+		softData.addSoft("LIMIT_STATE")
+	}
+	if !validCapacityStates[e.CapacityStatus] {
+		// ""/非法容量枚举 -> INVALID_STATE（合法 UNCHECKED 落入下方诚实分支）。
+		softData.addSoft("INVALID_STATE")
+	}
+	if e.CapacityStatus == CapacityUnchecked {
+		// 容量重算尚未执行 -> 诚实阻塞（下单前闸门未运行, 不放行）。该维度独立于
+		// 证券闸门适用性：旧实现把 UNCHECKED 拦截限定为"非股票类条目", 依赖 *_DATA
+		// 链先行拦截股票——但 *_DATA 只是数据缺失时的兜底, 当股票的资格/财务/流动性
+		// 全部 PASS（Provider 已接入）时容量维度会被静默跳过并放行, 违反"全部必需
+		// 检查明确通过"契约（评审信 P0-4）。凡未校验一律显式记录 CAPACITY_UNCHECKED。
+		softData.addSoft("CAPACITY_UNCHECKED")
+	}
+	switch e.Strength {
+	case StrengthUnset, StrengthA, StrengthB, StrengthNone:
+	default:
+		softData.addSoft("INVALID_STATE") // 非法强度枚举
+	}
+
+	hasSoftData := len(softData.soft) > 0
+	if hasSoftData {
+		// 软阻塞优先：数据不足类在前, STRENGTH 作为伴生原因附后。硬性否决（黑名单/
+		// 资格/财务 BLOCKED/停牌/低价/CAPACITY）仍保持最高优先级——deriveTradability
+		// 中 hard 非空即 BLOCKED, 本分支只是把"闸门未运行"的真实状态留在链尾供审计。
+		r.soft = append(r.soft, softData.soft...)
+		if e.Strength == StrengthNone && e.isStockLike() {
+			r.soft = append(r.soft, "STRENGTH")
+		}
+		if liqFail {
+			// 流动性 FAIL 是明确证据 -> BLOCKED, 主因固定 LIQUIDITY（评审信阶段 4
+			// 契约: FAIL 禁止新订单）。其余未运行维度（*_DATA / INVALID_STATE）作为
+			// 伴生原因保留在链尾, 一条都不丢。
+			r.hard = append([]string{"LIQUIDITY"}, r.hard...)
+		}
+	} else if liqFail {
+		// 全部必需检查都有确定结论且无其他硬性否决 -> 纯流动性剔除。
+		r.addHard("LIQUIDITY")
+	}
+	e.Tradability, e.BlockedBy = deriveTradability(r)
 }
 
-func (e *AggEntry) hasAutoSourceOnly() bool {
+// ---------------------------------------------------------------------------
+// 来源谓词（三个互相独立的维度, 取代旧的 hasAutoSourceOnly）
+// ---------------------------------------------------------------------------
+//
+// 旧实现 hasAutoSourceOnly() 的真实语义是"不含 MANUAL 即 true"——只有 ETF 来源、
+// 甚至没有任何来源证据的条目也会返回 true, 于是聚合初始化把 ETF 当成普通股票标为
+// UNKNOWN/DATA_INSUFFICIENT, 又把"MANUAL+自动来源"整体默认成 PASS/PASS（人工输入
+// 间接绕过证券资格与财务检查）。现拆分为显式谓词, 聚合初始化改按 AssetType 与
+// PrimarySource 判定"适用性", 而不是按"是否含 MANUAL"猜测结论。
+
+// HasManualSource 证据中是否包含人工白名单来源（人工记录永不被自动清理, 但不代表
+// 可以绕过黑名单 / 行情完整性 / 容量等硬性检查）。
+func (e *AggEntry) HasManualSource() bool {
 	for _, s := range e.Sources {
 		if s.SourceType == sourceManual {
-			return false
+			return true
 		}
 	}
-	return true
+	return false
+}
+
+// HasAutomaticSource 证据中是否包含任一自动来源（SECTOR_LEADER / ETF_MOMENTUM / FUND_FLOW）。
+func (e *AggEntry) HasAutomaticSource() bool {
+	for _, s := range e.Sources {
+		if s.SourceType != sourceManual {
+			return true
+		}
+	}
+	return false
+}
+
+// IsManualOnly 是否纯人工条目（无任何自动来源证据）。
+func (e *AggEntry) IsManualOnly() bool { return len(e.Sources) > 0 && !e.HasAutomaticSource() }
+
+// isETFLike ETF 身份判定：优先看权威 AssetType, 代码前缀启发式兜底（主数据 Provider
+// 接入后由其覆盖 AssetType, 本判定自动升级为权威口径）。
+func (e *AggEntry) isETFLike() bool {
+	if e.AssetType != "" {
+		return e.AssetType == "ETF"
+	}
+	return isETFCode(e.Symbol)
+}
+
+// stockGatesApplicable 股票资格 / 财务闸门是否适用于本条目：
+//   - ETF 不适用（非个股证券, 股票 EPS/ROE 画像对其无意义）;
+//   - MANUAL-only 股票不适用（人工自选未经自动画像采集, 不得伪造结论）;
+//   - 其余（含 MANUAL+自动来源并存的股票）一律适用——人工来源只能保留记录,
+//     不能把未知的证券资格变成 PASS。
+func (e *AggEntry) stockGatesApplicable() bool {
+	return !e.isETFLike() && !e.IsManualOnly()
 }
 
 // priority 返回该来源的优先级序号（未知来源排最后）。
@@ -266,6 +478,29 @@ func (s SourceStatus) orDefault(def SourceStatus) SourceStatus {
 	return s
 }
 
+// entryAsOf 命中证据的业务截止日期：使用上游 Entry 自带的 GeneratedAt
+// （前 10 字符 YYYY-MM-DD；Entry 契约与 Python make_entry 载荷均无独立 AsOf 字段，
+// GeneratedAt 即该条命中数据的生成/截止时刻），缺失时诚实返回 ""——绝不把
+// "来源日期未知"伪装成聚合运行日期（asOf）。落库层（pool_store）对空值自行兜底
+// 展示日期并保留 NULL 语义。
+func entryAsOf(e Entry) string {
+	if len(e.GeneratedAt) >= 10 {
+		return e.GeneratedAt[:10]
+	}
+	return ""
+}
+
+// entryHitVerified 本条上游命中是否属于"已明确验证的有效命中"（P1-4）。
+// 只有 OK / SUCCESS_EMPTY(确认成功取到空结果的占位行不会走到这里) 状态才是经过
+// 对应来源数据校验的结论；STALE / PARTIAL / FAILED / UNKNOWN 只是"收到了记录",
+// 不构成新鲜度证明——不得据此刷新 LastSeenAt / HitThisRun（否则接口故障期间
+// 旧证据会被伪装成今天仍然有效）。零值状态按 orDefault 契约视为 OK（兼容无此
+// 字段的旧载荷）。
+func entryHitVerified(e Entry) bool {
+	s := e.HitStatus.orDefault(StatusOK)
+	return s == StatusOK || s == StatusSuccessEmpty
+}
+
 // statusOf(code) 返回该股票在持久层的黑名单事实位与既有生命周期锚点（可为 nil）。
 func aggregateEntries(entries []Entry, asOf string, now time.Time, statusOf func(string) *AggEntry) []AggEntry {
 	type slot struct {
@@ -275,7 +510,24 @@ func aggregateEntries(entries []Entry, asOf string, now time.Time, statusOf func
 	order := []string{}
 	bySym := map[string]*slot{}
 
-	for _, e := range entries {
+	// P1-2: 先按规范化 symbol + 来源优先级 + 证据键整体排序，再进入合并循环。
+	// 修复说明（相对上一版）：Name/指标/最终评分的覆盖顺序此前完全取决于
+	// entries 的输入顺序（Provider 返回顺序变化即改变聚合结果, 不可复现）。
+	// 规范化排序后, "最后一条非 nil 值获胜"变成确定性的、与输入排列无关的规则。
+	sorted := make([]Entry, len(entries))
+	copy(sorted, entries)
+	sort.SliceStable(sorted, func(i, j int) bool {
+		si, sj := normalizeCode(sorted[i].Symbol), normalizeCode(sorted[j].Symbol)
+		if si != sj {
+			return si < sj
+		}
+		if pi, pj := srcPriority(sorted[i].SourceType), srcPriority(sorted[j].SourceType); pi != pj {
+			return pi < pj // 低优先级来源在前 -> 高优先级(权威)来源的证据/指标最后写入并生效
+		}
+		return sourceEvidenceKey(sorted[i]) < sourceEvidenceKey(sorted[j])
+	})
+
+	for _, e := range sorted {
 		sym := normalizeCode(e.Symbol)
 		if sym == "" {
 			continue
@@ -288,11 +540,20 @@ func aggregateEntries(entries []Entry, asOf string, now time.Time, statusOf func
 				Name:        e.Name,
 				AssetType:   assetTypeOf(sym),
 				GeneratedAt: e.GeneratedAt,
-				FirstSeenAt: now,
-				LastSeenAt:  now,
-				HitThisRun:  true,
+				// P1-4 修复（相对上一版）：新槽位必须显式初始化 SourceLifecycle——旧实现
+				// 留空字符串, 若持久化发生在 Transition() 之前, 会产生不属于任何合法
+				// 状态(ACTIVE/STALE/EXPIRED)的记录。
+				SourceLifecycle: "ACTIVE",
+				FirstSeenAt:     now,
+				HitThisRun:      entryHitVerified(e), // "确认有效命中"而非"收到记录"
 			}
-			// 持久层锚点：黑名单事实位优先保留；生命周期沿用既有 first/last seen（白名单永不过期语义由 Transition 保证）
+			// LastSeenAt 只在本次命中经过来源数据校验时才刷新为 now；STALE/FAILED/
+			// PARTIAL 证据只是"收到了记录", 不构成新鲜度证明, 不得伪装成今天仍有效。
+			if entryHitVerified(e) {
+				s.agg.LastSeenAt = now
+			}
+			// 持久层锚点：黑名单事实位优先保留；生命周期沿用既有 first/last seen
+			// 与 lifecycle（白名单永不过期语义由 Transition 保证）。
 			if statusOf != nil {
 				if prev := statusOf(sym); prev != nil {
 					s.agg.Blacklisted = prev.Blacklisted
@@ -301,6 +562,9 @@ func aggregateEntries(entries []Entry, asOf string, now time.Time, statusOf func
 					}
 					if !prev.LastSeenAt.IsZero() && prev.LastSeenAt.After(s.agg.LastSeenAt) {
 						s.agg.LastSeenAt = prev.LastSeenAt
+					}
+					if prev.SourceLifecycle != "" {
+						s.agg.SourceLifecycle = prev.SourceLifecycle
 					}
 				}
 			}
@@ -311,27 +575,44 @@ func aggregateEntries(entries []Entry, asOf string, now time.Time, statusOf func
 			order = append(order, sym)
 		}
 		a := &s.agg
+		// P1-4：后续同源条目若带来**已验证**的命中, 同样刷新 HitThisRun / LastSeenAt
+		// （新槽位初始化时只反映了第一条排序后的 Entry）。
+		if entryHitVerified(e) {
+			a.HitThisRun = true
+			if a.LastSeenAt.Before(now) {
+				a.LastSeenAt = now
+			}
+		}
 		if a.Name == "" && e.Name != "" {
 			a.Name = e.Name
 		}
-		// 证据追加（同来源重复命中视为上游 bug, 幂等跳过）
+		// 证据追加。P1-1 修复（相对上一版）：旧逻辑只要 SourceType 相同就整条丢弃,
+		// 同一来源的多条**合法**命中（如一只股票同时是多个行业板块的龙头、或理由不同
+		// 的多条筛选命中）会被误删——去重不等于删除有效证据。现改为按完整证据键
+		// (source|sector|reason|status|as_of) 幂等去重：只有逐字段相同的重复行才跳过。
+		newHit := SourceHit{
+			SourceType: e.SourceType,
+			Reason:     sourceReason(e),
+			SectorName: e.SectorName,
+			// P1-4 修复：AsOf 保存该来源业务数据的真实截止日期（Entry.AsOf / GeneratedAt）,
+			// 不再无条件改写为聚合级 asOf；上游确实无日期时诚实留空（不伪装成同日更新）。
+			// RunAsOf 单独记录本次候选池任务的目标时点（新鲜度审计三维之一）。
+			AsOf:    entryAsOf(e),
+			RunAsOf: asOf,
+			Status:  e.HitStatus.orDefault(StatusOK),
+		}
 		dup := false
 		for _, old := range a.Sources {
-			if old.SourceType == e.SourceType {
+			if evidenceKey(old) == evidenceKey(newHit) {
 				dup = true
 				break
 			}
 		}
 		if !dup {
-			a.Sources = append(a.Sources, SourceHit{
-				SourceType: e.SourceType,
-				Reason:     sourceReason(e),
-				SectorName: e.SectorName,
-				AsOf:       asOf,
-				Status:     e.HitStatus.orDefault(StatusOK),
-			})
+			a.Sources = append(a.Sources, newHit)
 		}
-		// 最新指标透传（指针非 nil 即覆盖, 语义与原单来源一致）
+		// 最新指标透传（指针非 nil 即覆盖）。经上方规范化排序后, 覆盖顺序与
+		// Provider 返回顺序无关; 高优先级来源的同名指标确定性生效。
 		if e.Momentum20DPct != nil {
 			v := *e.Momentum20DPct
 			a.Momentum20DPct = &v
@@ -344,9 +625,13 @@ func aggregateEntries(entries []Entry, asOf string, now time.Time, statusOf func
 			v := *e.AvgAmount20D
 			a.AvgAmount20D = &v
 		}
-		if e.RankScore != 0 {
-			a.RankScore = e.RankScore
-		}
+		// P0-5 修复（相对上一版）：聚合阶段**不得**写入最终 RankScore / RankPos。
+		// 唯一最终评分写入者是 strength.go 管线（applyStrengthPathsAndScores）;
+		// 来源阶段的分数只是诊断信息, 保存在 SourceHit 级, 若透传到条目上会：
+		//   - 用来源分覆盖最终强度分（双评分口径冲突）;
+		//   - 使最终得分取决于 entries 遍历顺序;
+		//   - 无法区分"合法的 0 分"与"未打分"。
+		// refinePool 消费的是本地 Entry 切片上的分数, 不依赖此处透传, 删除安全。
 		// 阶段 8: MA/收盘快照透传（refinePool 已写入 Entry; 指针非 nil 即覆盖）
 		if e.Close != nil {
 			v := *e.Close
@@ -360,16 +645,16 @@ func aggregateEntries(entries []Entry, asOf string, now time.Time, statusOf func
 			v := *e.MA60
 			a.MA60 = &v
 		}
-		if e.RankPos != 0 {
-			a.RankPos = e.RankPos
-		}
 	}
 
 	out := make([]AggEntry, 0, len(order))
 	for _, sym := range order {
 		a := &bySym[sym].agg
 		sort.SliceStable(a.Sources, func(i, j int) bool {
-			return srcPriority(a.Sources[i].SourceType) < srcPriority(a.Sources[j].SourceType)
+			if p := srcPriority(a.Sources[i].SourceType) - srcPriority(a.Sources[j].SourceType); p != 0 {
+				return p < 0
+			}
+			return evidenceKey(a.Sources[i]) < evidenceKey(a.Sources[j])
 		})
 		if len(a.Sources) > 0 {
 			a.PrimarySource = a.Sources[0].SourceType
@@ -377,19 +662,34 @@ func aggregateEntries(entries []Entry, asOf string, now time.Time, statusOf func
 			// sector_name 跟随主来源证据（多来源时保留最高优先级语境的板块名）
 			a.SectorName = a.Sources[0].SectorName
 		}
-		// 独立状态字段初始化（refinePool 开启时被闸门结果覆盖; 关闭时保持 UNKNOWN 语义诚实）
-		if a.hasAutoSourceOnly() {
+		// ---- 独立状态字段初始化（P0-2/P0-3 修复, 取代旧的 hasAutoSourceOnly 猜测）----
+		// 规则：状态只表达"实际验证结论", 不适用维度显式记 PASS(N/A), 未经确认一律诚实 UNKNOWN。
+		//   - ETF：股票证券资格画像不适用 -> PASS(N/A)（ETF 仍受黑名单/停牌/价格/行情完整性/容量约束,
+		//     见 ComputeTradability 硬性分支, 这些检查与来源类型无关）;
+		//   - MANUAL-only 股票：人工自选未经自动画像采集 -> UNKNOWN（精筛开启时由闸门回填实际结论;
+		//     人工保留 ≠ 自动绕过证券资格/财务检查）;
+		//   - 其余股票类（含 MANUAL+自动来源并存）：未经主数据/财务 Provider 确认 -> UNKNOWN /
+		//     DATA_INSUFFICIENT。**MANUAL 的存在不再改变股票的资格与财务状态**。
+		switch {
+		case a.isETFLike():
+			a.Eligibility = EligPass // N/A: 个股资格画像不适用于 ETF（显式标注, 见 FinNoteNotApplicable）
+			a.Financial = FinPass    // N/A: 股票 EPS/ROE 闸门不适用于 ETF
+		case a.IsManualOnly():
+			a.Eligibility = EligUnknown
+			a.Financial = FinDataInsufficient
+		default:
 			a.Eligibility = EligUnknown // 自动来源股票: 资格未经主数据 Provider 确认 -> UNKNOWN
 			a.Financial = FinDataInsufficient
-		} else {
-			// ETF / MANUAL-only: 不适用股票资格与财务闸门（ETF/人工条目按契约放行）。
-			// 证券资格应通过权威证券主数据 Provider 判定, 名称含 "ST" 仅是启发式代理;
-			// 非适用维度显式记 PASS(N/A), 避免把"不适用"误标成"未知"。
-			a.Eligibility = EligPass
-			a.Financial = FinPass
 		}
 		a.Strength = StrengthUnset // refinePool 实际打分后才覆盖为 A/B/NONE
-		a.Liquidity = LiqPass      // 能进入池子的股票均已通过全市场流动性初筛（初筛失败退化时为名义值）
+		// P0-3 修复（fail-open -> fail-closed）：聚合阶段不得默认 Liquidity=PASS。
+		// 全市场初筛（liquidityScreen）只是资金流来源的前置门槛, 其退化路径
+		// （初筛失败不设门槛）下"进入池子"不代表任何流动性验证; 逐票 ADV20 由
+		// 阶段 4 流动性闸门（liquidityGatePool）实测后覆盖本字段。闸门未运行/取数
+		// 失败时诚实保持 DATA_INSUFFICIENT（tradability=UNKNOWN/LIQUIDITY_DATA）,
+		// 绝不把"没算过"当成"已通过"。
+		a.Liquidity = LiqDataInsufficient
+		a.CapacityStatus = CapacityUnchecked // 候选池阶段无最终仓位 -> 未校验（下单前必须重算）
 		if a.Blacklisted {
 			a.Eligibility = EligBlocked
 		}
@@ -397,6 +697,16 @@ func aggregateEntries(entries []Entry, asOf string, now time.Time, statusOf func
 		out = append(out, *a)
 	}
 	return out
+}
+
+// sourceEvidenceKey 单条上游命中的证据键（幂等去重 + 规范化排序共用）。
+func sourceEvidenceKey(e Entry) string {
+	return strings.Join([]string{e.SourceType, e.SectorName, sourceReason(e), string(e.HitStatus), entryAsOf(e)}, "\x00")
+}
+
+// evidenceKey 聚合后 SourceHit 的证据键（与 sourceEvidenceKey 同构）。
+func evidenceKey(h SourceHit) string {
+	return strings.Join([]string{h.SourceType, h.SectorName, h.Reason, string(h.Status), h.AsOf}, "\x00")
 }
 
 // sourceReason 从 Entry 已有信息构造本来源的命中理由（人类可读, 落库供审计）。
@@ -448,7 +758,19 @@ const (
 )
 
 // Transition 对单条持久记录应用一次来源刷新（纯函数, 不改入参）。
-// persistedHit=本次是否命中; refreshStatus=对应来源本次刷新状态; blacklistFact=黑名单事实位。
+// persistedHit=本次是否命中; refreshStatus=对应来源本次刷新状态; autoExpireDays<=0 视为非法配置。
+//
+// 修复说明（相对上一版）：
+//  1. （第 13 条）旧实现只在 ExpireDate != nil 时才判过期——aggregateEntries 新建
+//     条目从不设置 ExpireDate, 若持久化/迁移没有补齐它, 自动来源记录将**永不过期**。
+//     现改为：不再命中且 ExpireDate 缺失时, 用 LastSeenAt + autoExpireDays 计算兼容
+//     截止时间；连 LastSeenAt 也无效则诚实标 STALE（数据不足需修复）, 绝不默认永久保留。
+//  2. （第 12 条）PARTIAL 不再与 FAILED 一刀切：persistedHit=true 表示该证券属于
+//     本次已成功、已验证的分片 -> 正常 TOUCH 续期；只有未确认(未知)的记录才保持
+//     原状并标 STALE, 不因"整批部分成功"被批量失效。FAILED/PARTIAL 均不进入过期
+//     判定（接口故障绝不清除旧证据）。
+//  3. 配置防御：autoExpireDays<=0 时不得把到期时间算成 now（当天即过期）或负数
+//     偏移, 一律降级为 STALE 待修复。
 func Transition(rec AggEntry, persistedHit bool, refreshStatus SourceStatus, autoExpireDays int, now time.Time) (AggEntry, LifeAction) {
 	out := rec
 	// 人工白名单与黑名单永不被自动逻辑改写（4.2: 白名单独立于自动过期; 黑名单终态）
@@ -456,20 +778,44 @@ func Transition(rec AggEntry, persistedHit bool, refreshStatus SourceStatus, aut
 		return out, LifeProtect
 	}
 	switch refreshStatus {
-	case StatusFailed, StatusPartial:
-		// FAILED: 保留上次有效结果并标 STALE; PARTIAL: 只更新可明确验证记录, 这里保守全保留
+	case StatusFailed:
+		// FAILED: 保留上次有效结果并标 STALE; 不进入过期判定, 也不刷新任何时间锚点。
 		out.SourceLifecycle = "STALE"
+		return out, LifeMarkStale
+	case StatusPartial:
+		// PARTIAL: 只更新能明确验证的记录, 其余保留原状（不批量失效）。
+		if persistedHit {
+			break // 属于已成功验证分片 -> 落入下方 OK 分支的续期逻辑
+		}
+		out.SourceLifecycle = "STALE" // 未知记录: 保留原数据, 禁止当作当前有效信号
 		return out, LifeMarkStale
 	case StatusOK, StatusSuccessEmpty:
 		if persistedHit {
 			out.LastSeenAt = now
+			if autoExpireDays <= 0 {
+				// 非法配置: 无法确定截止日, 诚实标 STALE, 不得伪造 ExpireDate=now。
+				out.SourceLifecycle = "STALE"
+				return out, LifeMarkStale
+			}
 			exp := now.AddDate(0, 0, autoExpireDays)
 			out.ExpireDate = &exp
 			out.SourceLifecycle = "ACTIVE"
 			return out, LifeTouch
 		}
-		// 不再命中: 仅当已超过自然日截止才过期; 节假日/短窗口内的旧记录原样保留
-		if rec.ExpireDate != nil && now.After(*rec.ExpireDate) {
+		// 不再命中: 仅当已超过自然日截止才过期; 节假日/短窗口内的旧记录原样保留。
+		// （第 13 条修复）ExpireDate 缺失时用 LastSeenAt + autoExpireDays 兜底计算,
+		// 自动来源记录不得因缺字段而永不过期。
+		exp := rec.ExpireDate
+		if exp == nil {
+			if autoExpireDays <= 0 || rec.LastSeenAt.IsZero() {
+				out.SourceLifecycle = "STALE" // 无截止日且无新鲜度锚点 -> 数据不足, 需修复
+				return out, LifeMarkStale
+			}
+			e2 := rec.LastSeenAt.AddDate(0, 0, autoExpireDays)
+			exp = &e2
+			out.ExpireDate = exp
+		}
+		if now.After(*exp) {
 			out.SourceLifecycle = "EXPIRED"
 			return out, LifeExpire
 		}
@@ -481,4 +827,14 @@ func Transition(rec AggEntry, persistedHit bool, refreshStatus SourceStatus, aut
 		out.SourceLifecycle = "STALE"
 		return out, LifeMarkStale
 	}
+	// 仅 PARTIAL && persistedHit 会到达这里（break 出 switch 后按已验证命中续期）。
+	out.LastSeenAt = now
+	if autoExpireDays <= 0 {
+		out.SourceLifecycle = "STALE"
+		return out, LifeMarkStale
+	}
+	exp := now.AddDate(0, 0, autoExpireDays)
+	out.ExpireDate = &exp
+	out.SourceLifecycle = "ACTIVE"
+	return out, LifeTouch
 }

@@ -7,12 +7,15 @@ package pool
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 )
 
 func rawEntry(symbol, source string) Entry {
-	return Entry{Symbol: symbol, SourceType: source, SectorName: source + "板块"}
+	// GeneratedAt 是上游命中证据的真实数据截止时刻（P1-3: SourceHit.AsOf 取该值前
+	// 10 字符, 缺失时诚实留空——绝不伪装成聚合运行日期）。夹具统一带上运行日。
+	return Entry{Symbol: symbol, SourceType: source, SectorName: source + "板块", GeneratedAt: "2026-10-13 15:00:00"}
 }
 
 // 4.1 合并逻辑: 同身份多来源 -> sources[] 全保留, primary_source 按优先级。
@@ -76,7 +79,9 @@ func TestManualPlusBlacklistStaysBlocked(t *testing.T) {
 		t.Errorf("manual source record must be preserved, got %s", e.PrimarySource)
 	}
 	e.ComputeTradability()
-	if e.Tradability != TradBlocked || e.BlockedBy != "BLACKLIST" {
+	// 多因全量记录（P0-② 定案）：黑名单是主因, 但聚合层诚实标记的资格 UNKNOWN
+	// （人工条目未经 Provider 确认, MANUAL 不得自动变 PASS）作为次因一并保留。
+	if e.Tradability != TradBlocked || !strings.HasPrefix(e.BlockedBy, "BLACKLIST") {
 		t.Errorf("blacklist must beat manual: trad=%s by=%s", e.Tradability, e.BlockedBy)
 	}
 }
@@ -261,10 +266,31 @@ func liteQuote(code, name string, price, avgAmtYi, capYuan float64) StockQuote {
 // ---------------------------------------------------------------------------
 
 func trad(e AggEntry, want, by string) error {
-	if e.Tradability != want || (by != "" && e.BlockedBy != by) {
+	// 多因全量记录契约（P0-② 定案）：BlockedBy 是 "; " 连接的原因链, **首位为主因**。
+	// 断言按主因前缀匹配；want="" 时要求 BlockedBy 严格为空（ELIGIBLE 不得残留原因）。
+	if e.Tradability != want {
 		return fmt.Errorf("tradability=%s blocked_by=%q want %s/%q", e.Tradability, e.BlockedBy, want, by)
 	}
+	if by == "" {
+		if e.BlockedBy != "" {
+			return fmt.Errorf("tradability=%s but blocked_by=%q must be empty", e.Tradability, e.BlockedBy)
+		}
+		return nil
+	}
+	if e.BlockedBy != by && !strings.HasPrefix(e.BlockedBy, by+"; ") {
+		return fmt.Errorf("tradability=%s blocked_by=%q want primary %q", e.Tradability, e.BlockedBy, by)
+	}
 	return nil
+}
+
+// fullyGated 把条目补齐为"全部必需闸门明确通过"的可执行形态（fail-closed ELIGIBLE
+// 白名单的最小合法集）：流动性实测 PASS、涨跌停状态已定界 NORMAL、容量实测 OK。
+// 候选池阶段这些字段默认 UNKNOWN/DATA_INSUFFICIENT/UNCHECKED——测试要验证"恢复放行"
+// 路径时必须显式给出真实结论, 而不是依赖空值兜底。
+func fullyGated(e *AggEntry) {
+	e.Liquidity = LiqPass
+	e.LimitState = LimitNormal
+	e.CapacityStatus = CapacityOK
 }
 
 func TestTradabilitySemantics(t *testing.T) {
@@ -277,7 +303,8 @@ func TestTradabilitySemantics(t *testing.T) {
 	t.Run("未判定自动股票->UNKNOWN默认不放行", func(t *testing.T) {
 		e := stock()
 		e.ComputeTradability()
-		if err := trad(e, TradUnknown, ""); err != nil {
+		// 多因全量记录契约：软性链序 LIQUIDITY_DATA > ELIGIBILITY_DATA > FINANCIAL_DATA。
+		if err := trad(e, TradUnknown, "LIQUIDITY_DATA; ELIGIBILITY_DATA; FINANCIAL_DATA"); err != nil {
 			t.Error(err)
 		}
 	})
@@ -318,6 +345,7 @@ func TestTradabilitySemantics(t *testing.T) {
 	t.Run("未打分(Unset)不得吞成STRENGTH落选", func(t *testing.T) {
 		e := stock()
 		e.Eligibility, e.Financial, e.Strength = EligPass, FinPass, StrengthUnset
+		fullyGated(&e) // 闸门白名单化后 ELIGIBLE 需流动性实测 PASS、涨跌停已定界、容量实测 OK
 		e.ComputeTradability()
 		if err := trad(e, TradEligible, ""); err != nil {
 			t.Error(err)
@@ -325,8 +353,9 @@ func TestTradabilitySemantics(t *testing.T) {
 	})
 	t.Run("ETF条目不适用股票闸门->按契约ELIGIBLE", func(t *testing.T) {
 		out := aggregateEntries([]Entry{rawEntry("510300", sourceETF)}, "2026-10-13", testNow, nil)
-		e := out[0]                                    // hasAutoSourceOnly()==false for ETF? ETF 是自动来源 -> 走 Unset 分支但 Scored=false
+		e := out[0]                                    // ETF 走 isETFLike 分支：资格/财务 N/A -> PASS(PASS(N/A))
 		e.Eligibility, e.Financial = EligPass, FinPass // refine 对 ETF 显式 PASS(N/A)
+		fullyGated(&e)                                 // 流动性/涨跌停/容量闸门与股票同一 fail-closed 口径，须实测通过
 		e.ComputeTradability()
 		if err := trad(e, TradEligible, ""); err != nil {
 			t.Error(err)
@@ -336,6 +365,7 @@ func TestTradabilitySemantics(t *testing.T) {
 		for _, p := range []StrengthPath{StrengthA, StrengthB} {
 			e := stock()
 			e.Eligibility, e.Financial, e.Strength = EligPass, FinPass, p
+			fullyGated(&e) // 评审信 P0-4：default 放行要求全部必需检查明确通过
 			e.ComputeTradability()
 			if err := trad(e, TradEligible, ""); err != nil {
 				t.Errorf("%s: %v", p, err)
@@ -372,7 +402,7 @@ func TestGenerateBlacklistOverridesManual(t *testing.T) {
 	if hit.PrimarySource != sourceManual {
 		t.Errorf("manual source record must be preserved, got %s", hit.PrimarySource)
 	}
-	if !hit.Blacklisted || hit.Tradability != TradBlocked || hit.BlockedBy != "BLACKLIST" {
+	if !hit.Blacklisted || hit.Tradability != TradBlocked || !strings.HasPrefix(hit.BlockedBy, "BLACKLIST") {
 		t.Errorf("blacklist must win over manual: %+v", *hit)
 	}
 }

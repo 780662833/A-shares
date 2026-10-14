@@ -109,33 +109,38 @@ func classifyPathA_B(o strengthOutcome) pathABResult {
 		}
 		return res
 	}
-	if !shortPositive || !rsIdxPositive {
-		res.reason = "R20≤0或RS20_index未确认为正(B需二者皆正)"
-		return res
-	}
 	// ---- 路径 A：完整趋势确认（所有条件必须"确认成立"，未知一律降级 B/NONE）----
-	aConds := []bool{
-		o.R60Stock != nil && *o.R60Stock > 0,
-		rsIdx20 != nil && *rsIdx20 > 0, // 已在上方共同准入
-		rsSec20 != nil && *rsSec20 > 0, // 行业侧未知 -> 不为真 -> 进不了 A
-		o.TrendKnown && o.CloseAboveMA20,
-		o.TrendKnown && o.MA20AboveMA60,
-	}
-	allA := true
-	for _, c := range aConds {
-		if !c {
-			allA = false
-			break
+	if shortPositive && rsIdxPositive {
+		aConds := []bool{
+			o.R60Stock != nil && *o.R60Stock > 0,
+			rsSec20 != nil && *rsSec20 > 0, // 行业侧未知 -> 不为真 -> 进不了 A
+			o.TrendKnown && o.CloseAboveMA20,
+			o.TrendKnown && o.MA20AboveMA60,
+		}
+		allA := true
+		for _, c := range aConds {
+			if !c {
+				allA = false
+				break
+			}
+		}
+		if allA {
+			res.path = StrengthA
+			res.reason = "A: R20/R60/RS20_index/RS20_sector均为正且Close≥MA20≥MA60"
+			return res
 		}
 	}
-	if allA {
-		res.path = StrengthA
-		res.reason = "A: R20/R60/RS20_index/RS20_sector均为正且Close≥MA20≥MA60"
+	// ---- 路径 B：修复候选（短期强 R20>0 ∧ RS20_index>0，或中期强 R60>0；
+	// RS20_index 硬门槛只约束 A——否则"中期强、短期回调未转正"的修复股永远
+	// 进不了低优先级观察队列，违背 6.3"趋势修复候选"契约语义。指数侧完全
+	// 不可得时（rsIdx20==nil）不猜测给 B，保持 NONE。）----
+	midStrong := o.R60Stock != nil && *o.R60Stock > 0
+	if rsIdxPositive || midStrong {
+		res.path = StrengthB
+		res.reason = "B: 短期强于大盘或中期绝对收益为正, 但趋势结构/行业强度未达A完整条件"
 		return res
 	}
-	// ---- 路径 B：修复候选（R20>0 ∧ RS20_index>0 ∧ 硬检查过；趋势结构可以未达标）----
-	res.path = StrengthB
-	res.reason = "B: 短期强于大盘但趋势结构/行业强度未达A完整条件"
+	res.reason = "NONE: R20≤0且RS20_index未确认为正且R60≤0(两窗口均无强势证据)"
 	return res
 }
 
@@ -255,7 +260,21 @@ type trendState struct {
 // 同时输出 TREND_CLASS 审计统计（强势/转强/震荡/弱势/数据不足五档）。
 //
 // kept 必须已按旧版总分粗排（上游职责），本函数会重写 RankScore 为百分位口径。
+//
+// legacy 模式（refinePoolWith 主链路使用）：RankScore/RankPos 已由阶段 5 双窗口
+// 加权超额口径写入并作为唯一最终评分（精筛测试基线锁定该口径）；legacy 下只补
+// 路径判定(A/B/NONE)、Reason 与 RS 超额证据字段，不回写分数、不重排名次——
+// 避免两套评分口径互相覆盖（P0-5 双评分冲突的定案：主链路=加权超额，百分位
+// 四因子口径仅作为独立实验管线由 strength_test.go 直接调用验证）。
+func (g *Generator) applyStrengthPathsAndScoresLegacy(kept []AggEntry, w strengthWiring, warnings *[]string) []AggEntry {
+	return g.applyStrengthPathsAndScoresMode(kept, w, warnings, true)
+}
+
 func (g *Generator) applyStrengthPathsAndScores(kept []AggEntry, w strengthWiring, warnings *[]string) []AggEntry {
+	return g.applyStrengthPathsAndScoresMode(kept, w, warnings, false)
+}
+
+func (g *Generator) applyStrengthPathsAndScoresMode(kept []AggEntry, w strengthWiring, warnings *[]string, legacy bool) []AggEntry {
 	if !g.cfg.RSEnabled || (w.BenchR20 == nil && w.BenchR60 == nil) {
 		return kept // RS 管线未实际执行 -> Strength 保持 Unset, 不伪装成 NONE
 	}
@@ -319,6 +338,26 @@ func (g *Generator) applyStrengthPathsAndScores(kept []AggEntry, w strengthWirin
 		fIdx[2] = append(fIdx[2], kept[i].RS20SectorExcess)
 		fIdx[3] = append(fIdx[3], w.Adv[kept[i].Symbol])
 		partIdx = append(partIdx, i)
+	}
+	if legacy {
+		// legacy 主链路：分数/名次已由阶段 5 加权超额口径写入并粗排完毕，
+		// 此处只统计路径分布供审计，不回写 RankScore、不重排名次、不分段重排。
+		nA, nB, nNone := 0, 0, 0
+		for i := range kept {
+			if !isStock(kept[i]) {
+				continue
+			}
+			switch kept[i].Strength {
+			case StrengthA:
+				nA++
+			case StrengthB:
+				nB++
+			default:
+				nNone++
+			}
+		}
+		*warnings = append(*warnings, fmt.Sprintf("STRENGTH 路径判定完成(legacy 加权超额评分口径): A %d, B %d, NONE %d", nA, nB, nNone))
+		return kept
 	}
 	var pcts [4][]float64
 	for fi := 0; fi < 4; fi++ {
@@ -496,6 +535,8 @@ func maTrendFromBars(closes []float64) (closeGeMa20, ma20GeMa60, known bool) {
 // RefineScores 阶段 7 二次精化：liquidityGatePool 已把 ADV20 写入条目快照
 // (AvgAmount20D, 单位元)后调用。若 refinePool 未产出强度包（精筛关闭/基准不可得），
 // 原样返回。幂等设计：重复调用只会用最新 Adv 快照重算百分位与分段排序。
+// legacy 主链路口径下 RankScore/RankPos 已由阶段 5 加权超额锁定，本函数只补写
+// ADV20 证据字段并统计路径分布，不回写分数、不重排名次（双评分口径冲突定案）。
 func (g *Generator) RefineScores(pool []AggEntry, warnings *[]string) []AggEntry {
 	if g.strengthWiring == nil {
 		return pool
@@ -505,5 +546,5 @@ func (g *Generator) RefineScores(pool []AggEntry, warnings *[]string) []AggEntry
 			g.strengthWiring.Adv[pool[i].Symbol] = pool[i].AvgAmount20D
 		}
 	}
-	return g.applyStrengthPathsAndScores(pool, *g.strengthWiring, warnings)
+	return g.applyStrengthPathsAndScoresLegacy(pool, *g.strengthWiring, warnings)
 }
