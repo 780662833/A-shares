@@ -66,8 +66,10 @@ func TestLiquidityDataInsufficientUnder20Samples(t *testing.T) {
 		t.Fatalf("R2 期望 DATA_INSUFFICIENT, got %v", out[0].Liquidity)
 	}
 	out[0].ComputeTradability()
-	if out[0].Tradability != TradUnknown || out[0].BlockedBy != "LIQUIDITY_DATA" {
-		t.Fatalf("R2 数据不足应 UNKNOWN(LIQUIDITY_DATA): %s/%s", out[0].Tradability, out[0].BlockedBy)
+	// 多因全量记录契约（P0-② 定案）：软链首位主因 LIQUIDITY_DATA, 其余维度未运行属
+	// 诚实伴生原因（LIMIT_STATE / CAPACITY_UNCHECKED）——断言改主因前缀匹配。
+	if out[0].Tradability != TradUnknown || !strings.HasPrefix(out[0].BlockedBy, "LIQUIDITY_DATA") {
+		t.Fatalf("R2 数据不足应 UNKNOWN(LIQUIDITY_DATA 主因): %s/%s", out[0].Tradability, out[0].BlockedBy)
 	}
 }
 
@@ -108,9 +110,12 @@ func TestLiqWarnNearThreshold(t *testing.T) {
 	if len(out) != 1 || out[0].Liquidity != LiqWarn {
 		t.Fatalf("期望 WARN(余量<20%%), got %+v", out)
 	}
+	// fail-closed 白名单：WARN 本身不阻塞（流动性维度放行），但涨跌停/容量闸门必须
+	// 有确定结论才能 ELIGIBLE——此处补齐"闸门全部明确通过"的形态验证 WARN 不降级。
+	fullyGated(&out[0])
 	out[0].ComputeTradability()
 	if out[0].Tradability != TradEligible {
-		t.Fatalf("WARN 不应阻塞交易资格: %s", out[0].Tradability)
+		t.Fatalf("WARN 不应阻塞交易资格: %s/%s", out[0].Tradability, out[0].BlockedBy)
 	}
 }
 
@@ -166,10 +171,12 @@ func TestCapacityGateMarksEntries(t *testing.T) {
 	}
 	e := bySym["600001.SH"]
 	e.ComputeTradability()
-	if e.Tradability != TradBlocked || e.BlockedBy != "CAPACITY" {
-		t.Fatalf("OVER 应 BLOCKED(CAPACITY): %s/%s", e.Tradability, e.BlockedBy)
+	if e.Tradability != TradBlocked || !strings.HasPrefix(e.BlockedBy, "CAPACITY") {
+		t.Fatalf("OVER 应 BLOCKED(CAPACITY 主因): %s/%s", e.Tradability, e.BlockedBy)
 	}
-	// 注意：闸门返回的 map 副本不影响原 slice；重取原条目校验 OK 路径
+	// 注意：闸门返回的 map 副本不影响原 slice；重取原条目校验 OK 路径。
+	// fail-closed 白名单：容量 OK 只说明该维度通过，ELIGIBLE 仍需全部必需闸门有确定结论。
+	fullyGated(&out[1])
 	out[1].ComputeTradability()
 	if out[1].Tradability != TradEligible {
 		t.Fatalf("OK 容量不应阻塞: %s/%s", out[1].Tradability, out[1].BlockedBy)

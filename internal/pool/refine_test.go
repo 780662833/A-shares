@@ -155,6 +155,9 @@ func TestRefineMinROEThreshold(t *testing.T) {
 func TestRefineRSSortTopKAndFuse(t *testing.T) {
 	// 阶段 5 双窗口口径下, 本用例固定单窗口退化模式（长期窗口=短期窗口）,
 	// 使总分 = R20 超额收益, 与旧断言保持同一数值基准。
+	// 注意: RSShortWeightPct 归一化发生在"两个窗口各自可得且都有基准"时;
+	// longWin==shortWin 时两窗口值相同, 但为避免权重(60%)污染纯短窗口语义,
+	// 将短窗权重置 100% —— 总分 = 1.0*R20超额 + 0*R60超额 = R20 超额。
 	f := newFake()
 	f.qualify = func(code string) *StockQualification {
 		return qual("2020-01-01", 1, 5)
@@ -177,6 +180,7 @@ func TestRefineRSSortTopKAndFuse(t *testing.T) {
 	cfg := refineCfg()
 	cfg.RSShortWindow = 20
 	cfg.RSLongWindow = 20 // 单窗口退化: 总分 = R20 超额
+	cfg.RSShortWeightPct = 100 // longWin==shortWin, 权重置满使总分=R20超额(见上方注释)
 	poolIn := []AggEntry{
 		entryOf("600003", sourceSector),
 		entryOf("600001", sourceFund),

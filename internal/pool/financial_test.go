@@ -226,6 +226,9 @@ func TestPipelineProviderNotWiredHonestUnknown(t *testing.T) {
 	f.indexBars = func(string, int) []DailyBar { return ib }
 	f.stockBars = func(string, int) []DailyBar { return sb }
 	f.barsOHLC = func(string, int) []barOHLC { return mkOHLCFromDaily(sb) }
+	// 流动性闸门需要真实成交额样本：未注入时 Liquidity=DATA_INSUFFICIENT 会作为
+	// 软链主因（LIQUIDITY_DATA）排在 FINANCIAL_DATA 之前，遮蔽本用例考察的财务维度。
+	f.stockAmounts = func(code string, lookback int) []DailyAmountRow { return amtRows(2e8, 60) }
 	g := NewGenerator(f, refineCfgWithFin()) // 不调 SetFinancialProvider
 	warns := []string{}
 	out := g.refinePoolWith(context.Background(), []AggEntry{entryOf("600001", sourceSector)}, &warns, finAsOf, 0, 0)
@@ -236,8 +239,10 @@ func TestPipelineProviderNotWiredHonestUnknown(t *testing.T) {
 	if e.Financial != FinDataInsufficient {
 		t.Fatalf("未接入应 DATA_INSUFFICIENT, got %s", e.Financial)
 	}
-	if e.Tradability != TradUnknown || e.BlockedBy != "FINANCIAL_DATA" {
-		t.Fatalf("未接入应 UNKNOWN/FINANCIAL_DATA, got %s/%s", e.Tradability, e.BlockedBy)
+	// 多因全量记录契约（P0-② 定案）：流动性实测 PASS 后软链首位主因为 FINANCIAL_DATA；
+	// 涨跌停 UNKNOWN 属"已定界的诚实结论"不再计入阻塞链。
+	if e.Tradability != TradUnknown || !strings.HasPrefix(e.BlockedBy, "FINANCIAL_DATA") {
+		t.Fatalf("未接入应 UNKNOWN(FINANCIAL_DATA 主因), got %s/%s", e.Tradability, e.BlockedBy)
 	}
 	if !strings.Contains(fmt.Sprint(warns), "provider 未接入") {
 		t.Errorf("warning 应明示未接入, got %v", warns)

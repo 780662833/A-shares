@@ -1,6 +1,6 @@
 module ashare-quant
 
-go 1.19
+go 1.22
 
 require (
 	github.com/cloudwego/eino v0.9.21

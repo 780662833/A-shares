@@ -485,7 +485,13 @@ func (g *Generator) refinePoolWith(ctx context.Context, pool []AggEntry, warning
 		*warnings = append(*warnings, fmt.Sprintf("QUALIFY 闸门基于明确证据剔除全部 %d 只股票类条目(不复活)", len(dropped)))
 	}
 
-	// ---- RS 降序排序 + TopK 截断（任一基准窗口可得即执行排序）----
+	// ---- RS 降序粗排 + TopK 截断（任一基准窗口可得即执行）----
+	// 唯一最终评分写入口径（阶段 5 锁定语义）：RankScore = 双窗口加权超额收益
+	// （RSShortWeightPct·R20超额 + (1-w)·R60超额，缺窗归一化），路径判定与分段
+	// 输出由下方 applyStrengthPathsAndScores 负责——该函数只在精筛主链路内以
+	// 显式 legacy 模式运行（legacy=true），不再回写 RankScore/RankPos；百分位
+	// 四因子口径作为独立实验管线保留（strength_test.go 直接调用验证），避免
+	// "双评分口径互相覆盖"的回归。
 	if benchChg != nil || benchChgShort != nil {
 		sort.SliceStable(kept, func(i, j int) bool { return kept[i].RankScore > kept[j].RankScore })
 		rankedN := 0
@@ -579,7 +585,7 @@ func (g *Generator) refinePoolWith(ctx context.Context, pool []AggEntry, warning
 			}
 			w.SectorR20[e.SectorName] = v
 		}
-		kept = g.applyStrengthPathsAndScores(kept, w, warnings)
+		kept = g.applyStrengthPathsAndScoresLegacy(kept, w, warnings)
 		g.strengthWiring = &w // 供 Generate() 在流动性闸门后二次精化(ADV因子)复用
 	}
 
