@@ -505,6 +505,24 @@ func (g *Generator) applyStrengthPathsAndScoresMode(kept []AggEntry, w strengthW
 			segNone = append(segNone, kept[i])
 		}
 	}
+	// trunc 按 PathATopN / PathBTopN 截断分段：段内先按 RankScore 降序稳定排序,
+	// TopN<=0 视为不截断（默认配置语义）。被裁掉的条目并入 NONE 段保留在池内
+	// （软阻塞由 ComputeTradability 的 STRENGTH 承担, 绝不物理删除记录）,
+	// 并输出审计 warning 使每次截断量可追溯。
+	trunc := func(seg []AggEntry, topN int, name string) []AggEntry {
+		sort.SliceStable(seg, func(a, b int) bool { return seg[a].RankScore > seg[b].RankScore })
+		if topN <= 0 || len(seg) <= topN {
+			return seg
+		}
+		overflow := seg[topN:]
+		seg = seg[:topN]
+		for i := range overflow {
+			overflow[i].Strength = StrengthNone
+			segNone = append(segNone, overflow[i])
+		}
+		*warnings = append(*warnings, fmt.Sprintf("STRENGTH %s 路径截断: TopN=%d, 超限 %d 只降级为 NONE 保留观察(不删除)", name, topN, len(overflow)))
+		return seg
+	}
 	segA = trunc(segA, g.cfg.PathATopN, "A")
 	segB = trunc(segB, g.cfg.PathBTopN, "B")
 	// NONE 段同样参与打分（RankPos 连续编号需要），但绝不截断——

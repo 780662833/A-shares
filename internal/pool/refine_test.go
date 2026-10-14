@@ -258,15 +258,15 @@ func TestRefineRSSortTopKAndFuse(t *testing.T) {
 	if !contains(join(warns2), "L2 分层保留") {
 		t.Errorf("want tiered-demote warning, got %v", warns2)
 	}
-	bySym := map[string]AggEntry{}
+	bySym2 := map[string]AggEntry{}
 	for _, e := range out2 {
-		bySym[e.Symbol] = e
+		bySym2[e.Symbol] = e
 	}
-	if bySym["600001"].RankPos != 1 || bySym["600002"].RankPos != 2 {
-		t.Errorf("top2 rankpos wrong: %v %v", bySym["600001"].RankPos, bySym["600002"].RankPos)
+	if bySym2["600001"].RankPos != 1 || bySym2["600002"].RankPos != 2 {
+		t.Errorf("top2 rankpos wrong: %v %v", bySym2["600001"].RankPos, bySym2["600002"].RankPos)
 	}
-	if bySym["600003"].RankPos != 0 || !bySym["600003"].Scored {
-		t.Errorf("weak tail must be demoted-but-kept (RankPos=0, Scored=true): %+v", bySym["600003"])
+	if bySym2["600003"].RankPos != 0 || !bySym2["600003"].Scored {
+		t.Errorf("weak tail must be demoted-but-kept (RankPos=0, Scored=true): %+v", bySym2["600003"])
 	}
 	// 非分层模式（旧物理截断语义）仍须裁掉弱尾
 	cfgNoTier := cfg
