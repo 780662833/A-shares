@@ -199,6 +199,51 @@ func applyPoolEnvOverrides(c *pool.Config) {
 			log.Printf("WARN: invalid ASHARE_RS_SHORT_WEIGHT=%q, keep %v", v, c.RSShortWeightPct)
 		}
 	}
+	// ---- 候选池来源规模上限（遗留问题修复：默认全量不截断，显式设置才恢复旧 Top-N 口径）----
+	// 注意: Ovr<=0 表示"沿用生效默认(全量)", 因此这里用负数哨兵区分"未设置"与"显式设 0"。
+	if v := strings.TrimSpace(os.Getenv("ASHARE_SECTOR_TOP_N")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			c.SectorTopNOvr = n
+		} else {
+			log.Printf("WARN: invalid ASHARE_SECTOR_TOP_N=%q, keep full(不截断)", v)
+		}
+	}
+	if v := strings.TrimSpace(os.Getenv("ASHARE_SECTOR_LEADERS_K")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			c.SectorLeadersKOvr = n
+		} else {
+			log.Printf("WARN: invalid ASHARE_SECTOR_LEADERS_K=%q, keep full(不截断)", v)
+		}
+	}
+	if v := strings.TrimSpace(os.Getenv("ASHARE_ETF_TOP_M")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			c.ETFTopMOvr = n
+		} else {
+			log.Printf("WARN: invalid ASHARE_ETF_TOP_M=%q, keep full(不截断)", v)
+		}
+	}
+	// 显式把三个覆盖键全部设为 0 => 视为调用方主动要求"按字段原值执行"，
+	// 关闭 DefaultConfig 的全量兜底（用于精确复现历史 3/3/8 之外口径的调试场景）。
+	if c.IsFullSourceDefault() &&
+		c.SectorTopNOvr == 0 && c.SectorLeadersKOvr == 0 && c.ETFTopMOvr == 0 &&
+		(os.Getenv("ASHARE_SECTOR_TOP_N") == "0" || os.Getenv("ASHARE_SECTOR_LEADERS_K") == "0" || os.Getenv("ASHARE_ETF_TOP_M") == "0") {
+		c.DisableFullSourceDefault()
+	}
+	// ---- L3/L4 缠论结构分层（chan.go, 复用 python czsc; ASHARE_CHAN_*）----
+	if v := strings.TrimSpace(os.Getenv("ASHARE_CHAN_ENABLED")); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			c.ChanEnabled = b
+		} else {
+			log.Printf("WARN: invalid ASHARE_CHAN_ENABLED=%q, keep %v", v, c.ChanEnabled)
+		}
+	}
+	if v := strings.TrimSpace(os.Getenv("ASHARE_CHAN_CACHE_ONLY")); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			c.ChanCacheOnly = b
+		} else {
+			log.Printf("WARN: invalid ASHARE_CHAN_CACHE_ONLY=%q, keep %v", v, c.ChanCacheOnly)
+		}
+	}
 }
 
 func loadConfig() appConfig {
@@ -672,6 +717,16 @@ func (a *app) generatePoolNative(now time.Time) (*tool.WatchlistGenData, error) 
 	defer cancel()
 
 	gen := pool.NewGenerator(pool.NewSDKProvider(15*time.Second), a.cfg.PoolCfg)
+	// L3/L4 缠论分层: 复用 Python 网关 czsc 引擎（/api/czsc/screen_pool）。
+	// 构造失败/未启用时不注入 -> ApplyChanLayer 整池诚实 DATA_INSUFFICIENT, 不删条目。
+	if a.cfg.PoolCfg.ChanEnabled {
+		cli, err := pool.NewHTTPChanClient(pool.HTTPChanConfig{GatewayBaseURL: a.cfg.GatewayURL})
+		if err != nil {
+			log.Printf("[watchlist] WARN chan client unavailable (%v): 缠论分层将标记 DATA_INSUFFICIENT", err)
+		} else {
+			gen.SetChanClient(cli)
+		}
+	}
 	// 阶段 8: run_id 由 cron 注入（时间戳口径, 幂等键——同一次运行重复落库不产生重复行）。
 	gen.SetRunID(now.UTC().Format("20060102T150405"))
 	// 阶段 2: 把持久层事实位（BLACKLIST / first_seen / last_seen / expire）回填进

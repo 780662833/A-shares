@@ -73,6 +73,10 @@ type AggEntry struct {
 	RankPos   int          `json:"rank_pos,omitempty"`
 	Strength  StrengthPath `json:"strength_path,omitempty"`
 
+	// RSScore: 阶段5 RS 双窗口加权总分快照（超额收益百分点口径）。RankScore 会被
+	// 强度管线重写为四因子百分位口径(0-100), 本字段恒保留粗排原始结论供审计区分。
+	RSScore float64 `json:"rs_score,omitempty"`
+
 	// ---- 阶段 5: 双窗口相对强度明细（R20/R60 超额收益, 单位 %）----
 	RetShortExcess *float64 `json:"ret_short_excess,omitempty"` // R20 - 基准同期
 	RetLongExcess  *float64 `json:"ret_long_excess,omitempty"`  // R60 - 基准同期
@@ -121,6 +125,20 @@ type AggEntry struct {
 	// "流动性通过"不等于"执行可行", 下单前必须按最终计划数量重算。
 	CapacityStatus string `json:"capacity_status,omitempty"`
 	ListingDays    int    `json:"listing_days,omitempty"` // 上市自然日数（诊断用; MinListedDays=120 近似 120 交易日口径）
+
+	// ---- L3/L4 缠论结构识别与买点分层（复用 python czsc, 见 chan.go）----
+	// CandidateTier: P0~P4 分层号; ChanStatus: 细分业务状态枚举;
+	// BuyPointConfirmedAt: 结构确认日期(信号 dt, 不是最新K线日);
+	// StopLoss/EffectiveStop: czsc 止损契约回填（回抽低点×0.99 / max(·,中枢ZG)）。
+	// 未接入缠论层时全部为零值——落库诚实为 NULL, 绝不伪造。
+	ChanStatus          ChanStatus `json:"chan_status,omitempty"`
+	CandidateTier       string     `json:"candidate_tier,omitempty"`
+	ChanSummary         string     `json:"chan_summary,omitempty"`
+	ChanReason          string     `json:"chan_reason,omitempty"`
+	BuyPointConfirmedAt string     `json:"buy_point_confirmed_at,omitempty"`
+	BuyPointReason      string     `json:"buy_point_reason,omitempty"`
+	StopLoss            float64    `json:"stop_loss,omitempty"`
+	EffectiveStop       float64    `json:"effective_stop,omitempty"`
 
 	// Scored 标记该条目是否实际参与 RS 打分（refinePool 设置）。未打分的股票类
 	// 条目 Strength 保持 Unset、RankPos=0 —— 防止"未打分"被误判为"打分后落选"。
@@ -274,10 +292,22 @@ func (e *AggEntry) ComputeTradability(strengthKnown ...bool) {
 		// QUOTE_STATE 判定——精筛恒置 LimitState=LimitUnknown（SDK 无权威涨跌停来源），
 		// 旧顺序下已打分条目永远先命中 QUOTE_STATE/UNKNOWN，把"明确不可入池"稀释成
 		// "待人工确认"。无论是否参与 RS 打分，低价格式硬条件一律 BLOCKED。
-		r.addHard("PRICE_BELOW_MIN")
-	}
-	if pipelineRan && e.Strength == StrengthNone && e.isStockLike() {
-		// 强度管线**已执行**、股票类条目两条路径均未入选 -> 软阻塞 STRENGTH（可人工放行）。
+		e.Tradability = TradBlocked
+		e.BlockedBy = "PRICE_BELOW_MIN"
+	case e.ChanStatus.BlocksTradability():
+		// L4 缠论分层：P4 结构失效（czsc 卖点确认/买点被破坏）-> 禁止新订单。
+		// 与 STRENGTH 软阻塞同级（可人工复核放行）；P0~P3 不影响此判定——
+		// "没有买点"只是观察状态, 不是否决证据。未接入缠论层时 ChanStatus
+		// 为空值, BlocksTradability()=false, 行为与旧版完全一致。
+		e.Tradability = TradBlocked
+		e.BlockedBy = "CHAN_STRUCTURE"
+	case e.Strength == StrengthNone && e.hasAutoSourceOnly() && len(strengthKnown) != 0 && !strengthKnown[0]:
+		// 阶段 7 冲突修复：管线**已执行**且股票类条目两条路径均未入选 -> 软阻塞 STRENGTH；
+		// 管线未执行(如流动性闸门复算路径)时不得把"未重新判定"猜测成"打分后落选",
+		// 否则会吞掉 FINANCIAL_DATA/LIQUIDITY_DATA 等更具体的诚实结论。
+	case e.Strength == StrengthNone && e.hasAutoSourceOnly() && len(strengthKnown) == 0:
+		// RS 管线**实际执行过**（Strength 被显式赋值为 A/B/NONE）且股票类条目两条
+		// 路径均未入选 -> 高优先级截断（软阻塞, 可人工放行）。
 		// StrengthUnset（精筛关闭 / RS 失败退化 / ETF / MANUAL-only）不参与此判定,
 		// 否则会把"未打分"吞成"打分后落选", 违反阈值语义诚实原则。
 		r.addHard("STRENGTH")

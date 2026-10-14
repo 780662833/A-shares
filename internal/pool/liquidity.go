@@ -158,6 +158,10 @@ func (g *Generator) liquidityGatePool(ctx context.Context, pool []AggEntry, warn
 	}
 	if failN > 0 {
 		*warnings = append(*warnings, fmt.Sprintf("LIQ 流动性闸门剔除 %d 只(ADV20不足), 数据不足 %d 只(保留标DATA_INSUFFICIENT)", failN, insN))
+	} else if insN > 0 {
+		// 可审计性：即使 0 剔除也必须输出 DATA_INSUFFICIENT 计数——否则"闸门执行过
+		// 但全部放行"与"闸门未执行"在日志里不可区分（L4 分层统计契约）。
+		*warnings = append(*warnings, fmt.Sprintf("LIQ 流动性闸门完成: 剔除 0 只(ADV20均达标或未知放行), 数据不足 %d 只(保留标DATA_INSUFFICIENT)", insN))
 	}
 	if len(kept) == 0 && failN > 0 {
 		*warnings = append(*warnings, fmt.Sprintf("LIQ 流动性闸门剔除了全部 %d 条(疑似数据事故, 已整体退化为不设闸门)", failN))
