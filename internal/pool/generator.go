@@ -412,7 +412,7 @@ func (g *Generator) Generate(ctx context.Context, manualSymbols []string, now ti
 	}
 
 	// ---- 来源 1: 行业龙头（行业资金流 Top N -> 板块成分股 Top K, 流动性门槛叠加）----
-	sectorEntries, err := g.genSectorLeaders(ctx, liquidSet, liquidIdx)
+	sectorEntries, err := g.genSectorLeaders(ctx, screenSet, liquidIdx)
 	if err != nil {
 		warnings = append(warnings, "SECTOR_LEADER 失败(已跳过): "+err.Error())
 	} else {
@@ -424,7 +424,7 @@ func (g *Generator) Generate(ctx context.Context, manualSymbols []string, now ti
 	}
 
 	// ---- 来源 3: 龙虎榜机构净买入（叠加流动性门槛）----
-	fundEntries, err := g.genDragonTiger(ctx, now, liquidSet, liquidIdx)
+	fundEntries, err := g.genDragonTiger(ctx, now, screenSet, liquidIdx)
 	if err != nil {
 		warnings = append(warnings, "FUND_FLOW 失败(已跳过): "+err.Error())
 	} else {
@@ -610,8 +610,8 @@ func (g *Generator) genSectorLeaders(ctx context.Context, liquidSet map[string]b
 			}
 			return filtered[i].Code < filtered[j].Code
 		})
-		if len(filtered) > g.cfg.SectorLeadersK {
-			filtered = filtered[:g.cfg.SectorLeadersK]
+		if leadersK > 0 && len(filtered) > leadersK {
+			filtered = filtered[:leadersK]
 		}
 		for _, c := range filtered {
 			out = append(out, g.entry(c.Code, c.Name, sourceSector, sec.Name))

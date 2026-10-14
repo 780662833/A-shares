@@ -298,24 +298,22 @@ func (e *AggEntry) ComputeTradability(strengthKnown ...bool) {
 		// QUOTE_STATE 判定——精筛恒置 LimitState=LimitUnknown（SDK 无权威涨跌停来源），
 		// 旧顺序下已打分条目永远先命中 QUOTE_STATE/UNKNOWN，把"明确不可入池"稀释成
 		// "待人工确认"。无论是否参与 RS 打分，低价格式硬条件一律 BLOCKED。
-		e.Tradability = TradBlocked
-		e.BlockedBy = "PRICE_BELOW_MIN"
-	case e.ChanStatus.BlocksTradability():
+		r.addHard("PRICE_BELOW_MIN")
+	}
+	if e.ChanStatus.BlocksTradability() {
 		// L4 缠论分层：P4 结构失效（czsc 卖点确认/买点被破坏）-> 禁止新订单。
 		// 与 STRENGTH 软阻塞同级（可人工复核放行）；P0~P3 不影响此判定——
 		// "没有买点"只是观察状态, 不是否决证据。未接入缠论层时 ChanStatus
 		// 为空值, BlocksTradability()=false, 行为与旧版完全一致。
-		e.Tradability = TradBlocked
-		e.BlockedBy = "CHAN_STRUCTURE"
-	case e.Strength == StrengthNone && e.hasAutoSourceOnly() && len(strengthKnown) != 0 && !strengthKnown[0]:
-		// 阶段 7 冲突修复：管线**已执行**且股票类条目两条路径均未入选 -> 软阻塞 STRENGTH；
-		// 管线未执行(如流动性闸门复算路径)时不得把"未重新判定"猜测成"打分后落选",
-		// 否则会吞掉 FINANCIAL_DATA/LIQUIDITY_DATA 等更具体的诚实结论。
-	case e.Strength == StrengthNone && e.hasAutoSourceOnly() && len(strengthKnown) == 0:
-		// RS 管线**实际执行过**（Strength 被显式赋值为 A/B/NONE）且股票类条目两条
-		// 路径均未入选 -> 高优先级截断（软阻塞, 可人工放行）。
-		// StrengthUnset（精筛关闭 / RS 失败退化 / ETF / MANUAL-only）不参与此判定,
-		// 否则会把"未打分"吞成"打分后落选", 违反阈值语义诚实原则。
+		r.addHard("CHAN_STRUCTURE")
+	}
+	// 阶段 7 冲突修复：仅当强度管线**实际执行过**（pipelineRan）时, NONE 才是
+	// "打分后落选"的确定结论, 记为硬性原因 STRENGTH（软阻塞级, 可人工放行）；
+	// 管线未执行（精筛关闭 / RS 失败退化 / 流动性闸门复算路径）时不得把
+	// "未重新判定"猜测成"打分后落选", 否则会吞掉 FINANCIAL_DATA/LIQUIDITY_DATA
+	// 等更具体的诚实结论。StrengthUnset（ETF / MANUAL-only 同样不适用此闸门）
+	// 不参与判定, 符合阈值语义诚实原则。
+	if pipelineRan && e.stockGatesApplicable() && e.Strength == StrengthNone {
 		r.addHard("STRENGTH")
 	}
 	liqFail := e.Liquidity == LiqFail
@@ -454,7 +452,7 @@ func (e *AggEntry) isETFLike() bool {
 	if e.AssetType != "" {
 		return e.AssetType == "ETF"
 	}
-	return isETFCode(e.Symbol)
+	return IsETFCode(e.Symbol)
 }
 
 // stockGatesApplicable 股票资格 / 财务闸门是否适用于本条目：
