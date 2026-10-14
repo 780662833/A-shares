@@ -47,6 +47,26 @@ type Config struct {
 	ExcludeST            bool    // 剔除 ST/*ST（默认 true）
 	LiquidityTopN        int     // 通过初筛的股票按成交额保留前 N 只做后续叠加（默认 400, 控制规模）
 
+	// ---- 候选池来源规模上限（<=0 一律视为"不截断", 全量进入后续精筛）----
+	// 历史默认 SectorTopN=3 / SectorLeadersK=3 / ETFTopM=8 使股票类候选恒为
+	// 3×3≈9 只、ETF 恒为 8 只——这是"池子只有 7+8 条"的直接原因。灰度期改为
+	// 默认不截断（对齐"实际数据可筛出两千多条"的全量口径）；如需恢复旧行为,
+	// 用 ASHARE_SECTOR_TOP_N / ASHARE_SECTOR_LEADERS_K / ASHARE_ETF_TOP_M 显式设置。
+	SectorTopNOvr     int  // 来源1 覆盖值: >0 时替代 SectorTopN（默认 0 = 不截断板块数）
+	SectorLeadersKOvr int  // 来源1 覆盖值: >0 时替代 SectorLeadersK（默认 0 = 板块成分股全量）
+	ETFTopMOvr        int  // 来源2 覆盖值: >0 时替代 ETFTopM（默认 0 = 动量打分全量保留）
+	fullSourceDefault bool // DefaultConfig 置 true: 未显式设覆盖值时按"全量不截断"运行
+
+	// ---- 分层口径开关（六层架构改造, 见 docs/ARCH_POOL_LAYERS.md）----
+	// TieredPipeline=true（新默认）: 来源 Top-N/K/M 截断恢复为"来源内发现规则"原值
+	//   （3/3/8, 对齐历史基线），池子规模由多来源合并去重决定；L2 趋势/RS 降级为
+	//   分类与评分（不再作为统一淘汰条件——NONE 路径股票保留在研究观察队列并输出
+	//   TREND_CLASS 审计统计）；L1 流动性初筛不再前置叠加到 SECTOR/FUND 来源，
+	//   ADV20 只在 L4 流动性闸门独立评估（PASS/WARN/FAIL/DATA_INSUFFICIENT）。
+	// TieredPipeline=false: 完整回退旧行为（含 fullSourceDefault 全量兜底、
+	//   RSTopK/PathATopN/PathBTopN 截断、流动性初筛前置叠加），供灰度对比与回滚。
+	TieredPipeline bool
+
 	// ---- 精筛管线：证券资格 / 财务状态 / 相对强度排序（Layer 0.75, Go 层新增）----
 	QualifyEnabled     bool    // 总开关（默认 true）; false 时行为与迁移版完全一致
 	MinListedDays      int     // 证券资格: 上市满 N 自然日方可入池（默认 120; 次新波动大且无足够 RS 样本）
@@ -69,6 +89,12 @@ type Config struct {
 	MinADV20ETF         float64 // ETF 最低 20 日均成交额（元; <=0 时用契约值 2e7; 不套用股票规则）
 	PlanNotional        float64 // 计划下单金额（元; 默认 0 = 候选池阶段未知 -> capacity=UNCHECKED）
 	MaxParticipationPct float64 // 参与率上限 %（默认 1.0; 真正下单前必须按最终数量重算）
+
+	// ---- L3/L4 缠论结构分层（chan.go, 复用 Python 网关 czsc 引擎）----
+	// Go 端不实现任何笔/线段/中枢算法, 只做 HTTP 调用 + P0~P4 状态映射 + 审计统计。
+	ChanEnabled    bool   // 总开关（默认 true）; false 时整池不打缠论状态、不影响旧行为
+	ChanCacheOnly  bool   // true: 只读每日 refresh 落盘的 czsc 缓存（零联网毫秒级; 空批自动回源补一次）
+	ChanGatewayURL string // 网关基址（cmd 层注入; ChanEnabled 且未接客户端时整池 DATA_INSUFFICIENT 告警）
 }
 
 // DefaultConfig 返回与 Python 版对齐的默认参数。
@@ -88,6 +114,15 @@ func DefaultConfig() Config {
 		FundFlowMinMarketCap: 5e9,                   // 50 亿（契约 FundFlowMinMarketCap, FUND 来源叠加）
 		ExcludeST:            true,
 		LiquidityTopN:        400,
+
+		// 分层口径（六层架构改造）: 默认启用。来源截断恢复历史基线 3/3/8
+		// （它们是"来源内发现规则", 池子规模由合并去重决定）；fullSourceDefault
+		// 全量兜底仅在 TieredPipeline=false 的回退模式下生效。
+		TieredPipeline: true,
+
+		// 遗留问题修复(2026-10-14): 旧默认 3/3/8 使池子恒为 ~9 只股票 + 8 只 ETF。
+		// 灰度期改为全量口径（不截断）；如需恢复旧行为用上述 ASHARE_* 覆盖键显式设置。
+		fullSourceDefault: true,
 
 		QualifyEnabled:     true,
 		MinListedDays:      120,
@@ -109,6 +144,11 @@ func DefaultConfig() Config {
 		MinADV20ETF:         ContractETFMinADV20,
 		PlanNotional:        0, // 候选池阶段不知道最终仓位 -> UNCHECKED
 		MaxParticipationPct: 1.0,
+
+		// L3/L4 缠论分层默认开启（复用 python czsc; 网关不可达时诚实退化 DATA_INSUFFICIENT,
+		// 不删条目）。生产建议 cache_only=true 走每日 refresh 缓存, 由 ASHARE_CHAN_* 键覆盖。
+		ChanEnabled:   true,
+		ChanCacheOnly: true,
 	}
 }
 
@@ -214,10 +254,62 @@ type Generator struct {
 	// strengthWiring 阶段 7: refinePool 产出的强度管线输入包（趋势/基准/行业因子）。
 	// liquidityGatePool 计算 ADV20 后由 Generate 回填 Adv 并调用 RefineScores 二次精化。
 	strengthWiring *strengthWiring
+	// chanCli L3/L4 缠论分层客户端（chan.go; 复用 python czsc 网关）。nil 时
+	// ApplyChanLayer 整池诚实标记 DATA_INSUFFICIENT。由 SetChanClient 注入。
+	chanCli ChanLayerClient
 }
 
 // SetFinancialProvider 注入阶段 6 财务数据供应商（外部财报服务 / 测试 fake）。
 func (g *Generator) SetFinancialProvider(p FinancialProvider) { g.finProv = p }
+
+// IsFullSourceDefault 报告当前配置是否处于"来源全量不截断"的默认口径
+// （供 cmd 层环境变量覆盖逻辑判断是否需要关闭兜底）。
+func (c Config) IsFullSourceDefault() bool { return c.fullSourceDefault }
+
+// DisableFullSourceDefault 关闭 DefaultConfig 的"全量不截断"兜底，恢复按
+// SectorTopN/SectorLeadersK/ETFTopM 字段原值截断（返回修改后的副本, Config 值语义）。
+func (c *Config) DisableFullSourceDefault() { c.fullSourceDefault = false }
+
+// effectiveSourceLimits 解析来源规模上限的最终生效值（<=0 = 不截断, 全量口径）：
+//   - TieredPipeline=true（分层架构默认）: 来源 Top-N/K/M 是"来源内发现规则",
+//     恢复按 SectorTopN/SectorLeadersK/ETFTopM 原值执行（历史基线 3/3/8）；
+//     覆盖字段 >0 时仍优先生效（ASHARE_SECTOR_TOP_N 等显式调参不受影响）。
+//     池子总规模由多来源合并去重决定, 不再是全局 Top-9/Top-8。
+//   - 覆盖字段 >0: 直接采用覆盖值；
+//   - DefaultConfig 路径(fullSourceDefault=true)且未设覆盖值: 旧默认 3/3/8 视为
+//     "遗留截断", 一律改为 0(不截断)——修复候选池恒为 ~9 只股票 + 8 只 ETF 的问题；
+//   - 调用方显式构造的 Config: 完全尊重其 SectorTopN/SectorLeadersK/ETFTopM 原值。
+func (c Config) effectiveSourceLimits() (sectorTopN, leadersK, etfTopM int) {
+	sectorTopN, leadersK, etfTopM = c.SectorTopN, c.SectorLeadersK, c.ETFTopM
+	if c.TieredPipeline {
+		if c.SectorTopNOvr > 0 {
+			sectorTopN = c.SectorTopNOvr
+		}
+		if c.SectorLeadersKOvr > 0 {
+			leadersK = c.SectorLeadersKOvr
+		}
+		if c.ETFTopMOvr > 0 {
+			etfTopM = c.ETFTopMOvr
+		}
+		return
+	}
+	if c.SectorTopNOvr > 0 {
+		sectorTopN = c.SectorTopNOvr
+	} else if c.fullSourceDefault {
+		sectorTopN = 0
+	}
+	if c.SectorLeadersKOvr > 0 {
+		leadersK = c.SectorLeadersKOvr
+	} else if c.fullSourceDefault && c.SectorLeadersKOvr == 0 {
+		leadersK = 0
+	}
+	if c.ETFTopMOvr > 0 {
+		etfTopM = c.ETFTopMOvr
+	} else if c.fullSourceDefault && c.ETFTopMOvr == 0 {
+		etfTopM = 0
+	}
+	return
+}
 
 // NewGenerator 创建生成器。cfg 为零值时取 DefaultConfig；对显式传入但缺省的
 // 精筛字段做兜底（避免调用方只覆盖部分来源参数时 RS/资格闸门静默失效）。
@@ -231,6 +323,16 @@ func NewGenerator(prov Provider, cfg Config) *Generator {
 		}
 		if cfg.RSWindow == 0 && cfg.RSEnabled {
 			cfg.RSWindow = d.RSWindow
+		}
+		// 双窗口契约默认值回落：显式手工构造的 Config（不经 applyPoolEnvOverrides）
+		// 若未设置 R20/R60 窗口，必须回落到契约默认 20/60——否则 refinePool 拿到
+		// 非法 0/0 后虽内部兜底为 20/60，但调用方视角的"配置回落"不可见，
+		// TestRefineInvalidWindowsFallback 类断言失去依据。与 RSWindow 同口径补齐。
+		if cfg.RSShortWindow == 0 && cfg.RSEnabled {
+			cfg.RSShortWindow = d.RSShortWindow
+		}
+		if cfg.RSLongWindow == 0 && cfg.RSEnabled {
+			cfg.RSLongWindow = d.RSLongWindow
 		}
 		if cfg.RSBenchmark == "" {
 			cfg.RSBenchmark = d.RSBenchmark
@@ -282,6 +384,19 @@ func (g *Generator) Generate(ctx context.Context, manualSymbols []string, now ti
 		warnings = append(warnings, "LIQUIDITY_SCREEN 失败(已跳过, 资金流来源退化为不设门槛): "+err.Error())
 		log.Printf("[pool] WARN liquidity screen failed: %v", err)
 		markSrc("LIQUIDITY_SCREEN", err)
+	}
+	// L1 宽口径发现（分层架构）: 初筛结果不再前置叠加到 SECTOR/FUND 来源——
+	// 同一流动性门槛在发现层与 L4 精筛闸门重复执行是"层层叠加淘汰"的来源之一。
+	// ADV20 评估统一延后到 liquidityGatePool（PASS/WARN/FAIL/DATA_INSUFFICIENT 分级,
+	// FAIL 才剔除）。初筛统计(LiquidityPassed)保留用于诊断报告。
+	screenSet := func(s map[string]bool) map[string]bool {
+		if g.cfg.TieredPipeline {
+			return nil
+		}
+		return s
+	}(liquidSet)
+	if g.cfg.TieredPipeline && liquidSet != nil {
+		warnings = append(warnings, fmt.Sprintf("L1 宽口径发现: 流动性初筛(%d 只通过)仅作诊断统计, 不前置叠加到来源发现; ADV20 由 L4 闸门独立评估", liquidityCount))
 	}
 
 	// ---- 来源 2: ETF 动量 ----
@@ -353,6 +468,10 @@ func (g *Generator) Generate(ctx context.Context, manualSymbols []string, now ti
 	// 阶段 7: ADV20 已由流动性闸门写入条目快照(AvgAmount20D), 用它对四因子评分做
 	// 最终精化(补 P(ADV20) 权重)并按 A→B→其余重排。弱依赖：无强度包时原样返回。
 	pool = g.RefineScores(pool, &warnings)
+	// L3/L4 缠论结构分层（chan.go）: 复用 Python 网关 czsc 引擎, 在流动性/强度闸门
+	// 之后执行——只打 candidate_tier / chan_status / 止损证据, 不删条目、不翻转
+	// eligibility/tradability（P4 结构失效除外, 见 ComputeTradability）。
+	pool = g.ApplyChanLayer(ctx, pool, &warnings, now)
 
 	bySource := map[string]int{}
 	for _, e := range pool {
@@ -438,13 +557,14 @@ func (g *Generator) genSectorLeaders(ctx context.Context, liquidSet map[string]b
 	if len(rank) == 0 {
 		return nil, context.DeadlineExceeded // 语义: 上游返回空
 	}
-	// 按主力净流入降序取 Top N（防御性排序, 不信任上游顺序）
+	// 按主力净流入降序取 Top N（防御性排序, 不信任上游顺序）；TopN<=0 = 全量板块。
+	sectorTopN, leadersK, _ := g.cfg.effectiveSourceLimits()
 	sorted := make([]SectorFlow, len(rank))
 	copy(sorted, rank)
 	sort.SliceStable(sorted, func(i, j int) bool { return sorted[i].MainNetInflow > sorted[j].MainNetInflow })
 	top := sorted
-	if len(top) > g.cfg.SectorTopN {
-		top = top[:g.cfg.SectorTopN]
+	if sectorTopN > 0 && len(top) > sectorTopN {
+		top = top[:sectorTopN]
 	}
 
 	var out []Entry
@@ -575,9 +695,15 @@ func (g *Generator) genETFMomentum(ctx context.Context, now time.Time) ([]Entry,
 		return nil, context.DeadlineExceeded
 	}
 	sort.SliceStable(ranked, func(i, j int) bool { return ranked[i].mom > ranked[j].mom })
-	out := make([]Entry, 0, g.cfg.ETFTopM)
+	// ETFTopM<=0 = 全量保留（遗留问题修复: 旧默认 8 使 ETF 恒为 8 条）。
+	_, _, etfTopM := g.cfg.effectiveSourceLimits()
+	limit := len(ranked)
+	if etfTopM > 0 && etfTopM < limit {
+		limit = etfTopM
+	}
+	out := make([]Entry, 0, limit)
 	for i, r := range ranked {
-		if i >= g.cfg.ETFTopM {
+		if i >= limit {
 			break
 		}
 		out = append(out, r.e)

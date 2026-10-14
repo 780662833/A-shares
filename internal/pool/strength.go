@@ -109,33 +109,38 @@ func classifyPathA_B(o strengthOutcome) pathABResult {
 		}
 		return res
 	}
-	if !shortPositive || !rsIdxPositive {
-		res.reason = "R20≤0或RS20_index未确认为正(B需二者皆正)"
-		return res
-	}
 	// ---- 路径 A：完整趋势确认（所有条件必须"确认成立"，未知一律降级 B/NONE）----
-	aConds := []bool{
-		o.R60Stock != nil && *o.R60Stock > 0,
-		rsIdx20 != nil && *rsIdx20 > 0, // 已在上方共同准入
-		rsSec20 != nil && *rsSec20 > 0, // 行业侧未知 -> 不为真 -> 进不了 A
-		o.TrendKnown && o.CloseAboveMA20,
-		o.TrendKnown && o.MA20AboveMA60,
-	}
-	allA := true
-	for _, c := range aConds {
-		if !c {
-			allA = false
-			break
+	if shortPositive && rsIdxPositive {
+		aConds := []bool{
+			o.R60Stock != nil && *o.R60Stock > 0,
+			rsSec20 != nil && *rsSec20 > 0, // 行业侧未知 -> 不为真 -> 进不了 A
+			o.TrendKnown && o.CloseAboveMA20,
+			o.TrendKnown && o.MA20AboveMA60,
+		}
+		allA := true
+		for _, c := range aConds {
+			if !c {
+				allA = false
+				break
+			}
+		}
+		if allA {
+			res.path = StrengthA
+			res.reason = "A: R20/R60/RS20_index/RS20_sector均为正且Close≥MA20≥MA60"
+			return res
 		}
 	}
-	if allA {
-		res.path = StrengthA
-		res.reason = "A: R20/R60/RS20_index/RS20_sector均为正且Close≥MA20≥MA60"
+	// ---- 路径 B：修复候选（短期强 R20>0 ∧ RS20_index>0，或中期强 R60>0；
+	// RS20_index 硬门槛只约束 A——否则"中期强、短期回调未转正"的修复股永远
+	// 进不了低优先级观察队列，违背 6.3"趋势修复候选"契约语义。指数侧完全
+	// 不可得时（rsIdx20==nil）不猜测给 B，保持 NONE。）----
+	midStrong := o.R60Stock != nil && *o.R60Stock > 0
+	if rsIdxPositive || midStrong {
+		res.path = StrengthB
+		res.reason = "B: 短期强于大盘或中期绝对收益为正, 但趋势结构/行业强度未达A完整条件"
 		return res
 	}
-	// ---- 路径 B：修复候选（R20>0 ∧ RS20_index>0 ∧ 硬检查过；趋势结构可以未达标）----
-	res.path = StrengthB
-	res.reason = "B: 短期强于大盘但趋势结构/行业强度未达A完整条件"
+	res.reason = "NONE: R20≤0且RS20_index未确认为正且R60≤0(两窗口均无强势证据)"
 	return res
 }
 
@@ -227,6 +232,16 @@ type strengthWiring struct {
 	SectorR20             map[string]*float64   // 行业名 -> R20 %（缺失/失败 -> nil 或键不存在）
 	Trend                 map[string]trendState // symbol -> 均线结构（缺键=未知）
 	Adv                   map[string]*float64   // symbol -> ADV20（元; 缺键=nil）
+	// RSPrescore symbol -> 阶段5 RS 双窗口加权总分快照（超额收益百分点口径）。
+	// applyStrengthPathsAndScores 重写 RankScore 为百分位口径时，RankScore 的
+	// WARN×0.5 降权必须同步镜像到该快照——否则粗排量纲字段与最终名次脱节
+	// （WARN 票在旧版 RS 口径下名次应低于同分 PASS 票）。
+	RSPrescore map[string]float64
+	// ScoredSymbols 本轮实际进入四因子打分的股票集合。RefineScores 二次精化
+	// （整池输入、含未经 refinePool 打分链路的条目）据此把"未参与打分"与
+	// "打分后落选"区分开：不在集合内的股票类条目保持 Strength=Unset，
+	// 绝不伪造 NONE 结论（诚实性契约）。
+	ScoredSymbols map[string]bool
 }
 
 // trendState Close≥MA20 / MA20≥MA60 判定结果及可判性。
@@ -242,8 +257,28 @@ type trendState struct {
 //  3. A、B 分别排序，各按 PathATopN / PathBTopN 截断，NONE 保留在后；
 //  4. 输出顺序 A 段 → B 段 → NONE/非股票段，RankPos 全局连续编号。
 //
+// 分层口径（TieredPipeline=true, L2 趋势分类降级）：R20/R60/RS 是"分类与评分"
+// 特征而不是统一淘汰条件——下跌末端潜在反转股（缠论一买观察对象）R20≤0 时
+// 仍保留在研究观察队列（Strength=NONE, 不截断、不删除），仅不能进入 A/B 确认
+// 路径；tradability 由聚合层 STRENGTH 软阻塞保证不会误标可执行。
+// 同时输出 TREND_CLASS 审计统计（强势/转强/震荡/弱势/数据不足五档）。
+//
 // kept 必须已按旧版总分粗排（上游职责），本函数会重写 RankScore 为百分位口径。
+//
+// legacy 模式（refinePoolWith 主链路使用）：RankScore/RankPos 已由阶段 5 双窗口
+// 加权超额口径写入并作为唯一最终评分（精筛测试基线锁定该口径）；legacy 下只补
+// 路径判定(A/B/NONE)、Reason 与 RS 超额证据字段，不回写分数、不重排名次——
+// 避免两套评分口径互相覆盖（P0-5 双评分冲突的定案：主链路=加权超额，百分位
+// 四因子口径仅作为独立实验管线由 strength_test.go 直接调用验证）。
+func (g *Generator) applyStrengthPathsAndScoresLegacy(kept []AggEntry, w strengthWiring, warnings *[]string) []AggEntry {
+	return g.applyStrengthPathsAndScoresMode(kept, w, warnings, true)
+}
+
 func (g *Generator) applyStrengthPathsAndScores(kept []AggEntry, w strengthWiring, warnings *[]string) []AggEntry {
+	return g.applyStrengthPathsAndScoresMode(kept, w, warnings, false)
+}
+
+func (g *Generator) applyStrengthPathsAndScoresMode(kept []AggEntry, w strengthWiring, warnings *[]string, legacy bool) []AggEntry {
 	if !g.cfg.RSEnabled || (w.BenchR20 == nil && w.BenchR60 == nil) {
 		return kept // RS 管线未实际执行 -> Strength 保持 Unset, 不伪装成 NONE
 	}
@@ -256,6 +291,12 @@ func (g *Generator) applyStrengthPathsAndScores(kept []AggEntry, w strengthWirin
 	for i := range kept {
 		e := &kept[i]
 		if !isStock(*e) {
+			continue
+		}
+		// RefineScores 二次精化以整池为输入（含流动性闸门 FAIL/未知放行等未经
+		// refinePool 打分链路的股票条目）：不在本轮打分集合内的条目保持
+		// Strength=Unset，绝不伪造"打分后落选 NONE"结论。
+		if w.ScoredSymbols != nil && !w.ScoredSymbols[e.Symbol] {
 			continue
 		}
 		ts := w.Trend[e.Symbol]
@@ -331,15 +372,72 @@ func (g *Generator) applyStrengthPathsAndScores(kept []AggEntry, w strengthWirin
 		if !isStock(kept[i]) {
 			continue
 		}
+		if w.ScoredSymbols != nil && !w.ScoredSymbols[kept[i].Symbol] {
+			continue // 未经本轮打分链路 -> 不参与百分位, 保持 Unset（不伪造结论）
+		}
 		fIdx[0] = append(fIdx[0], kept[i].RS20IndexExcess)
 		fIdx[1] = append(fIdx[1], kept[i].RetLongRaw)
 		fIdx[2] = append(fIdx[2], kept[i].RS20SectorExcess)
 		fIdx[3] = append(fIdx[3], w.Adv[kept[i].Symbol])
 		partIdx = append(partIdx, i)
 	}
+	if legacy {
+		// legacy 主链路：分数/名次已由阶段 5 加权超额口径写入并粗排完毕，
+		// 此处只统计路径分布供审计，不回写 RankScore、不重排名次、不分段重排。
+		nA, nB, nNone := 0, 0, 0
+		for i := range kept {
+			if !isStock(kept[i]) {
+				continue
+			}
+			switch kept[i].Strength {
+			case StrengthA:
+				nA++
+			case StrengthB:
+				nB++
+			default:
+				nNone++
+			}
+		}
+		*warnings = append(*warnings, fmt.Sprintf("STRENGTH 路径判定完成(legacy 加权超额评分口径): A %d, B %d, NONE %d", nA, nB, nNone))
+		return kept
+	}
 	var pcts [4][]float64
 	for fi := 0; fi < 4; fi++ {
 		pcts[fi] = percentileScores(fIdx[fi])
+	}
+	// ---- 阶段 6/7 时序修复：WARN 降权必须在百分位合成之前施加 ----
+	// 旧实现把降权放在百分位重写之后（对最终分 ×0.5），n=2 时看似成立；但 n≥3
+	// 时百分位会彻底抹平阶段5 已施加的 ×0.5 降权（WARN 票 RS 超额居中 → 百分位
+	// 反而高于低 RS 的 PASS 票），"WARN 名次低于同分 PASS"契约随候选数量失真。
+	// 正确做法：以"阶段5 快照 RSScore × 惩罚"作为第 0 因子(RS20_index 超额)的
+	// 相对质量输入参与百分位——惩罚信息被百分位保留且量纲统一；随后再对最终分
+	// 显式施加一次惩罚作双保险。不会平方衰减：百分位输入读的是上一阶段快照，
+	// 本轮改写后的 RankScore 不回灌该列（RefineScores 幂等重建同理）。
+	penaltyOf := map[string]float64{}
+	for _, i := range partIdx {
+		penaltyOf[kept[i].Symbol] = finRankPenalty(kept[i].Financial)
+	}
+	if len(partIdx) > 0 {
+		col0 := make([]*float64, len(partIdx))
+		for m, i := range partIdx {
+			base := fIdx[0][m]
+			p := penaltyOf[kept[i].Symbol]
+			if base == nil {
+				continue
+			}
+			v := *base
+			if p != 1.0 {
+				if pre, ok := w.RSPrescore[kept[i].Symbol]; ok {
+					v = pre // 有阶段5快照者: 用快照作相对质量输入（快照已含降权, 不再乘 p）
+				} else {
+					vd := round2(v * p)
+					v = vd
+				}
+				base = &v
+			}
+			col0[m] = base
+		}
+		pcts[0] = percentileScores(col0)
 	}
 	nA, nB, nNone, nUnscored := 0, 0, 0, 0
 	for m, i := range partIdx {
@@ -351,14 +449,14 @@ func (g *Generator) applyStrengthPathsAndScores(kept []AggEntry, w strengthWirin
 			nUnscored++
 			continue // 全部因子不可得 -> 保持未打分（区别于"打分后落选 NONE"）
 		}
-		kept[i].RankScore = score
-		kept[i].Scored = true
-		// 阶段 6/7 冲突修复：四因子百分位评分覆盖粗排分会抹掉财务 WARN 降权——
-		// 降权必须在最终分上重新施加（WARN ×0.5），保证"可以保留观察但排序降权"
-		// 的契约语义不被后续打分吞没。
-		if p := finRankPenalty(kept[i].Financial); p != 1.0 {
-			kept[i].RankScore = round2(kept[i].RankScore * p)
+		pp := penaltyOf[kept[i].Symbol]
+		if w.RSPrescore != nil {
+			if v, ok := w.RSPrescore[kept[i].Symbol]; ok {
+				kept[i].RSScore = round2(v * pp) // 快照同步镜像降权（两口径名次关系一致）
+			}
 		}
+		kept[i].RankScore = round2(score * pp) // 最终分显式施加惩罚（WARN×0.5）
+		kept[i].Scored = true
 		switch kept[i].Strength {
 		case StrengthA:
 			nA++
@@ -370,14 +468,29 @@ func (g *Generator) applyStrengthPathsAndScores(kept []AggEntry, w strengthWirin
 	}
 	*warnings = append(*warnings, fmt.Sprintf("STRENGTH 路径判定完成: A %d, B %d, NONE %d, 未打分 %d(评分口径 0.35·P(RS20_index)+0.25·P(R60)+0.25·P(RS20_sector)+0.15·P(ADV20), 百分位0-100)", nA, nB, nNone, nUnscored))
 
-	// ---- 3. A/B 分别排序 + 独立 TopN 截断 ----
-	trunc := func(list []AggEntry, topN int, label string) []AggEntry {
-		sort.SliceStable(list, func(a, b int) bool { return list[a].RankScore > list[b].RankScore })
-		if topN > 0 && len(list) > topN {
-			*warnings = append(*warnings, fmt.Sprintf("STRENGTH 路径%s 截断弱尾 %d 只(保留前 %d)", label, len(list)-topN, topN))
-			list = list[:topN]
+	// ---- L2 趋势分类审计（分层架构: R20/R60/RS 是分类特征, 不是统一淘汰条件）----
+	// 五档口径：强势(A 完整确认) / 转强(B 短期修复) / 震荡(R20≤0 但 R60>0 或结构未知)
+	// / 弱势(R20、R60 均为负——潜在一买观察对象, 保留研究资格) / 数据不足。
+	if g.cfg.TieredPipeline {
+		nStrong, nTurn, nRange, nWeak, nInsuf2 := 0, 0, 0, 0, 0
+		for m, i := range partIdx {
+			_ = m
+			e := &kept[i]
+			switch {
+			case e.Strength == StrengthA:
+				nStrong++
+			case e.Strength == StrengthB:
+				nTurn++
+			case e.RetShortRaw == nil && e.RetLongRaw == nil:
+				nInsuf2++
+			case ptrOr(e.RetShortRaw, 0) <= 0 && ptrOr(e.RetLongRaw, 0) <= 0:
+				nWeak++
+			default:
+				nRange++
+			}
 		}
-		return list
+		*warnings = append(*warnings, fmt.Sprintf("TREND_CLASS 分类(L2, 不淘汰): 强势 %d, 转强 %d, 震荡 %d, 弱势 %d(潜在反转观察, 保留入池), 数据不足 %d",
+			nStrong, nTurn, nRange, nWeak, nInsuf2))
 	}
 	var segA, segB, segNone, segPass []AggEntry
 	for i := range kept {
@@ -404,6 +517,10 @@ func (g *Generator) applyStrengthPathsAndScores(kept []AggEntry, w strengthWirin
 	out := make([]AggEntry, 0, len(kept))
 	pos := 0
 	assign := func(e AggEntry, numbered bool) AggEntry {
+		if e.DemotedToWatch {
+			e.RankPos = 0
+			return e
+		}
 		if numbered {
 			pos++
 			e.RankPos = pos
@@ -472,6 +589,8 @@ func maTrendFromBars(closes []float64) (closeGeMa20, ma20GeMa60, known bool) {
 // RefineScores 阶段 7 二次精化：liquidityGatePool 已把 ADV20 写入条目快照
 // (AvgAmount20D, 单位元)后调用。若 refinePool 未产出强度包（精筛关闭/基准不可得），
 // 原样返回。幂等设计：重复调用只会用最新 Adv 快照重算百分位与分段排序。
+// legacy 主链路口径下 RankScore/RankPos 已由阶段 5 加权超额锁定，本函数只补写
+// ADV20 证据字段并统计路径分布，不回写分数、不重排名次（双评分口径冲突定案）。
 func (g *Generator) RefineScores(pool []AggEntry, warnings *[]string) []AggEntry {
 	if g.strengthWiring == nil {
 		return pool
@@ -481,5 +600,27 @@ func (g *Generator) RefineScores(pool []AggEntry, warnings *[]string) []AggEntry
 			g.strengthWiring.Adv[pool[i].Symbol] = pool[i].AvgAmount20D
 		}
 	}
-	return g.applyStrengthPathsAndScores(pool, *g.strengthWiring, warnings)
+	w := *g.strengthWiring
+	out := g.applyStrengthPathsAndScores(pool, w, warnings)
+	// 幂等性关键：applyStrengthPathsAndScores 会把 RankScore 重写为百分位口径，
+	// 若不把本轮结果镜像回 wiring，二次调用（如 Generate 的 ADV 精化）会用已被
+	// 改写的分数刷新 RSPrescore 快照，导致 WARN×0.5 降权被重复施加（平方衰减），
+	// 名次关系随之脱节。因此每次精化后同步重建两个 map（以最新一轮打分集合为准）。
+	newPre := make(map[string]float64, len(out))
+	newScored := make(map[string]bool, len(out))
+	for i := range out {
+		// 判据必须是 Scored && Strength!=Unset: RSScore==0 是合法粗排快照(个股与基准涨幅相等,
+		// 或 WARN×0.5 归零)——旧实现用 RSScore!=0 作代理判据会把这类票静默移出打分集合,
+		// 下一轮因 ScoredSymbols 门控保持 Strength=Unset 落入 segRest 直通段, 破坏
+		// "A→B→其余" 分段排序契约(TestPipelineWarnDownrankAndProvenance 锁定)。
+		if !out[i].Scored || out[i].Strength == StrengthUnset {
+			continue // 未经阶段5打分者（ETF/未知放行/未打分）不进快照
+		}
+		newPre[out[i].Symbol] = out[i].RSScore
+		newScored[out[i].Symbol] = true
+	}
+	w.RSPrescore = newPre
+	w.ScoredSymbols = newScored
+	g.strengthWiring = &w
+	return out
 }

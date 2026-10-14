@@ -168,7 +168,7 @@ func TestRefineRSSortTopKAndFuse(t *testing.T) {
 	}
 	// 基准 100 -> 110（+10%）; 个股涨幅: A +30%, B +20%, C -5%
 	f.indexBars = func(idx string, lookback int) []DailyBar {
-		return mkBars(100, 110, lookback)
+		return mkFlat(61, 110, 100, 100) // 端点固定 +10 -> RS=+20/+10/-15 精确可断言
 	}
 	// 行业指数显式置为不可得：本用例验证"行业侧未确认 → 最高归 B"契约。
 	// fake 的 IndexBars 在未注入 sectorIndexBars 时会把行业名请求复用到宽基
@@ -248,14 +248,35 @@ func TestRefineRSSortTopKAndFuse(t *testing.T) {
 		t.Errorf("ETF must stay unnumbered, got %v", bySym["510300"].RankPos)
 	}
 
-	// TopK 截断弱尾
+	// TopK 分层保留（TieredPipeline=true 默认口径）：RSTopK 是"确认队列名额"而非
+	// 删除开关——弱尾降级保留在观察队列（RankPos=0 退出确认段位），记录不删除。
 	cfg.RSTopK = 2
 	out2, warns2 := runRefine(t, f, cfg, poolIn)
-	if len(out2) != 3 { // ETF + 前2名
-		t.Fatalf("topk=2 want 3 entries, got %+v", out2)
+	if len(out2) != 4 { // ETF + 全部3只股票（弱尾 600003 降级保留）
+		t.Fatalf("tiered topk=2 want 4 entries (demote-not-delete), got %+v", out2)
 	}
-	if !contains(join(warns2), "RS_TOPK 截断弱尾 1 只") {
-		t.Errorf("want topk warning, got %v", warns2)
+	if !contains(join(warns2), "L2 分层保留") {
+		t.Errorf("want tiered-demote warning, got %v", warns2)
+	}
+	bySym := map[string]AggEntry{}
+	for _, e := range out2 {
+		bySym[e.Symbol] = e
+	}
+	if bySym["600001"].RankPos != 1 || bySym["600002"].RankPos != 2 {
+		t.Errorf("top2 rankpos wrong: %v %v", bySym["600001"].RankPos, bySym["600002"].RankPos)
+	}
+	if bySym["600003"].RankPos != 0 || !bySym["600003"].Scored {
+		t.Errorf("weak tail must be demoted-but-kept (RankPos=0, Scored=true): %+v", bySym["600003"])
+	}
+	// 非分层模式（旧物理截断语义）仍须裁掉弱尾
+	cfgNoTier := cfg
+	cfgNoTier.TieredPipeline = false
+	outN, warnsN := runRefine(t, f, cfgNoTier, poolIn)
+	if len(outN) != 3 { // ETF + 前2名
+		t.Fatalf("legacy topk=2 want 3 entries, got %+v", outN)
+	}
+	if !contains(join(warnsN), "RS_TOPK 截断弱尾 1 只") {
+		t.Errorf("want legacy topk warning, got %v", warnsN)
 	}
 
 	// 保险丝: 闸门杀光全部股票类 -> 退化放行（不空池）
