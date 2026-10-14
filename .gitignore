@@ -1,2 +1,5 @@
 .env.local
 .env.*.local
+data
+cmd\data\
+data_gateway\.cache
