@@ -100,6 +100,12 @@ type AggEntry struct {
 	Blacklisted bool              `json:"blacklisted"` // 黑名单事实位（DB status=BLACKLIST）
 	BlockedBy   string            `json:"blocked_by,omitempty"`
 
+	// DemotedToWatch: L2 分层保留标志——TieredPipeline=true 时被 RSTopK / A/B TopN
+	// 移出确认段位的股票类条目置 true（RankPos=0 退出确认展示, 记录不删除, 进入
+	// P0 观察队列）。必须用独立标志而非 RankPos==0 判定：阶段7 重组会对 NONE 段
+	// 打分股票重新连续编号，会覆盖阶段5 的清零结果。
+	DemotedToWatch bool `json:"demoted_to_watch,omitempty"`
+
 	// ---- 生命周期（per-symbol 视角; 逐来源精确迁移见 Lifecycle.Transition）----
 	SourceLifecycle string     `json:"source_lifecycle"` // ACTIVE / STALE / EXPIRED
 	FirstSeenAt     time.Time  `json:"first_seen_at"`

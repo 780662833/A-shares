@@ -251,12 +251,30 @@ func TestPipelineProviderNotWiredHonestUnknown(t *testing.T) {
 
 func TestPipelineWarnDownrankAndProvenance(t *testing.T) {
 	f := newFake()
-	f.qualify = func(string) *StockQualification { return qual("2020-01-01", 1, 5) }
+	// 画像按 code 区分：600003 财务字段缺失 -> 未知放行（不参与打分），其余正常。
+	// BarsOHLC 按 code 区分：600003 无 OHLC -> 未知放行路径；其余由 fakeProvider
+	// 默认委托 stockBars 生成合法序列（尾部日期与 asOfDate 对齐, quoteAsOfMatches 通过）。
+	f.qualify = func(code string) *StockQualification {
+		if code == "600003" {
+			return &StockQualification{ListingDate: "2020-01-01"} // EPS/ROE 缺失 -> unknown
+		}
+		return qual("2020-01-01", 1, 5)
+	}
 	ib := mkFlat(61, 100, 100, 100)
 	sb := mkFlat(61, 110, 110, 110)
 	f.indexBars = func(string, int) []DailyBar { return ib }
-	f.stockBars = func(string, int) []DailyBar { return sb }
-	f.barsOHLC = func(string, int) []barOHLC { return mkOHLCFromDaily(sb) }
+	f.stockBars = func(code string, lookback int) []DailyBar {
+		if code == "600003" {
+			return nil // RS 取数失败 -> unknown 放行分支（诚实不参与打分）
+		}
+		return sb
+	}
+	f.barsOHLC = func(code string, lookback int) []barOHLC {
+		if code == "600003" {
+			return nil
+		}
+		return mkOHLCFromDaily(sb)
+	}
 	g := NewGenerator(f, refineCfgWithFin())
 	g.SetFinancialProvider(&fakeFin{fn: func(code string, asOf time.Time) (*FinSnapshot, error) {
 		s := cleanSnapshot()
@@ -267,7 +285,10 @@ func TestPipelineWarnDownrankAndProvenance(t *testing.T) {
 		return s, nil
 	}})
 	warns := []string{}
-	in := []AggEntry{entryOf("600001", sourceSector), entryOf("600002", sourceSector)}
+	// 第三只票 600003 走未知放行路径（不参与打分）：若它与 600002 同为无证据条目
+	// 进入直通段，SliceStable 会保持输入顺序(600002 在前)而使断言失去约束力。
+	// 将其置于两票之后，使"WARN 必须排到所有 PASS 之后"成为有信息量的断言。
+	in := []AggEntry{entryOf("600001", sourceSector), entryOf("600002", sourceSector), entryOf("600003", sourceSector)}
 	out := g.refinePoolWith(context.Background(), in, &warns, finAsOf, 0, 0)
 	bySym := map[string]AggEntry{}
 	for _, e := range out {
@@ -275,13 +296,18 @@ func TestPipelineWarnDownrankAndProvenance(t *testing.T) {
 	}
 	w, ok1 := bySym["600001"]
 	p, ok2 := bySym["600002"]
-	if !ok1 || !ok2 {
-		t.Fatalf("两只都应保留, got %v", out)
+	u, ok3 := bySym["600003"]
+	if !ok1 || !ok2 || !ok3 {
+		t.Fatalf("三只都应保留(未知放行不删记录), got %v", out)
 	}
 	if w.Financial != FinWarn || p.Financial != FinPass {
 		t.Fatalf("状态不符: %s / %s", w.Financial, p.Financial)
 	}
-	// 同分数下 WARN 降权后名次必须低于 PASS
+	if u.Scored {
+		t.Fatalf("600003 数据缺失不应参与打分, got scored=%v", u.Scored)
+	}
+	// 同分数下 WARN 降权后名次必须低于 PASS。（未知放行条目不参与段位重编号，
+	// RankPos=0 属"未定段"约定值，不参与名次比较断言。）
 	if !(p.RankPos < w.RankPos) {
 		t.Fatalf("WARN 应被降权排后: warn pos=%d pass pos=%d scores %v/%v",
 			w.RankPos, p.RankPos, w.RankScore, p.RankScore)

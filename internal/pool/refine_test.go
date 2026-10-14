@@ -164,16 +164,16 @@ func TestRefineRSSortTopKAndFuse(t *testing.T) {
 	}
 	// 基准 100 -> 110（+10%）; 个股涨幅: A +30%, B +20%, C -5%
 	f.indexBars = func(idx string, lookback int) []DailyBar {
-		return mkBars(100, 110, lookback)
+		return mkFlat(61, 110, 100, 100) // 端点固定 +10 -> RS=+20/+10/-15 精确可断言
 	}
 	f.stockBars = func(code string, lookback int) []DailyBar {
 		switch code {
 		case "600001":
-			return mkBars(10, 13, lookback) // +30 -> RS=+20
+			return mkFlat(61, 13, 10, 10) // R20/R60 端点固定 +30 -> RS=+20
 		case "600002":
-			return mkBars(10, 12, lookback) // +20 -> RS=+10
+			return mkFlat(61, 12, 10, 10) // +20 -> RS=+10
 		case "600003":
-			return mkBars(10, 9.5, lookback) // -5 -> RS=-15
+			return mkFlat(61, 9.5, 10, 10) // -5 -> RS=-15
 		}
 		return nil
 	}
@@ -205,14 +205,35 @@ func TestRefineRSSortTopKAndFuse(t *testing.T) {
 		t.Errorf("rank pos wrong: %v %v", out[1].RankPos, out[3].RankPos)
 	}
 
-	// TopK 截断弱尾
+	// TopK 分层保留（TieredPipeline=true 默认口径）：RSTopK 是"确认队列名额"而非
+	// 删除开关——弱尾降级保留在观察队列（RankPos=0 退出确认段位），记录不删除。
 	cfg.RSTopK = 2
 	out2, warns2 := runRefine(t, f, cfg, poolIn)
-	if len(out2) != 3 { // ETF + 前2名
-		t.Fatalf("topk=2 want 3 entries, got %+v", out2)
+	if len(out2) != 4 { // ETF + 全部3只股票（弱尾 600003 降级保留）
+		t.Fatalf("tiered topk=2 want 4 entries (demote-not-delete), got %+v", out2)
 	}
-	if !contains(join(warns2), "RS_TOPK 截断弱尾 1 只") {
-		t.Errorf("want topk warning, got %v", warns2)
+	if !contains(join(warns2), "L2 分层保留") {
+		t.Errorf("want tiered-demote warning, got %v", warns2)
+	}
+	bySym := map[string]AggEntry{}
+	for _, e := range out2 {
+		bySym[e.Symbol] = e
+	}
+	if bySym["600001"].RankPos != 1 || bySym["600002"].RankPos != 2 {
+		t.Errorf("top2 rankpos wrong: %v %v", bySym["600001"].RankPos, bySym["600002"].RankPos)
+	}
+	if bySym["600003"].RankPos != 0 || !bySym["600003"].Scored {
+		t.Errorf("weak tail must be demoted-but-kept (RankPos=0, Scored=true): %+v", bySym["600003"])
+	}
+	// 非分层模式（旧物理截断语义）仍须裁掉弱尾
+	cfgNoTier := cfg
+	cfgNoTier.TieredPipeline = false
+	outN, warnsN := runRefine(t, f, cfgNoTier, poolIn)
+	if len(outN) != 3 { // ETF + 前2名
+		t.Fatalf("legacy topk=2 want 3 entries, got %+v", outN)
+	}
+	if !contains(join(warnsN), "RS_TOPK 截断弱尾 1 只") {
+		t.Errorf("want legacy topk warning, got %v", warnsN)
 	}
 
 	// 保险丝: 闸门杀光全部股票类 -> 退化放行（不空池）
@@ -400,7 +421,9 @@ func TestRefineStrengthPathSemantics(t *testing.T) {
 		switch code {
 		case "600001": // R20 +10, R60 +10 -> 总分 +10, 短期超额正, 排名1 -> A
 			return mkFlat(61, 110, 100, 100)
-		case "600002": // R20 -5, R60 +20 -> 总分 0.6*(-5)+0.4*20=5, 中期强 -> B
+		case "600002": // R20 -5, R60 +20 -> 总分 0.6*(-5)+0.4*20=5
+			// 契约锁定(classifyPathA_B): A/B 共同准入要求 R20>0 且 RS20_index>0 二者皆正;
+			// R20≤0 的"仅中期强"属 L2 震荡档分类特征, 不是路径资格 -> NONE(保留研究观察)。
 			return mkFlat(61, 120, 126.316, 100) // 120/126.316-1=-5%, 120/100-1=+20%
 		case "600003": // R20 -10, R60 -10 -> 总分 -10 -> NONE
 			return mkFlat(61, 90, 100, 100)
@@ -421,8 +444,8 @@ func TestRefineStrengthPathSemantics(t *testing.T) {
 	if byCode["600001"].Strength != StrengthA {
 		t.Errorf("600001 want A, got %v (score %v)", byCode["600001"].Strength, byCode["600001"].RankScore)
 	}
-	if byCode["600002"].Strength != StrengthB {
-		t.Errorf("600002 want B (mid-term strong only), got %v (score %v)", byCode["600002"].Strength, byCode["600002"].RankScore)
+	if byCode["600002"].Strength != StrengthNone {
+		t.Errorf("600002 want NONE (R20≤0, B需R20与RS20_index皆正——契约锁定), got %v (score %v)", byCode["600002"].Strength, byCode["600002"].RankScore)
 	}
 	if byCode["600003"].Strength != StrengthNone {
 		t.Errorf("600003 want NONE (both windows weak), got %v", byCode["600003"].Strength)
