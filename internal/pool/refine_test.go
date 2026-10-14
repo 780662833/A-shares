@@ -169,6 +169,12 @@ func TestRefineRSSortTopKAndFuse(t *testing.T) {
 	f.indexBars = func(idx string, lookback int) []DailyBar {
 		return mkBars(100, 110, lookback)
 	}
+	// 行业指数显式置为不可得：本用例验证"行业侧未确认 → 最高归 B"契约。
+	// fake 的 IndexBars 在未注入 sectorIndexBars 时会把行业名请求复用到宽基
+	// indexBars(+10%)，使 RS20_sector 被伪确认为正、A 门槛失真；真实供应商按
+	// 行业名取数失败返回 error——这里用 panic 模拟取数异常（refinePool 的行业
+	// 侧取数带 recover 防护，诚实降级为 nil"无法确认"）。
+	f.sectorIndexBars = func(name string, lookback int) []DailyBar { panic("sector unavailable") }
 	f.stockBars = func(code string, lookback int) []DailyBar {
 		switch code {
 		case "600001":
@@ -207,12 +213,16 @@ func TestRefineRSSortTopKAndFuse(t *testing.T) {
 	if c.Strength != StrengthNone {
 		t.Errorf("600003 want NONE (R20<0 fails B admission), got %v", c.Strength)
 	}
-	// 分段输出顺序：A 段 → B 段 → 其余段（NONE 股票与非股票直通段）
-	if out[0].Symbol != "600001" || out[1].Symbol != "600002" {
-		t.Errorf("want B-segment order [600001 600002], got %+v", out)
+	// 分段输出顺序：非股票直通段(ETF/MANUAL)保持原相对顺序整体在前，
+	// 其后为股票类分段 A → B → NONE（refinePool 池重组契约）。
+	if out[0].Symbol != "510300" {
+		t.Errorf("want pass-through ETF first, got %v", out[0].Symbol)
 	}
-	if out[2].Symbol != "600003" || out[3].Symbol != "510300" {
-		t.Errorf("want rest-segment [600003(NONE) 510300(ETF)], got %+v", out)
+	if out[1].Symbol != "600001" || out[2].Symbol != "600002" {
+		t.Errorf("want B-segment order [600001 600002], got [%v %v]", out[1].Symbol, out[2].Symbol)
+	}
+	if out[3].Symbol != "600003" {
+		t.Errorf("want tail NONE-segment [600003], got %v", out[3].Symbol)
 	}
 	// 百分位口径终裁（n=3, midrank, P=(rank-1)/(n-1)*100）：
 	//   RS20_index 超额 20/10/-15 全互异 → P ∈ {100, 50, 0}；
@@ -373,6 +383,20 @@ func mkOHLCFromDaily(bars []DailyBar) []barOHLC {
 	return out
 }
 
+// mkAmounts 生成 n 行成交额序列：前段固定 base，尾部 m 行为 last（下标按尾部定位）。
+// 用于构造 ADV20 因子可区分的流动性夹具（liquidityGatePool 只看最近 advWindow=20 行）。
+func mkAmounts(n int, base, last float64, tail int) []DailyAmountRow {
+	rows := make([]DailyAmountRow, 0, n)
+	for i := 0; i < n; i++ {
+		v := base
+		if i >= n-tail {
+			v = last
+		}
+		rows = append(rows, DailyAmountRow{Amount: v})
+	}
+	return rows
+}
+
 // runRefineDual 以显式短/长窗口执行精筛（仅供测试构造退化场景；传 0 走配置解析）。
 func runRefineDual(t *testing.T, f *fakeProvider, cfg Config, pool []AggEntry, shortWin, longWin int) ([]AggEntry, []string) {
 	t.Helper()
@@ -427,11 +451,12 @@ func TestRefineStrengthPathSemantics(t *testing.T) {
 	f.indexBars = func(idx string, lookback int) []DailyBar {
 		return mkFlat(61, 100, 100, 100)
 	}
-	// 行业指数 K 线: "测试" 行业 R20 = -10%（bars[n-21]=110 -> 99/110-1=-10）。
-	// 刻意让个股跑输行业，验证 A 路径的 RS20_sector>0 硬门槛——行业侧确认不过关时
-	// 必须诚实降级 B（契约 6.2: 未知或为负都不进 A），绝不允许"排名列前即 A"。
+	// 行业指数 K 线: "测试" 行业 R20 = +20%（bars[n-21]=82.5 -> 99/82.5-1=+20）。
+	// 刻意让最强个股 600001（R20=+10）跑输行业（RS20_sector=-10），验证 A 路径的
+	// RS20_sector>0 硬门槛——行业侧确认不过关时必须诚实降级 B（契约 6.2: 未知或为
+	// 负都不进 A），绝不允许"排名列前即 A"。
 	f.sectorIndexBars = func(name string, lookback int) []DailyBar {
-		return mkFlat(61, 99, 110, 110)
+		return mkFlat(61, 99, 82.5, 82.5)
 	}
 	f.stockBars = func(code string, lookback int) []DailyBar {
 		switch code {

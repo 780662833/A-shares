@@ -13,7 +13,7 @@
 //
 // 同一次运行重复调用不会产生重复记录；失败来源只更新其错误状态，
 // 绝不把 FAILED 解释成"今天没有命中"而批量失效旧数据。
-package db
+package persist
 
 import (
 	"encoding/json"

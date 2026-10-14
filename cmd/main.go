@@ -53,6 +53,7 @@ import (
 
 	"ashare-quant/internal/broker"
 	"ashare-quant/internal/db"
+	"ashare-quant/internal/persist"
 	dbmodel "ashare-quant/internal/model"
 	"ashare-quant/internal/pool"
 	datasync "ashare-quant/internal/sync"
@@ -717,7 +718,7 @@ func (a *app) generatePoolNative(now time.Time) (*tool.WatchlistGenData, error) 
 		}
 	}
 	if a.gdb != nil {
-		runID, serr := db.SaveScreeningRun(db.SaveScreeningRunInputs{
+		runID, serr := persist.SaveScreeningRun(persist.SaveScreeningRunInputs{
 			GDB: a.gdb, Result: res, Started: now, Status: runStatus,
 		})
 		if serr != nil {

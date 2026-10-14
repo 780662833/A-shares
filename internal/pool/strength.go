@@ -221,6 +221,8 @@ type strengthWiring struct {
 	BenchR20, BenchR60    *float64              // 基准指数双窗口收益率 %（全局口径）
 	StockBenchR20         map[string]*float64   // symbol -> 该票打分时实际使用的短窗基准收益（单票样本不足退化口径; 缺键=nil 沿用全局）
 	StockBenchR60         map[string]*float64   // symbol -> 长窗同上
+	StockShortKnown       map[string]bool       // symbol -> 个股短窗样本充分（端点存在即算可得, 含 0% 收益）
+	StockLongKnown        map[string]bool       // symbol -> 个股长窗样本充分（false = R60 诚实不可得）
 	SingleWindowShortOnly bool                  // 个股侧与基准侧短窗同时可得而长窗两侧皆不可得（阶段 5 单窗口退化口径）
 	SectorR20             map[string]*float64   // 行业名 -> R20 %（缺失/失败 -> nil 或键不存在）
 	Trend                 map[string]trendState // symbol -> 均线结构（缺键=未知）
@@ -279,19 +281,33 @@ func (g *Generator) applyStrengthPathsAndScores(kept []AggEntry, w strengthWirin
 		}
 		det := classifyPathA_B(o)
 		singleWin := w.SingleWindowShortOnly
-		if _, hasS := w.StockBenchR20[e.Symbol]; hasS {
-			// 逐票退化标志：该票短窗两侧可得、长窗两侧皆不可得 -> 视同单窗口模式。
-			sB60 := w.BenchR60
+		if w.StockShortKnown != nil || w.StockLongKnown != nil {
+			// 逐票退化标志（样本可得性口径，生产 bug 修复）：该票短窗两侧可得、
+			// 长窗个股侧与基准侧皆不可得 -> 视同单窗口模式。旧实现仅凭
+			// StockBenchR20 是否含 key 触发逐票判定，且用 nil 指针区分"不可得"与
+			// "收益恰为 0%"——mkFlat 类夹具中长窗基准横盘 0% 是有效测量，必须用
+			// 显式标志表达可得性，否则路径判定与打分口径分裂。
+			shortOK := w.StockShortKnown[e.Symbol]
+			longOK := w.StockLongKnown[e.Symbol]
+			benchLongOK := true
 			if v, ok := w.StockBenchR60[e.Symbol]; ok {
-				sB60 = v
+				benchLongOK = v != nil
+			} else if w.BenchR60 == nil {
+				benchLongOK = false
 			}
-			singleWin = o.R20Stock != nil && o.R60Stock == nil && benchR20 != nil && sB60 == nil
+			singleWin = singleWin || (shortOK && !longOK && benchLongOK == false && o.R20Stock != nil && o.R60Stock == nil)
 		}
 		if singleWin && det.path == StrengthB && o.R20Stock != nil && o.R60Stock == nil {
-			if ex := rsExcess(o.R20Stock, o.R20Index); ex != nil && *ex > 0 {
-				// 阶段 5 锁定语义：基准长窗不可得、短期强于大盘 -> 视为短期强势 A（退化口径）。
-				det.path = StrengthA
-				det.reason = "A(单窗口退化): 基准长窗不可得, 短期强于大盘即视为短期强势"
+			// 行业确认负门禁：RS20_sector 已知且 <=0 时, 说明行业侧已给出否定证据,
+			// 单窗口退化不得越过该证据升 A —— 诚实保留 B 段。仅当行业侧未知(nil)
+			// 或为正时才允许退化升 A。
+			sectorNotNegative := o.R20Sector == nil || *o.R20Sector > 0
+			if sectorNotNegative {
+				if ex := rsExcess(o.R20Stock, o.R20Index); ex != nil && *ex > 0 {
+					// 阶段 5 锁定语义：基准长窗不可得、短期强于大盘 -> 视为短期强势 A（退化口径）。
+					det.path = StrengthA
+					det.reason = "A(单窗口退化): 基准长窗不可得, 短期强于大盘即视为短期强势"
+				}
 			}
 		}
 		// 生产 bug 修复（tie-break）：行业侧与趋势结构**确认成立**时，不得因
