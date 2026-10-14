@@ -319,6 +319,12 @@ func (g *Generator) refinePoolWith(ctx context.Context, pool []AggEntry, warning
 	var unknownN, rejectedN int
 	kept := make([]AggEntry, 0, len(stockIdx))
 	dropped := make([]AggEntry, 0, len(stockIdx))
+	// 阶段5 打分集合与粗排快照镜像：在闸门循环内逐票填充（e 是值拷贝、Symbol
+	// 唯一），供下方 strengthWiring 构造时直接采用。ScoredSymbols 的判据必须是
+	// "实际完成 RS 打分"而非"存在于 kept"——未知放行条目也在 kept 中但不得进入
+	// 四因子百分位链路（否则伪造打分结论，违反诚实性契约）。
+	wiringPreScore := map[string]float64{}
+	wiringScored := map[string]bool{}
 	for k, idx := range stockIdx {
 		e := pool[idx]
 		res := results[k]
@@ -447,6 +453,8 @@ func (g *Generator) refinePoolWith(ctx context.Context, pool []AggEntry, warning
 			// 得分"策略而丢失快照（重复代码场景）——e.RSScore 与 e.RankScore 同源同值,
 			// 天然与最终保留条目一致, 无需回填。
 			e.RSScore = e.RankScore
+			wiringPreScore[e.Symbol] = e.RSScore
+			wiringScored[e.Symbol] = true
 		}
 		kept = append(kept, e)
 	}
@@ -488,21 +496,50 @@ func (g *Generator) refinePoolWith(ctx context.Context, pool []AggEntry, warning
 			rankedN++
 			kept[i].RankPos = rankedN
 		}
-		if g.cfg.RSTopK > 0 && len(kept) > g.cfg.RSTopK && !g.cfg.TieredPipeline {
-			*warnings = append(*warnings, fmt.Sprintf("RS_TOPK 截断弱尾 %d 只(保留前 %d)", len(kept)-g.cfg.RSTopK, g.cfg.RSTopK))
-			kept = kept[:g.cfg.RSTopK]
-		} else if g.cfg.RSTopK > 0 && len(kept) > g.cfg.RSTopK {
-			// 分层口径(TieredPipeline=true): RSTopK 是"确认队列名额"而非删除开关——
-			// 弱尾降级保留在观察队列尾部(L4 P0 研究池), 不占 RankPos 段位。
+		if g.cfg.RSTopK > 0 && len(kept) > g.cfg.RSTopK {
+			// 统计口径修正：RSTopK 是"股票类确认队列名额"，ETF/未打分条目本就不参与
+			// RS 排名（旧实现用 len(kept)-TopK 把 ETF 也计入"截断数"，虚报剔除量）。
+			nStock := 0
 			for i := range kept {
-				if !kept[i].Scored {
-					continue
-				}
-				if kept[i].RankPos > g.cfg.RSTopK {
-					kept[i].Scored = false // 移出确认段位, 保留记录与分数快照(观察队列)
+				if kept[i].Scored {
+					nStock++
 				}
 			}
-			*warnings = append(*warnings, fmt.Sprintf("L2 分层保留: RS_TOPK=%d 之外的 %d 只弱尾降级进入观察队列(不删除)", g.cfg.RSTopK, len(kept)-g.cfg.RSTopK))
+			truncN := nStock - g.cfg.RSTopK
+			if truncN <= 0 {
+				truncN = 0
+			}
+			if !g.cfg.TieredPipeline {
+				// 旧模式: 物理截断（按名次裁掉股票类弱尾, 非股票条目直通段保留）。
+				if truncN > 0 {
+					*warnings = append(*warnings, fmt.Sprintf("RS_TOPK 截断弱尾 %d 只(保留前 %d)", truncN, g.cfg.RSTopK))
+					trimmed := make([]AggEntry, 0, len(kept))
+					for _, e := range kept {
+						if e.Scored && e.RankPos > g.cfg.RSTopK {
+							continue // 弱尾股票类: 移出输出
+						}
+						trimmed = append(trimmed, e)
+					}
+					kept = trimmed
+				}
+			} else if truncN > 0 {
+				// 分层口径(TieredPipeline=true): RSTopK 是"确认队列名额"而非删除开关——
+				// 弱尾降级保留在观察队列尾部(L4 P0 研究池)。RankPos 清零使其退出
+				// 确认段位展示；但 Scored 必须保持 true：该标志同时是
+				// ComputeTradability QUOTE_STATE 分支的判据（精筛恒置 LimitUnknown），
+				// 若在此翻转会把被剔除条目的诚实结论从 QUOTE_STATE/FINANCIAL_DATA
+				// 吞成泛化 STRENGTH，并污染 RefineScores 幂等快照重建。
+				for i := range kept {
+					if !kept[i].Scored {
+						continue
+					}
+					if kept[i].RankPos > g.cfg.RSTopK {
+						kept[i].RankPos = 0        // 移出确认段位, 保留记录、分数快照与打分标记(观察队列)
+						kept[i].DemotedToWatch = true // 独立标志: 阶段7 重组会重编 RankPos, 清零不可靠
+					}
+				}
+				*warnings = append(*warnings, fmt.Sprintf("L2 分层保留: RS_TOPK=%d 之外的 %d 只弱尾降级进入观察队列(不删除)", g.cfg.RSTopK, truncN))
+			}
 		}
 	}
 
@@ -517,7 +554,7 @@ func (g *Generator) refinePoolWith(ctx context.Context, pool []AggEntry, warning
 	{
 		w := strengthWiring{BenchR20: benchChgShort, BenchR60: benchChg, SingleWindowShortOnly: benchChgShort != nil && benchChg == nil,
 			SectorR20: map[string]*float64{}, Adv: map[string]*float64{},
-			Trend: map[string]trendState{}, RSPrescore: map[string]float64{}, ScoredSymbols: map[string]bool{}}
+			Trend: map[string]trendState{}, RSPrescore: wiringPreScore, ScoredSymbols: wiringScored}
 		for k, idxK := range stockIdx {
 			_ = idxK
 			if trendRes[k].Known || trendRes[k].CloseGeMA20 || trendRes[k].MA20GeMA60 {

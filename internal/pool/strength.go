@@ -324,6 +324,40 @@ func (g *Generator) applyStrengthPathsAndScores(kept []AggEntry, w strengthWirin
 	for fi := 0; fi < 4; fi++ {
 		pcts[fi] = percentileScores(fIdx[fi])
 	}
+	// ---- 阶段 6/7 时序修复：WARN 降权必须在百分位合成之前施加 ----
+	// 旧实现把降权放在百分位重写之后（对最终分 ×0.5），n=2 时看似成立；但 n≥3
+	// 时百分位会彻底抹平阶段5 已施加的 ×0.5 降权（WARN 票 RS 超额居中 → 百分位
+	// 反而高于低 RS 的 PASS 票），"WARN 名次低于同分 PASS"契约随候选数量失真。
+	// 正确做法：以"阶段5 快照 RSScore × 惩罚"作为第 0 因子(RS20_index 超额)的
+	// 相对质量输入参与百分位——惩罚信息被百分位保留且量纲统一；随后再对最终分
+	// 显式施加一次惩罚作双保险。不会平方衰减：百分位输入读的是上一阶段快照，
+	// 本轮改写后的 RankScore 不回灌该列（RefineScores 幂等重建同理）。
+	penaltyOf := map[string]float64{}
+	for _, i := range partIdx {
+		penaltyOf[kept[i].Symbol] = finRankPenalty(kept[i].Financial)
+	}
+	if len(partIdx) > 0 {
+		col0 := make([]*float64, len(partIdx))
+		for m, i := range partIdx {
+			base := fIdx[0][m]
+			p := penaltyOf[kept[i].Symbol]
+			if base == nil {
+				continue
+			}
+			v := *base
+			if p != 1.0 {
+				if pre, ok := w.RSPrescore[kept[i].Symbol]; ok {
+					v = pre // 有阶段5快照者: 用快照作相对质量输入（快照已含降权, 不再乘 p）
+				} else {
+					vd := round2(v * p)
+					v = vd
+				}
+				base = &v
+			}
+			col0[m] = base
+		}
+		pcts[0] = percentileScores(col0)
+	}
 	nA, nB, nNone, nUnscored := 0, 0, 0, 0
 	for m, i := range partIdx {
 		f := [4]*float64{fIdx[0][m], fIdx[1][m], fIdx[2][m], fIdx[3][m]}
@@ -334,26 +368,14 @@ func (g *Generator) applyStrengthPathsAndScores(kept []AggEntry, w strengthWirin
 			nUnscored++
 			continue // 全部因子不可得 -> 保持未打分（区别于"打分后落选 NONE"）
 		}
-		kept[i].RankScore = score
-		kept[i].Scored = true
-		// 阶段 6/7 冲突修复：四因子百分位评分覆盖粗排分会抹掉财务 WARN 降权——
-		// 降权必须在最终分上重新施加（WARN ×0.5），保证"可以保留观察但排序降权"
-		// 的契约语义不被后续打分吞没。同一惩罚必须同步镜像到 RSScore 快照
-		// （阶段5 粗排量纲）：两口径的 WARN 名次关系必须一致，否则审计字段
-		// 与最终排序脱节（TestPipelineWarnDownrankAndProvenance 锁定）。
-		if p := finRankPenalty(kept[i].Financial); p != 1.0 {
-			kept[i].RankScore = round2(kept[i].RankScore * p)
-			if w.RSPrescore != nil {
-				if v, ok := w.RSPrescore[kept[i].Symbol]; ok {
-					kept[i].RSScore = round2(v * p)
-				}
-			}
-		} else if w.RSPrescore != nil {
-			// PASS/WARN 之外状态保持阶段5原快照（未被打断）
+		pp := penaltyOf[kept[i].Symbol]
+		if w.RSPrescore != nil {
 			if v, ok := w.RSPrescore[kept[i].Symbol]; ok {
-				kept[i].RSScore = v
+				kept[i].RSScore = round2(v * pp) // 快照同步镜像降权（两口径名次关系一致）
 			}
 		}
+		kept[i].RankScore = round2(score * pp) // 最终分显式施加惩罚（WARN×0.5）
+		kept[i].Scored = true
 		switch kept[i].Strength {
 		case StrengthA:
 			nA++
@@ -404,8 +426,22 @@ func (g *Generator) applyStrengthPathsAndScores(kept []AggEntry, w strengthWirin
 			segRest = append(segRest, kept[i])
 		}
 	}
-	sort.SliceStable(segA, func(a, b int) bool { return segA[a].RankScore > segA[b].RankScore })
-	sort.SliceStable(segB, func(a, b int) bool { return segB[a].RankScore > segB[b].RankScore })
+	// WARN 财务降权必须同时决定段内次序：百分位评分在只有少数候选时极易并列
+	// （n=2 时两票各自因子不是 0 就是 100, 归一化后同为 50）——若只靠 SliceStable
+	// 依赖输入顺序, "WARN×0.5 排后"契约会被并列静默吞掉。显式以 RankScore(已含
+	// ×0.5 降权)为主键、RSScore(阶段5 粗排快照, 同样镜像了降权)为次键排序,
+	// 原始输入顺序作最终 tiebreak, 保证同分 WARN 稳定排在 PASS 之后。
+	downrankLess := func(a, b AggEntry) bool {
+		if a.RankScore != b.RankScore {
+			return a.RankScore > b.RankScore
+		}
+		if a.RSScore != b.RSScore {
+			return a.RSScore > b.RSScore
+		}
+		return false // SliceStable: 保持原相对顺序
+	}
+	sort.SliceStable(segA, func(i, j int) bool { return downrankLess(segA[i], segA[j]) })
+	sort.SliceStable(segB, func(i, j int) bool { return downrankLess(segB[i], segB[j]) })
 	demote := func(list []AggEntry, topN int, label string) ([]AggEntry, []AggEntry) {
 		if topN > 0 && len(list) > topN {
 			*warnings = append(*warnings, fmt.Sprintf("STRENGTH 路径%s 截断弱尾 %d 只(保留前 %d)", label, len(list)-topN, topN))
@@ -425,9 +461,15 @@ func (g *Generator) applyStrengthPathsAndScores(kept []AggEntry, w strengthWirin
 	}
 
 	// ---- 4. 重组输出: A 段 -> B 段 -> 其余段; RankPos 只对打分股票连续编号 ----
+	// 分层保留标志（DemotedToWatch）优先：被 RSTopK/TopN 移出确认段位的条目即使
+	// 落入 NONE 段也不得重新获得确认名次（否则阶段5 的降级会被重编号静默撤销）。
 	out := make([]AggEntry, 0, len(kept))
 	pos := 0
 	assign := func(e AggEntry, numbered bool) AggEntry {
+		if e.DemotedToWatch {
+			e.RankPos = 0
+			return e
+		}
 		if numbered {
 			pos++
 			e.RankPos = pos
@@ -505,5 +547,27 @@ func (g *Generator) RefineScores(pool []AggEntry, warnings *[]string) []AggEntry
 			g.strengthWiring.Adv[pool[i].Symbol] = pool[i].AvgAmount20D
 		}
 	}
-	return g.applyStrengthPathsAndScores(pool, *g.strengthWiring, warnings)
+	w := *g.strengthWiring
+	out := g.applyStrengthPathsAndScores(pool, w, warnings)
+	// 幂等性关键：applyStrengthPathsAndScores 会把 RankScore 重写为百分位口径，
+	// 若不把本轮结果镜像回 wiring，二次调用（如 Generate 的 ADV 精化）会用已被
+	// 改写的分数刷新 RSPrescore 快照，导致 WARN×0.5 降权被重复施加（平方衰减），
+	// 名次关系随之脱节。因此每次精化后同步重建两个 map（以最新一轮打分集合为准）。
+	newPre := make(map[string]float64, len(out))
+	newScored := make(map[string]bool, len(out))
+	for i := range out {
+		// 判据必须是 Scored && Strength!=Unset: RSScore==0 是合法粗排快照(个股与基准涨幅相等,
+		// 或 WARN×0.5 归零)——旧实现用 RSScore!=0 作代理判据会把这类票静默移出打分集合,
+		// 下一轮因 ScoredSymbols 门控保持 Strength=Unset 落入 segRest 直通段, 破坏
+		// "A→B→其余" 分段排序契约(TestPipelineWarnDownrankAndProvenance 锁定)。
+		if !out[i].Scored || out[i].Strength == StrengthUnset {
+			continue // 未经阶段5打分者（ETF/未知放行/未打分）不进快照
+		}
+		newPre[out[i].Symbol] = out[i].RSScore
+		newScored[out[i].Symbol] = true
+	}
+	w.RSPrescore = newPre
+	w.ScoredSymbols = newScored
+	g.strengthWiring = &w
+	return out
 }

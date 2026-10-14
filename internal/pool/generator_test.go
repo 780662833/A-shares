@@ -216,6 +216,23 @@ func baseFake() *fakeProvider {
 		{Code: "600004", Name: "缩量股", OrgNetAmount: 9e8},  // 不在 liquidSet -> 剔除
 		{Code: "600005", Name: "低买机构", OrgNetAmount: 1e7}, // 低于阈值 -> 剔除
 	}
+	// refinePool 接线: 三只有流动性记录的成分股给统一上行 K 线(现价110/R20端点100/
+	// R60端点100 -> R20=R60=+10%), 基准指数横盘(全100) -> RS 超额 +10, 股票类条目
+	// 实际进入打分链路(ScoredSymbols), 使阶段7 A/B/NONE 判定与四因子精化可被断言。
+	f.qualify = func(code string) *StockQualification { return qual("2020-01-01", 1, 5) }
+	f.stockBars = func(code string, lookback int) []DailyBar { return mkFlat(61, 110, 100, 100) }
+	f.indexBars = func(code string, lookback int) []DailyBar { return mkFlat(61, 100, 100, 100) }
+	f.stockAmounts = func(code string, lookback int) []DailyAmountRow {
+		amt := map[string]float64{"600519": 5e9, "300750": 3e9, "601127": 2e9}[code]
+		if amt == 0 {
+			return nil // 000001 等无记录 -> DATA_INSUFFICIENT(保留标记, 不 FAIL)
+		}
+		rows := make([]DailyAmountRow, advWindow)
+		for i := range rows {
+			rows[i] = DailyAmountRow{Amount: amt}
+		}
+		return rows
+	}
 	f.fundCodes = []string{"510300", "159915", "511990"} // 最后一个是货币ETF(badKW 无"债/货币"名, 见 snaps)
 	f.fundSnaps = []FundSnapshot{
 		{Code: "510300", Name: "沪深300ETF", Price: 4, Amount: 8e9},
