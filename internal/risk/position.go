@@ -39,13 +39,13 @@ func DefaultConfig() Config {
 
 // PositionRequest 仓位计算输入。
 type PositionRequest struct {
-	TotalAssets    float64 // 账户总资产（现金+冻结+持仓市值）
-	AvailableCash  float64 // 可用现金
-	HeldValue      float64 // 该票当前持仓市值（加仓时传入，用于单票上限约束）
-	EntryPrice     float64 // 计划买入价（一般用最新收盘价或昨收）
-	EffectiveStop  float64 // 实际风控线 = max(stop_loss, invalidation)，Step 1 契约
-	GlobalMaxPct   float64 // BEAR 市总仓位闸门（0 表示不启用，用 1.0）
-	Confidence     int     // LLM 信心分 0-100：<60 视为观察，不允许建仓
+	TotalAssets   float64 // 账户总资产（现金+冻结+持仓市值）
+	AvailableCash float64 // 可用现金
+	HeldValue     float64 // 该票当前持仓市值（加仓时传入，用于单票上限约束）
+	EntryPrice    float64 // 计划买入价（一般用最新收盘价或昨收）
+	EffectiveStop float64 // 实际风控线 = max(stop_loss, invalidation)，Step 1 契约
+	GlobalMaxPct  float64 // BEAR 市总仓位闸门（0 表示不启用，用 1.0）
+	Confidence    int     // LLM 信心分 0-100：<60 视为观察，不允许建仓
 }
 
 // PositionResult 仓位计算输出（quantity 为最终硬编码结果，LLM 无权覆盖）。

@@ -33,9 +33,41 @@ const (
 	StatusFailed       SourceStatus = "FAILED"        // 取数失败（禁止当作空通过）
 )
 
-// Usable 报告该状态的数据是否可参与筛选判定。
-// STALE 可用但调用方应记 warning；FAILED 绝对不可用。
-func (s SourceStatus) Usable() bool { return s != StatusFailed }
+// IsKnown 报告状态是否为契约定义的合法枚举值。
+// 空串与未定义字符串一律 false —— 闸门不得把无法确认的状态当作通过。
+func (s SourceStatus) IsKnown() bool {
+	switch s {
+	case StatusOK, StatusSuccessEmpty, StatusPartial, StatusStale, StatusFailed:
+		return true
+	default:
+		return false
+	}
+}
+
+// IsCompleteSuccess 报告本次刷新是否"完整成功"（全量成功或确认的空结果）。
+// PARTIAL（只取到部分数据）与 STALE（非当前时点数据）均不算完整。
+func (s SourceStatus) IsCompleteSuccess() bool {
+	return s == StatusOK || s == StatusSuccessEmpty
+}
+
+// CanGenerateFreshSignal 报告该状态是否允许产生新交易信号。
+// 仅最新、完整且成功的数据（OK）可以；SUCCESS_EMPTY 只代表"本次没有候选",
+// 不是"存在合格候选"，不得放行信号。
+func (s SourceStatus) CanGenerateFreshSignal() bool {
+	return s == StatusOK
+}
+
+// CanUpdateLifecycle 报告能否依据"本次未命中"推进自动来源生命周期。
+// 只有完整刷新（OK / SUCCESS_EMPTY）才能据此过期旧记录；FAILED/PARTIAL/STALE
+// 时必须保留历史, 防止一次拉取失败误清有效来源。
+func (s SourceStatus) CanUpdateLifecycle() bool {
+	return s.IsCompleteSuccess()
+}
+
+// Usable 闸门白名单语义（阶段 0 审查 P0-1 修复）：
+// 任何闸门逻辑不得把非 OK/SUCCESS_EMPTY 的状态当作通过。
+// 旧实现 `s != StatusFailed` 会把 PARTIAL/STALE/""/未定义状态全部放行, 属契约冲突。
+func (s SourceStatus) Usable() bool { return s.IsCompleteSuccess() }
 
 // ---------------------------------------------------------------------------
 // 固定枚举：证券资格 / 流动性 / 财务状态
@@ -48,7 +80,7 @@ type EligibilityStatus string
 const (
 	EligPass    EligibilityStatus = "PASS"    // 明确具备资格
 	EligBlocked EligibilityStatus = "BLOCKED" // 明确不具备（ST/退市整理/暂停上市）
-	EligUnknown EligibilityStatus = "UNKNOWN" // 主数据缺失 -> 按策略放行并计入统计
+	EligUnknown EligibilityStatus = "UNKNOWN" // 主数据缺失：保留观察记录, 但不得默认通过证券资格或可执行交易检查（tradability 必须为 UNKNOWN, 见 ComputeTradability）
 )
 
 // LiquidityStatus 流动性闸门结果。DATA_INSUFFICIENT 表示样本不足无法计算 ADV，
@@ -117,7 +149,8 @@ func Params() Config {
 	// SectorTopN=3, SectorLeadersK(SectorTopK)=3      已一致
 	// ETFTopM=8                                        已一致
 	// FundFlowMinNetBuy(LHBMinNetBuy)=5000万=5e7       已一致
-	// FundFlowMinMarketCap(MinMarketCap)=50亿=5e9      已一致
+	// FundFlowMinMarketCap(FundFlowMinMarketCap)=50亿=5e9   已一致（FUND 来源单独叠加）
+	// MinAvgAmount=契约 StockMinADV20(5e7); MinMarketCap(流动性初筛)=5e8(5亿, Go 层新增口径)
 	// StockMinPrice(MinPrice)=1元                      已一致
 	// MinListingTradingDays=120个有效交易日; 当前 MinListedDays=120 自然日,
 	//   自然日≈交易日*1.4, 阶段 1 由主数据 Provider 提供交易日计数后收紧。
@@ -137,7 +170,7 @@ func Params() Config {
 const (
 	ContractStockMinADV20  = 5e7 // 元
 	ContractETFMinADV20    = 2e7 // 元
-	ContractETFHistoryBars = 90  // ETF 日线观察窗口（当前 ETFLookback=60, 阶段 1 扩至 90）
+	ContractETFHistoryBars = 90  // ETF 日线观察窗口（DefaultConfig.ETFLookback 已对齐此值）
 )
 
 // StrategyVersion 策略版本标识（阶段 8: daily_stock_metrics/screening_runs 的口径键）。

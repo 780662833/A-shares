@@ -34,6 +34,11 @@ type fakeProvider struct {
 	// 阶段3: nil -> 复用 stockBars 生成合法 OHLC；可注入异常 K 线
 	barsOHLC  func(code string, lookback int) []barOHLC
 	indexBars func(indexCode string, lookback int) []DailyBar
+	// sectorIndexBars: 行业指数 K 线钩子（按行业名）。nil -> 复用 indexBars；
+	// 返回 nil 切片配合 indexBarsErr 可模拟"行业侧取数失败"（诚实降级为无法确认）。
+	sectorIndexBars func(sectorName string, lookback int) []DailyBar
+	// indexBarsErr: 非宽基指数请求的注入错误（模拟行业指数取数失败, 走 error 契约而非 panic）。
+	indexBarsErr error
 }
 
 func newFake() *fakeProvider {
@@ -121,6 +126,14 @@ func (f *fakeProvider) StockBars(ctx context.Context, code string, lookback int,
 
 func (f *fakeProvider) IndexBars(ctx context.Context, indexCode string, lookback int, end time.Time) ([]DailyBar, error) {
 	func() { f.mu.Lock(); defer f.mu.Unlock(); f.calls["IndexBars:"+indexCode]++ }()
+	// 行业指数请求（非宽基代码）优先走 sectorIndexBars 钩子，允许测试把
+	// 行业侧与宽基侧构造为不同序列（RS20_sector 硬门槛专项用例需要）。
+	if f.sectorIndexBars != nil && indexCode != "000300" && indexCode != "" {
+		return f.sectorIndexBars(indexCode, lookback), nil
+	}
+	if f.indexBarsErr != nil && indexCode != "000300" && indexCode != "" {
+		return nil, f.indexBarsErr
+	}
 	if f.indexBars != nil {
 		return f.indexBars(indexCode, lookback), nil
 	}
@@ -154,11 +167,11 @@ func TestLiquidityScreen(t *testing.T) {
 		quote("600002", "ST杂毛", 10, 5e8, 1e11),   // ST 剔除
 		quote("600003", "仙股", 0.5, 5e8, 1e11),    // 价格剔除
 		quote("600004", "缩量股", 10, 1e6, 1e11),    // 成交额剔除
-		quote("600005", "微盘股", 10, 5e8, 1e9),     // 市值剔除
+		quote("600005", "微盘股", 10, 5e8, 4e8),     // 市值剔除（< 5 亿初筛门槛）
 		{Code: "abc123", Name: "非法代码", Price: 10, AvgAmount20D: 5e9},
 	}
 	g := NewGenerator(f, DefaultConfig())
-	set, n, err := g.liquidityScreen(context.Background())
+	set, _, n, err := g.liquidityScreen(context.Background())
 	if err != nil {
 		t.Fatalf("unexpected err: %v", err)
 	}
@@ -171,7 +184,7 @@ func TestLiquidityScreenEmptySetDegenerates(t *testing.T) {
 	f := newFake()
 	f.stocks = []StockQuote{quote("600004", "缩量股", 10, 1e6, 1e11)} // 全军覆没
 	g := NewGenerator(f, DefaultConfig())
-	set, _, err := g.liquidityScreen(context.Background())
+	set, _, _, err := g.liquidityScreen(context.Background())
 	if err == nil || set != nil {
 		t.Fatalf("want err + nil set on zero-pass, got set=%v err=%v", set, err)
 	}
@@ -180,12 +193,12 @@ func TestLiquidityScreenEmptySetDegenerates(t *testing.T) {
 func TestLiquidityTopNTruncation(t *testing.T) {
 	f := newFake()
 	for i := 0; i < 50; i++ {
-		f.stocks = append(f.stocks, quote(fmt.Sprintf("6000%02d", i), fmt.Sprintf("股%d", i), 10, float64(i+1)*1e8, 1e11))
+		f.stocks = append(f.stocks, quote(fmt.Sprintf("6000%02d", i), fmt.Sprintf("股%d", i), 10, float64(i+2)*1e8, 1e11))
 	}
 	cfg := DefaultConfig()
 	cfg.LiquidityTopN = 10
 	g := NewGenerator(f, cfg)
-	set, n, err := g.liquidityScreen(context.Background())
+	set, _, n, err := g.liquidityScreen(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -389,9 +402,10 @@ func TestMomentumPct(t *testing.T) {
 
 func TestIsETFCodeAndNormalize(t *testing.T) {
 	for c, want := range map[string]bool{"510300": true, "159915": true, "561100": true, "588000": true,
-		"164900": true, "600519": false, "300750": false, "123456": false} {
-		if got := isETFCode(c); got != want {
-			t.Errorf("isETFCode(%s)=%v want %v", c, got, want)
+		"164900": false, "600519": false, "300750": false, "123456": false,
+		"sh510300": false, "15991": false, "1599155": false} {
+		if got := IsETFCode(c); got != want {
+			t.Errorf("IsETFCode(%s)=%v want %v", c, got, want)
 		}
 	}
 	if normalizeCode("sh600519") != "600519" || normalizeCode(" 600519 ") != "600519" || normalizeCode("hk00700") != "" {
@@ -407,11 +421,26 @@ func TestSectorLeaderOrderingTopK(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.SectorLeadersK = 2
 	g := NewGenerator(f, cfg)
-	out, err := g.genSectorLeaders(context.Background(), map[string]bool{"600010": true, "600011": true, "600012": true})
+	// 无市值索引: 降级为价格降序 top2
+	out, err := g.genSectorLeaders(context.Background(), map[string]bool{"600010": true, "600011": true, "600012": true}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(out) != 2 || out[0].Symbol != "600012" || out[1].Symbol != "600011" {
 		t.Fatalf("want price-desc top2 [600012 600011], got %+v", out)
+	}
+
+	// 有市值索引: 按总市值降序（龙头口径优先市值）, 覆盖价格顺序
+	idx := map[string]StockQuote{
+		"600010": quote("600010", "A", 5, 5e8, 3e12), // 市值最大
+		"600011": quote("600011", "B", 15, 5e8, 1e12),
+		"600012": quote("600012", "C", 25, 5e8, 2e12),
+	}
+	out, err = g.genSectorLeaders(context.Background(), map[string]bool{"600010": true, "600011": true, "600012": true}, idx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out) != 2 || out[0].Symbol != "600010" || out[1].Symbol != "600012" {
+		t.Fatalf("want cap-desc top2 [600010 600012], got %+v", out)
 	}
 }

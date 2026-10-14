@@ -2,6 +2,7 @@ package pool
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -33,6 +34,11 @@ func refineCfg() Config {
 	c.RequirePositiveEPS = true
 	c.MinROE = 0
 	c.RSWindow = 60
+	// 显式双窗口（20/60）: 契约默认口径, 夹具不依赖 DefaultConfig 的内部默认值,
+	// 避免"配置解析回落"与"窗口取值"两件事在同一用例里耦合（此前长窗未设置时
+	// 解析回落为短窗同值, 触发单窗口退化路径, 使双窗口用例失真）。
+	c.RSShortWindow = 20
+	c.RSLongWindow = 60
 	c.RSEnabled = true
 	c.RSTopK = 0
 	return c
@@ -154,10 +160,8 @@ func TestRefineMinROEThreshold(t *testing.T) {
 
 func TestRefineRSSortTopKAndFuse(t *testing.T) {
 	// 阶段 5 双窗口口径下, 本用例固定单窗口退化模式（长期窗口=短期窗口）,
-	// 使总分 = R20 超额收益, 与旧断言保持同一数值基准。
-	// 注意: RSShortWeightPct 归一化发生在"两个窗口各自可得且都有基准"时;
-	// longWin==shortWin 时两窗口值相同, 但为避免权重(60%)污染纯短窗口语义,
-	// 将短窗权重置 100% —— 总分 = 1.0*R20超额 + 0*R60超额 = R20 超额。
+	// 使中间态总分 = R20 超额收益；最终 RankScore 由阶段 7 四因子百分位口径覆盖
+	// （断言已迁移为百分位口径, 见 README §12.2）。
 	f := newFake()
 	f.qualify = func(code string) *StockQualification {
 		return qual("2020-01-01", 1, 5)
@@ -166,21 +170,26 @@ func TestRefineRSSortTopKAndFuse(t *testing.T) {
 	f.indexBars = func(idx string, lookback int) []DailyBar {
 		return mkFlat(61, 110, 100, 100) // 端点固定 +10 -> RS=+20/+10/-15 精确可断言
 	}
+	// 行业指数显式置为不可得：本用例验证"行业侧未确认 → 最高归 B"契约。
+	// fake 的 IndexBars 在未注入 sectorIndexBars 时会把行业名请求复用到宽基
+	// indexBars(+10%)，使 RS20_sector 被伪确认为正、A 门槛失真；真实供应商按
+	// 行业名取数失败返回 error——这里用 error 注入模拟取数失败（符合 Go 错误
+	// 处理契约, refinePool 行业侧对 err != nil 诚实降级为 nil"无法确认"）。
+	f.sectorIndexBars = func(name string, lookback int) []DailyBar { return nil }
+	f.indexBarsErr = errors.New("sector unavailable")
 	f.stockBars = func(code string, lookback int) []DailyBar {
 		switch code {
 		case "600001":
-			return mkFlat(61, 13, 10, 10) // R20/R60 端点固定 +30 -> RS=+20
+			return mkFlat(61, 13, 10, 10) // R20 +30 / R60 +30 -> RS_index=+20
 		case "600002":
-			return mkFlat(61, 12, 10, 10) // +20 -> RS=+10
+			return mkFlat(61, 12, 10, 10) // R20 +20 / R60 +20 -> RS_index=+10
 		case "600003":
-			return mkFlat(61, 9.5, 10, 10) // -5 -> RS=-15
+			return mkFlat(61, 9.5, 10, 10) // R20 -5 / R60 -5 -> RS_index=-15
 		}
 		return nil
 	}
 	cfg := refineCfg()
-	cfg.RSShortWindow = 20
-	cfg.RSLongWindow = 20 // 单窗口退化: 总分 = R20 超额
-	cfg.RSShortWeightPct = 100 // longWin==shortWin, 权重置满使总分=R20超额(见上方注释)
+	cfg.RSLongWindow = 20 // 单窗口退化: 中间分 = R20 超额（长窗端点样本不足）
 	poolIn := []AggEntry{
 		entryOf("600003", sourceSector),
 		entryOf("600001", sourceFund),
@@ -191,18 +200,52 @@ func TestRefineRSSortTopKAndFuse(t *testing.T) {
 	if len(out) != 4 {
 		t.Fatalf("no topk: want 4, got %+v", out)
 	}
-	// 非股票条目保持在前, 股票类按 RS 降序整体插到其后
+	bySym := map[string]AggEntry{}
+	for _, e := range out {
+		bySym[e.Symbol] = e
+	}
+	a, b, c := bySym["600001"], bySym["600002"], bySym["600003"]
+	// 路径判定（契约语义, 与旧版数值基准一致）：
+	//   600001: R20>0 ∧ RS20_index>0 ∧ 行业侧未确认 → B（修复候选段首位）
+	//   600002: 同上但 RS 弱一档 → B（第二段）
+	//   600003: R20<0 → NONE（不满足 B 共同准入），落其余段但仍参与打分排序
+	if a.Strength != StrengthB || b.Strength != StrengthB {
+		t.Errorf("600001/600002 want B (short-strong vs index, sector unconfirmed), got %v/%v", a.Strength, b.Strength)
+	}
+	if c.Strength != StrengthNone {
+		t.Errorf("600003 want NONE (R20<0 fails B admission), got %v", c.Strength)
+	}
+	// 分段输出顺序：非股票直通段(ETF/MANUAL)保持原相对顺序整体在前，
+	// 其后为股票类分段 A → B → NONE（refinePool 池重组契约）。
 	if out[0].Symbol != "510300" {
-		t.Errorf("ETF must keep head position, got %+v", out)
+		t.Errorf("want pass-through ETF first, got %v", out[0].Symbol)
 	}
-	if out[1].Symbol != "600001" || out[2].Symbol != "600002" || out[3].Symbol != "600003" {
-		t.Errorf("want RS desc [600001 600002 600003], got %+v", out)
+	if out[1].Symbol != "600001" || out[2].Symbol != "600002" {
+		t.Errorf("want B-segment order [600001 600002], got [%v %v]", out[1].Symbol, out[2].Symbol)
 	}
-	if out[1].RSScore < 19.9 || out[1].RSScore > 20.1 {
-		t.Errorf("RS score want ~20, got %v", out[1].RSScore) // RSScore: 阶段5 RS 双窗口加权快照(百分位精化不改写)
+	if out[3].Symbol != "600003" {
+		t.Errorf("want tail NONE-segment [600003], got %v", out[3].Symbol)
 	}
-	if out[1].RankPos != 1 || out[3].RankPos != 3 {
-		t.Errorf("rank pos wrong: %v %v", out[1].RankPos, out[3].RankPos)
+	// 百分位口径终裁（n=3, midrank, P=(rank-1)/(n-1)*100）：
+	//   RS20_index 超额 20/10/-15 全互异 → P ∈ {100, 50, 0}；
+	//   R60（单窗口退化复用短窗原始收益）30/20/-5 → P ∈ {100, 50, 0}；
+	//   行业侧与 ADV 不可得 → 权重归一后 Score = 0.7*P(RS)+0.3*P(R60)。
+	//   600001 = 0.7*100+0.3*100 = 100；600002 = 50；600003 = 0。
+	if a.RankScore < 99.9 || a.RankScore > 100.1 {
+		t.Errorf("percentile score want ~100 (top of both factors), got %v", a.RankScore)
+	}
+	if b.RankScore < 49.9 || b.RankScore > 50.1 {
+		t.Errorf("percentile score want ~50 (midrank p50), got %v", b.RankScore)
+	}
+	if c.RankScore < -0.1 || c.RankScore > 0.1 {
+		t.Errorf("percentile score want ~0 (bottom of both factors), got %v", c.RankScore)
+	}
+	// RankPos 只对打分股票连续编号（B 段 1/2, NONE 参与打分排 3, ETF 不编号）
+	if a.RankPos != 1 || b.RankPos != 2 || c.RankPos != 3 {
+		t.Errorf("rank pos wrong: %v %v %v", a.RankPos, b.RankPos, c.RankPos)
+	}
+	if bySym["510300"].RankPos != 0 {
+		t.Errorf("ETF must stay unnumbered, got %v", bySym["510300"].RankPos)
 	}
 
 	// TopK 分层保留（TieredPipeline=true 默认口径）：RSTopK 是"确认队列名额"而非
@@ -363,6 +406,20 @@ func mkOHLCFromDaily(bars []DailyBar) []barOHLC {
 	return out
 }
 
+// mkAmounts 生成 n 行成交额序列：前段固定 base，尾部 m 行为 last（下标按尾部定位）。
+// 用于构造 ADV20 因子可区分的流动性夹具（liquidityGatePool 只看最近 advWindow=20 行）。
+func mkAmounts(n int, base, last float64, tail int) []DailyAmountRow {
+	rows := make([]DailyAmountRow, 0, n)
+	for i := 0; i < n; i++ {
+		v := base
+		if i >= n-tail {
+			v = last
+		}
+		rows = append(rows, DailyAmountRow{Amount: v})
+	}
+	return rows
+}
+
 // runRefineDual 以显式短/长窗口执行精筛（仅供测试构造退化场景；传 0 走配置解析）。
 func runRefineDual(t *testing.T, f *fakeProvider, cfg Config, pool []AggEntry, shortWin, longWin int) ([]AggEntry, []string) {
 	t.Helper()
@@ -393,8 +450,11 @@ func TestRefineDualWindowWeightedScore(t *testing.T) {
 		t.Fatalf("entry must survive, got %d", len(out))
 	}
 	e := out[0]
-	if e.RSScore < 3.5 || e.RSScore > 3.7 {
-		t.Fatalf("dual-window weighted score want ~3.6, got %v", e.RSScore) // RSScore: 阶段5 RS 加权快照(RankScore 已被百分位口径重写)
+	// README §12.2 断言口径迁移：RankScore 已从旧线性加权总分(0.6*10+0.4*(-6)=3.6)
+	// 改为四因子百分位合成（0-100）。单样本不构成分布，百分位恒取中位锚 50；
+	// 加权总分的符号语义改由窗口超额中间量断言承载（见下），路径判定不受总分影响。
+	if e.RankScore != 50 {
+		t.Fatalf("single-sample percentile anchor want 50, got %v", e.RankScore)
 	}
 	if e.RetShortExcess == nil || *e.RetShortExcess < 9.9 || *e.RetShortExcess > 10.1 {
 		t.Errorf("want R20 excess ~10, got %v", e.RetShortExcess)
@@ -417,15 +477,20 @@ func TestRefineStrengthPathSemantics(t *testing.T) {
 	f.indexBars = func(idx string, lookback int) []DailyBar {
 		return mkFlat(61, 100, 100, 100)
 	}
+	// 行业指数 K 线: "测试" 行业 R20 = +20%（bars[n-21]=82.5 -> 99/82.5-1=+20）。
+	// 刻意让最强个股 600001（R20=+10）跑输行业（RS20_sector=-10），验证 A 路径的
+	// RS20_sector>0 硬门槛——行业侧确认不过关时必须诚实降级 B（契约 6.2: 未知或为
+	// 负都不进 A），绝不允许"排名列前即 A"。
+	f.sectorIndexBars = func(name string, lookback int) []DailyBar {
+		return mkFlat(61, 99, 82.5, 82.5)
+	}
 	f.stockBars = func(code string, lookback int) []DailyBar {
 		switch code {
-		case "600001": // R20 +10, R60 +10 -> 总分 +10, 短期超额正, 排名1 -> A
+		case "600001": // R20 +10, R60 +10 -> 短期超额正 -> B（行业侧 -10 否决 A）
 			return mkFlat(61, 110, 100, 100)
-		case "600002": // R20 -5, R60 +20 -> 总分 0.6*(-5)+0.4*20=5
-			// 契约锁定(classifyPathA_B): A/B 共同准入要求 R20>0 且 RS20_index>0 二者皆正;
-			// R20≤0 的"仅中期强"属 L2 震荡档分类特征, 不是路径资格 -> NONE(保留研究观察)。
+		case "600002": // R20 -5, R60 +20 -> 短期超额负 -> NONE（B 需 R20 与 RS20_index 皆正）
 			return mkFlat(61, 120, 126.316, 100) // 120/126.316-1=-5%, 120/100-1=+20%
-		case "600003": // R20 -10, R60 -10 -> 总分 -10 -> NONE
+		case "600003": // R20 -10, R60 -10 -> 双窗皆弱 -> NONE
 			return mkFlat(61, 90, 100, 100)
 		}
 		return nil
@@ -441,16 +506,18 @@ func TestRefineStrengthPathSemantics(t *testing.T) {
 	for _, e := range out {
 		byCode[e.Symbol] = e
 	}
-	if byCode["600001"].Strength != StrengthA {
-		t.Errorf("600001 want A, got %v (score %v)", byCode["600001"].Strength, byCode["600001"].RankScore)
+	if byCode["600001"].Strength != StrengthB {
+		t.Errorf("600001 want B (short-strong vs index but sector unconfirmed-negative), got %v (score %v)", byCode["600001"].Strength, byCode["600001"].RankScore)
 	}
 	if byCode["600002"].Strength != StrengthNone {
-		t.Errorf("600002 want NONE (R20≤0, B需R20与RS20_index皆正——契约锁定), got %v (score %v)", byCode["600002"].Strength, byCode["600002"].RankScore)
+		t.Errorf("600002 want NONE (R20 excess negative fails B admission), got %v (score %v)", byCode["600002"].Strength, byCode["600002"].RankScore)
 	}
 	if byCode["600003"].Strength != StrengthNone {
 		t.Errorf("600003 want NONE (both windows weak), got %v", byCode["600003"].Strength)
 	}
-	// 排序按总分降序: 600001(+10) > 600002(+5) > 600003(-10)
+	// 分段序 A→B→其余 + 段内按四因子百分位分降序连续编号：
+	// 600001(B, P(RS)=100/P(R60)=100 -> 100) RankPos=1；
+	// 600002(NONE, P(RS)=50/P(R60)=100 -> 75) RankPos=2；600003(全末位 -> 0) RankPos=3。
 	if byCode["600001"].RankPos != 1 || byCode["600002"].RankPos != 2 || byCode["600003"].RankPos != 3 {
 		t.Errorf("rank pos wrong: %+v", []int{byCode["600001"].RankPos, byCode["600002"].RankPos, byCode["600003"].RankPos})
 	}
@@ -505,8 +572,13 @@ func TestRefineSingleWindowDegeneration(t *testing.T) {
 	if !e.Scored {
 		t.Fatalf("should score with available short window only")
 	}
-	if e.RSScore < 9.9 || e.RSScore > 10.1 {
-		t.Errorf("single-window degeneration want score=R20 excess ~10, got %v", e.RSScore) // RSScore: 阶段5 快照口径
+	// README §12.2 断言口径迁移：单窗口退化下 RankScore 不再是"短窗超额原值(~10)"，
+	// 而是百分位口径（n==1 恒取中位锚 50）；超额数值本身由 RetShortExcess 断言承载。
+	if e.RankScore != 50 {
+		t.Errorf("single-window degeneration want percentile anchor 50, got %v", e.RankScore)
+	}
+	if e.RetShortExcess == nil || *e.RetShortExcess < 9.9 || *e.RetShortExcess > 10.1 {
+		t.Errorf("want R20 excess ~10, got %v", e.RetShortExcess)
 	}
 	if e.RetLongExcess != nil {
 		t.Errorf("long excess must stay nil when long window unavailable, got %v", *e.RetLongExcess)
@@ -536,8 +608,11 @@ func TestRefineInvalidWindowsFallback(t *testing.T) {
 		t.Fatalf("entry must survive, got %d", len(out))
 	}
 	e := out[0]
-	if e.RSScore < 19.9 || e.RSScore > 20.1 {
-		t.Errorf("invalid config must fall back to contract defaults (20/60), score want ~20 (0.6*30+0.4*5), got %v", e.RSScore) // RSScore: 阶段5 RS 加权快照(RankScore 已被百分位口径重写)
+	// README §12.2 断言口径迁移：回落正确性不再用旧线性加权总分(~20)验证，
+	// 而由窗口超额中间量直接证明（short=90 未回落时短窗样本不足, R20 超额将为 nil）；
+	// RankScore 为百分位口径, n==1 恒取中位锚 50。
+	if e.RankScore != 50 {
+		t.Errorf("want percentile anchor 50 (n==1), got %v", e.RankScore)
 	}
 	if e.RetShortExcess == nil || *e.RetShortExcess < 29.9 || *e.RetShortExcess > 30.1 {
 		t.Errorf("want R20 excess ~30 after fallback, got %v", e.RetShortExcess)

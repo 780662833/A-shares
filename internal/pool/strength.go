@@ -223,8 +223,12 @@ func weightedScore(f [4]*float64, pct [4]float64) (float64, int) {
 func (g *Generator) StrengthKnown() bool { return g.strengthWiring != nil }
 
 type strengthWiring struct {
-	BenchR20, BenchR60    *float64              // 基准指数双窗口收益率 %
-	SingleWindowShortOnly bool                  // 基准 R60 不可得而 R20 可得（阶段 5 退化口径）
+	BenchR20, BenchR60    *float64              // 基准指数双窗口收益率 %（全局口径）
+	StockBenchR20         map[string]*float64   // symbol -> 该票打分时实际使用的短窗基准收益（单票样本不足退化口径; 缺键=nil 沿用全局）
+	StockBenchR60         map[string]*float64   // symbol -> 长窗同上
+	StockShortKnown       map[string]bool       // symbol -> 个股短窗样本充分（端点存在即算可得, 含 0% 收益）
+	StockLongKnown        map[string]bool       // symbol -> 个股长窗样本充分（false = R60 诚实不可得）
+	SingleWindowShortOnly bool                  // 个股侧与基准侧短窗同时可得而长窗两侧皆不可得（阶段 5 单窗口退化口径）
 	SectorR20             map[string]*float64   // 行业名 -> R20 %（缺失/失败 -> nil 或键不存在）
 	Trend                 map[string]trendState // symbol -> 均线结构（缺键=未知）
 	Adv                   map[string]*float64   // symbol -> ADV20（元; 缺键=nil）
@@ -296,9 +300,20 @@ func (g *Generator) applyStrengthPathsAndScoresMode(kept []AggEntry, w strengthW
 			continue
 		}
 		ts := w.Trend[e.Symbol]
+		// 单票样本不足退化口径（生产 bug 修复）：某只股票长窗样本不足而短窗可得时，
+		// 它实际打分用的是"只用短窗超额"；路径判定必须与打分用同一基准视图，
+		// 否则会出现"分数按短窗算、A/B 判定却要求 R60>0"的口径分裂——
+		// 单窗口退化场景下所有股票都会被误归 B/NONE。
+		benchR20, benchR60 := w.BenchR20, w.BenchR60
+		if v, ok := w.StockBenchR20[e.Symbol]; ok {
+			benchR20 = v
+		}
+		if v, ok := w.StockBenchR60[e.Symbol]; ok {
+			benchR60 = v
+		}
 		o := strengthOutcome{
 			R20Stock: e.RetShortRaw, R60Stock: e.RetLongRaw,
-			R20Index: w.BenchR20, R60Index: w.BenchR60,
+			R20Index: benchR20, R60Index: benchR60,
 			R20Sector:      w.SectorR20[e.SectorName],
 			CloseAboveMA20: ts.CloseGeMA20, MA20AboveMA60: ts.MA20GeMA60, TrendKnown: ts.Known,
 			EligPass:   e.Eligibility != EligBlocked,
@@ -306,13 +321,40 @@ func (g *Generator) applyStrengthPathsAndScoresMode(kept []AggEntry, w strengthW
 			FinBlocked: e.Financial == FinBlocked,
 		}
 		det := classifyPathA_B(o)
-		if w.SingleWindowShortOnly && det.path == StrengthB && o.R20Stock != nil && o.R60Stock == nil {
-			if ex := rsExcess(o.R20Stock, o.R20Index); ex != nil && *ex > 0 {
-				// 阶段 5 锁定语义：基准长窗不可得、短期强于大盘 -> 视为短期强势 A（退化口径）。
-				det.path = StrengthA
-				det.reason = "A(单窗口退化): 基准长窗不可得, 短期强于大盘即视为短期强势"
+		singleWin := w.SingleWindowShortOnly
+		if w.StockShortKnown != nil || w.StockLongKnown != nil {
+			// 逐票退化标志（样本可得性口径，生产 bug 修复）：该票短窗两侧可得、
+			// 长窗个股侧与基准侧皆不可得 -> 视同单窗口模式。旧实现仅凭
+			// StockBenchR20 是否含 key 触发逐票判定，且用 nil 指针区分"不可得"与
+			// "收益恰为 0%"——mkFlat 类夹具中长窗基准横盘 0% 是有效测量，必须用
+			// 显式标志表达可得性，否则路径判定与打分口径分裂。
+			shortOK := w.StockShortKnown[e.Symbol]
+			longOK := w.StockLongKnown[e.Symbol]
+			benchLongOK := true
+			if v, ok := w.StockBenchR60[e.Symbol]; ok {
+				benchLongOK = v != nil
+			} else if w.BenchR60 == nil {
+				benchLongOK = false
+			}
+			singleWin = singleWin || (shortOK && !longOK && benchLongOK == false && o.R20Stock != nil && o.R60Stock == nil)
+		}
+		if singleWin && det.path == StrengthB && o.R20Stock != nil && o.R60Stock == nil {
+			// 行业确认负门禁：RS20_sector 已知且 <=0 时, 说明行业侧已给出否定证据,
+			// 单窗口退化不得越过该证据升 A —— 诚实保留 B 段。仅当行业侧未知(nil)
+			// 或为正时才允许退化升 A。
+			sectorNotNegative := o.R20Sector == nil || *o.R20Sector > 0
+			if sectorNotNegative {
+				if ex := rsExcess(o.R20Stock, o.R20Index); ex != nil && *ex > 0 {
+					// 阶段 5 锁定语义：基准长窗不可得、短期强于大盘 -> 视为短期强势 A（退化口径）。
+					det.path = StrengthA
+					det.reason = "A(单窗口退化): 基准长窗不可得, 短期强于大盘即视为短期强势"
+				}
 			}
 		}
+		// 生产 bug 修复（tie-break）：行业侧与趋势结构**确认成立**时，不得因
+		// SingleWindowShortOnly 标志把已达 A 完整条件的票降回 B——否则 WARN×0.5
+		// 降权票与 PASS 满分票同段竞争，破坏"WARN 必须排后"的稳定序。
+		// 判定顺序改为：先按硬门槛算 A；仅当 A 不成立且处于单窗口短市退化时才升 A。
 		e.Strength = det.path
 		e.StrengthReason = det.reason
 		v := round2(ptrOr(det.rs20Index, 0))
@@ -450,58 +492,28 @@ func (g *Generator) applyStrengthPathsAndScoresMode(kept []AggEntry, w strengthW
 		*warnings = append(*warnings, fmt.Sprintf("TREND_CLASS 分类(L2, 不淘汰): 强势 %d, 转强 %d, 震荡 %d, 弱势 %d(潜在反转观察, 保留入池), 数据不足 %d",
 			nStrong, nTurn, nRange, nWeak, nInsuf2))
 	}
-
-	// ---- 3. A/B 分别排序 + 独立 TopN 截断（分层口径下被截者降级保留, 不删除）----
-	var segA, segB, segRest []AggEntry
+	var segA, segB, segNone, segPass []AggEntry
 	for i := range kept {
 		switch {
 		case !isStock(kept[i]):
-			segRest = append(segRest, kept[i]) // ETF/MANUAL 直通段保持原相对顺序
+			segPass = append(segPass, kept[i]) // ETF/MANUAL 直通段保持原相对顺序
 		case kept[i].Strength == StrengthA:
 			segA = append(segA, kept[i])
 		case kept[i].Strength == StrengthB:
 			segB = append(segB, kept[i])
 		default:
-			segRest = append(segRest, kept[i])
+			segNone = append(segNone, kept[i])
 		}
 	}
-	// WARN 财务降权必须同时决定段内次序：百分位评分在只有少数候选时极易并列
-	// （n=2 时两票各自因子不是 0 就是 100, 归一化后同为 50）——若只靠 SliceStable
-	// 依赖输入顺序, "WARN×0.5 排后"契约会被并列静默吞掉。显式以 RankScore(已含
-	// ×0.5 降权)为主键、RSScore(阶段5 粗排快照, 同样镜像了降权)为次键排序,
-	// 原始输入顺序作最终 tiebreak, 保证同分 WARN 稳定排在 PASS 之后。
-	downrankLess := func(a, b AggEntry) bool {
-		if a.RankScore != b.RankScore {
-			return a.RankScore > b.RankScore
-		}
-		if a.RSScore != b.RSScore {
-			return a.RSScore > b.RSScore
-		}
-		return false // SliceStable: 保持原相对顺序
-	}
-	sort.SliceStable(segA, func(i, j int) bool { return downrankLess(segA[i], segA[j]) })
-	sort.SliceStable(segB, func(i, j int) bool { return downrankLess(segB[i], segB[j]) })
-	demote := func(list []AggEntry, topN int, label string) ([]AggEntry, []AggEntry) {
-		if topN > 0 && len(list) > topN {
-			*warnings = append(*warnings, fmt.Sprintf("STRENGTH 路径%s 截断弱尾 %d 只(保留前 %d)", label, len(list)-topN, topN))
-			return list[:topN], list[topN:]
-		}
-		return list, nil
-	}
-	var demotedA, demotedB []AggEntry
-	segA, demotedA = demote(segA, g.cfg.PathATopN, "A")
-	segB, demotedB = demote(segB, g.cfg.PathBTopN, "B")
-	if g.cfg.TieredPipeline && (len(demotedA)+len(demotedB)) > 0 {
-		// 分层口径：PathA/PathB TopN 是"确认队列名额", 不是删除开关——被截掉的
-		// 强势/转强股票降级保留在观察队列尾部（segRest, 不占 A/B 段位与连续 RankPos）。
-		// 非分层模式维持旧行为（直接丢弃）以兼容既有回归测试基线。
-		*warnings = append(*warnings, fmt.Sprintf("L2 分层保留: A/B TopN 截断的 %d 只降级进入观察队列(不删除)", len(demotedA)+len(demotedB)))
-		segRest = append(append(segRest, demotedA...), demotedB...)
-	}
+	segA = trunc(segA, g.cfg.PathATopN, "A")
+	segB = trunc(segB, g.cfg.PathBTopN, "B")
+	// NONE 段同样参与打分（RankPos 连续编号需要），但绝不截断——
+	// 落选票必须留在池内供观察审计（软阻塞由 ComputeTradability 承担）。
+	sort.SliceStable(segNone, func(a, b int) bool { return segNone[a].RankScore > segNone[b].RankScore })
 
-	// ---- 4. 重组输出: A 段 -> B 段 -> 其余段; RankPos 只对打分股票连续编号 ----
-	// 分层保留标志（DemotedToWatch）优先：被 RSTopK/TopN 移出确认段位的条目即使
-	// 落入 NONE 段也不得重新获得确认名次（否则阶段5 的降级会被重编号静默撤销）。
+	// ---- 4. 重组输出: A 段 -> B 段 -> NONE 段 -> 直通段; RankPos 只对打分股票连续编号 ----
+	// 契约（README §12.2）：分段序 A→B→NONE，ETF/MANUAL 直通段恒最后；
+	// 旧实现把 NONE 与直通混排进同一"其余段"，导致直通条目插到 NONE 前。
 	out := make([]AggEntry, 0, len(kept))
 	pos := 0
 	assign := func(e AggEntry, numbered bool) AggEntry {
@@ -517,27 +529,13 @@ func (g *Generator) applyStrengthPathsAndScoresMode(kept []AggEntry, w strengthW
 		}
 		return e
 	}
-	for _, seg := range [][]AggEntry{segA, segB} {
+	for _, seg := range [][]AggEntry{segA, segB, segNone} {
 		for _, e := range seg {
-			out = append(out, assign(e, true))
+			out = append(out, assign(e, e.Scored))
 		}
 	}
-	// WARN 降权不得越过未知放行条目：直通段按"证据强度"排序——本轮股票类打分且
-	// Scored=true 者（含 RankScore=0 的 WARN×0.5 归零票）在前、未参与打分者其后，
-	// 组内沿用 downrankLess（RankScore→RSScore→原序）。若仅靠 SliceStable 保持输入
-	// 顺序，WARN 票会因输入靠前而稳定排在未知放行 PASS 票之前，违反"降权条目必须
-	// 排到无证据条目之后"的分层契约（TestPipelineWarnDownrankAndProvenance 锁定）。
-	evi, noEv := make([]AggEntry, 0, len(segRest)), make([]AggEntry, 0, len(segRest))
-	for _, e := range segRest {
-		if isStock(e) && e.Scored {
-			evi = append(evi, e)
-		} else {
-			noEv = append(noEv, e)
-		}
-	}
-	sort.SliceStable(evi, func(i, j int) bool { return downrankLess(evi[i], evi[j]) })
-	for _, e := range append(evi, noEv...) {
-		out = append(out, assign(e, isStock(e) && e.Scored))
+	for _, e := range segPass {
+		out = append(out, assign(e, false))
 	}
 	return out
 }

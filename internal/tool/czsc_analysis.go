@@ -43,22 +43,22 @@ type CzscInput struct {
 
 // czscBi 单笔结构（只保留决策相关字段）。
 type czscBi struct {
-	Direction   string  `json:"direction"` // up / down
-	StartDt     string  `json:"start_dt"`
-	EndDt       string  `json:"end_dt"`
-	High        float64 `json:"high"`
-	Low         float64 `json:"low"`
-	Length      int     `json:"length"`
-	PowerPrice  float64 `json:"power_price"`
+	Direction  string  `json:"direction"` // up / down
+	StartDt    string  `json:"start_dt"`
+	EndDt      string  `json:"end_dt"`
+	High       float64 `json:"high"`
+	Low        float64 `json:"low"`
+	Length     int     `json:"length"`
+	PowerPrice float64 `json:"power_price"`
 }
 
 // czscZS 最近中枢。
 type czscZS struct {
-	Zg       float64 `json:"zg"`
-	Zd       float64 `json:"zd"`
-	StartDt  string  `json:"start_dt"`
-	EndDt    string  `json:"end_dt"`
-	BiCount  int     `json:"bi_count"`
+	Zg      float64 `json:"zg"`
+	Zd      float64 `json:"zd"`
+	StartDt string  `json:"start_dt"`
+	EndDt   string  `json:"end_dt"`
+	BiCount int     `json:"bi_count"`
 }
 
 // CzscSignal 一个买/卖点信号（导出别名：供 graph 包在候选池 JSON 降级解析时使用，
@@ -69,8 +69,8 @@ type CzscSignal = czscSignal
 // Phase A（Step 1 契约）扩展止损字段：stop_loss / invalidation / effective_stop /
 // pullback_low，供 Go 端 Layer3 仓位计算与持仓止损监控使用；旧网关响应缺省时为 0。
 type czscSignal struct {
-	Type          string  `json:"type"`           // 1B/2B/3B 或 1S/2S/3S
-	NameCn        string  `json:"name_cn"`        // 中文名，如 "第三类买点"
+	Type          string  `json:"type"`    // 1B/2B/3B 或 1S/2S/3S
+	NameCn        string  `json:"name_cn"` // 中文名，如 "第三类买点"
 	Price         float64 `json:"price"`
 	Dt            string  `json:"dt"`
 	Reason        string  `json:"reason"`
@@ -82,8 +82,8 @@ type czscSignal struct {
 
 // czscGatewayData 网关 data 字段。
 type czscGatewayData struct {
-	Symbol    string `json:"symbol"`
-	Freq      string `json:"freq"`
+	Symbol     string `json:"symbol"`
+	Freq       string `json:"freq"`
 	Structures struct {
 		BiCount int     `json:"bi_count"`
 		ZsCount int     `json:"zs_count"`

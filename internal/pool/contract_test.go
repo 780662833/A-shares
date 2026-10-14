@@ -7,7 +7,7 @@ import "testing"
 // ---------------------------------------------------------------------------
 
 func TestSourceStatusSemantics(t *testing.T) {
-	// SUCCESS_EMPTY 是正常空结果：可用（生成器据此产出合法空来源）
+	// SUCCESS_EMPTY 是正常空结果：闸门通过（生成器据此产出合法空来源）
 	if !StatusSuccessEmpty.Usable() {
 		t.Fatal("SUCCESS_EMPTY must be usable")
 	}
@@ -15,10 +15,51 @@ func TestSourceStatusSemantics(t *testing.T) {
 	if StatusFailed.Usable() {
 		t.Fatal("FAILED must never be usable")
 	}
-	for _, s := range []SourceStatus{StatusOK, StatusPartial, StatusStale} {
+	// 阶段 0 审查 P0-1: 闸门白名单语义 —— PARTIAL/STALE/未定义状态不得通过。
+	for _, s := range []SourceStatus{StatusOK} {
 		if !s.Usable() {
 			t.Fatalf("%s should be usable", s)
 		}
+	}
+	for _, s := range []SourceStatus{StatusPartial, StatusStale, SourceStatus(""), SourceStatus("WHATEVER")} {
+		if s.Usable() {
+			t.Fatalf("%q must NOT pass the gate (whitelist = OK/SUCCESS_EMPTY only)", s)
+		}
+	}
+}
+
+// TestSourceStatusPolicies 验证四种用途下的状态策略矩阵（阶段 0 审查 P0-1）。
+func TestSourceStatusPolicies(t *testing.T) {
+	tests := []struct {
+		name                string
+		status              SourceStatus
+		wantKnown           bool
+		wantComplete        bool
+		wantFreshSignal     bool
+		wantLifecycleUpdate bool
+	}{
+		{"完整成功", StatusOK, true, true, true, true},
+		{"成功空结果", StatusSuccessEmpty, true, true, false, true},
+		{"部分成功", StatusPartial, true, false, false, false},
+		{"数据过期", StatusStale, true, false, false, false},
+		{"获取失败", StatusFailed, true, false, false, false},
+		{"未知状态", SourceStatus(""), false, false, false, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.status.IsKnown(); got != tt.wantKnown {
+				t.Fatalf("IsKnown() = %v, want %v", got, tt.wantKnown)
+			}
+			if got := tt.status.IsCompleteSuccess(); got != tt.wantComplete {
+				t.Fatalf("IsCompleteSuccess() = %v, want %v", got, tt.wantComplete)
+			}
+			if got := tt.status.CanGenerateFreshSignal(); got != tt.wantFreshSignal {
+				t.Fatalf("CanGenerateFreshSignal() = %v, want %v", got, tt.wantFreshSignal)
+			}
+			if got := tt.status.CanUpdateLifecycle(); got != tt.wantLifecycleUpdate {
+				t.Fatalf("CanUpdateLifecycle() = %v, want %v", got, tt.wantLifecycleUpdate)
+			}
+		})
 	}
 }
 
@@ -35,8 +76,12 @@ func TestAmountUnitNormalization(t *testing.T) {
 	if p.LHBMinNetBuy != normalizeYiAmount(0.5) {
 		t.Fatalf("LHB threshold unit mismatch: %v vs %v", p.LHBMinNetBuy, normalizeYiAmount(0.5))
 	}
-	if p.MinMarketCap != normalizeYiAmount(50) {
-		t.Fatalf("market cap threshold unit mismatch: %v", p.MinMarketCap)
+	// FUND 来源契约市值门槛 = 50 亿（FundFlowMinMarketCap）; 流动性初筛 MinMarketCap = 5 亿为 Go 层新增口径
+	if p.FundFlowMinMarketCap != normalizeYiAmount(50) {
+		t.Fatalf("fund-flow market cap threshold unit mismatch: %v", p.FundFlowMinMarketCap)
+	}
+	if p.MinMarketCap != 5e8 {
+		t.Fatalf("liquidity screen market cap threshold mismatch: %v, want 5e8", p.MinMarketCap)
 	}
 	if formatYi(5e9) != "50.00亿" {
 		t.Fatalf("formatYi diag output wrong: %s", formatYi(5e9))
@@ -54,9 +99,10 @@ func TestParamsContractTable(t *testing.T) {
 		{"SectorTopN", float64(p.SectorTopN), 3},
 		{"SectorLeadersK", float64(p.SectorLeadersK), 3},
 		{"ETFTopM", float64(p.ETFTopM), 8},
-		{"FundFlowMinNetBuy", p.LHBMinNetBuy, 5e7},    // 5000 万元
-		{"FundFlowMinMarketCap", p.MinMarketCap, 5e9}, // 50 亿元
-		{"StockMinPrice", p.MinPrice, 1.0},            // 1 元
+		{"FundFlowMinNetBuy", p.LHBMinNetBuy, 5e7},            // 5000 万元
+		{"FundFlowMinMarketCap", p.FundFlowMinMarketCap, 5e9}, // 50 亿元（FUND 来源单独叠加）
+		{"LiquidityMinMarketCap", p.MinMarketCap, 5e8},        // 5 亿元（流动性初筛, Go 层新增口径）
+		{"StockMinPrice", p.MinPrice, 1.0},                    // 1 元
 		{"MinListingDays", float64(p.MinListedDays), 120},
 		{"RSWindow(R60)", float64(p.RSWindow), 60},
 	}

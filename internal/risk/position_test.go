@@ -96,7 +96,7 @@ func TestCalculatePosition_SingleCap(t *testing.T) {
 // BEAR 市全局闸门（决策 #3）: GlobalMaxPct=0.3 且无持仓时, 全局预算 30 万;
 // 若风险预算本身小于它则不生效。构造一个风险预算更大的场景验证 global 生效。
 func TestCalculatePosition_GlobalGate(t *testing.T) {
-	req := baseReq() // entry 100, stop 95 → qtyRisk = 20000 股 (市值 200 万, 被 single_cap 削到 2000)
+	req := baseReq()        // entry 100, stop 95 → qtyRisk = 20000 股 (市值 200 万, 被 single_cap 削到 2000)
 	req.GlobalMaxPct = 0.01 // BEAR 闸门: 全局最多 1% 总资产 = 1000 股 < single_cap 2000 → global 生效
 	res, err := CalculatePosition(req, DefaultConfig())
 	if err != nil {

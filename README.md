@@ -339,6 +339,31 @@ symbols 不是人工输入，是 Go 调度层自动收集的**任务边界**（�
 **Q6：requirements.txt 装不上 pandas==3.0.6？**
 按发布渠道核对可用版本；本仓库新闻模块已同时兼容 object 后端与 Arrow 后端两种情况。
 
+## 12. Go 候选池契约记录（internal/pool）
+
+### 12.1 阶段 0 代码审查修复（P0-1 ~ P0-5）
+
+- **P0-1 SourceStatus 闸门白名单**：废弃单一 `Usable()`，拆分为 `IsKnown` / `IsCompleteSuccess` / `CanGenerateFreshSignal` / `CanUpdateLifecycle` 四个策略谓词。仅 `OK` 可产生新信号；`SUCCESS_EMPTY` 表示"本次无候选"而非"通过筛选"；`PARTIAL`/`STALE`/未知状态一律不得穿过数据闸门。
+- **P0-2 Eligibility.UNKNOWN**：主数据缺失保留观察记录，但不得默认获得交易资格；`ComputeTradability` 对 UNKNOWN 阻断下单直至身份确认。
+- **P0-3 契约参数落实**：股票与 ETF 流动性阈值分离（`ContractStockMinADV20=5e7`、`ContractETFMinADV20=2e7`），`DefaultConfig()`/`Params()` 显式引用契约常量，环境变量覆盖统一走加载步骤。
+- **P0-4 金额单位换算**：换算只发生在适配层，逐字段登记原始单位（成交额万元→×1e4、总市值亿元→×1e8），禁止对所有字段套用同一转换函数；已是元口径不再二次转换。
+- **P0-5 上市天数口径**：`MinListedDays=120` 为自然日近似，与"有效交易日数"及"指标所需 K 线根数"三者语义分离，注释与校验函数各自标明适用对象。
+
+### 12.2 RankScore 断言口径迁移（线性加权分 → 百分位）
+
+评分口径已从旧版"双窗口线性加权总分（0.6·R20超额 + 0.4·R60超额，原值直接作为分数）"迁移为四因子百分位合成：
+
+```
+RankScore = 0.35·P(RS20_index) + 0.25·P(R60) + 0.25·P(RS20_sector) + 0.15·P(ADV20)   // 值域 0–100
+```
+
+配套规则（测试断言迁移依据）：
+
+1. **单样本中位锚**：百分位 `(rank-1)/(n-1)·100` 在 n==1 时分母为零，契约终裁取中位锚 **50**——一个样本不构成分布，既不给满分也不给零分，同时避免 WARN×0.5 并列破坏稳定序。因此凡池内唯一打分者的用例，期望值一律为 50（如 `TestRefineDualWindowWeightedScore` 旧期望 3.6、`TestRefineSingleWindowDegeneration` 旧期望 ~10、`TestRefineInvalidWindowsFallback` 旧期望 ~20 均已迁移）。
+2. **超额中间量承载数值语义**：旧断言中对"加权总分数值"的验证改由 `RetShortExcess` / `RetLongExcess` 中间量断言承担（窗口超额仍是原始百分比），配置回落正确性同样以超额是否为 nil/取值证明。
+3. **WARN 降权后置**：财务 WARN 的 ×0.5 降权必须在百分位合成后的最终分上重新施加，防止被后续打分吞没。
+4. **分段序契约**：输出恒为 A → B → NONE → 未打分直通段，同段内按 RankScore 降序、同分保持输入稳定序。
+
 ---
 
 *文档与代码同步基线：`main@6b4e808`（动态自选股池 Layer 0.5 接入调度链）。*

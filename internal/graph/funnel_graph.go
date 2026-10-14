@@ -48,22 +48,22 @@ import (
 // ---------------------------------------------------------------------------
 
 const (
-	NodeFetchPool        = "FetchPool"
-	NodeFetchNews        = "FetchNews"
-	NodeManagerDecision  = "ManagerDecision"
-	NodeSaveDecision     = "SaveDecision"
-	NodeRiskBudget       = "RiskBudget"  // Layer3: 风险预算仓位 + 大盘闸门硬校验
-	NodePlaceOrders      = "PlaceOrders" // Layer4: PENDING 订单落库（修复漏斗断链）
+	NodeFetchPool       = "FetchPool"
+	NodeFetchNews       = "FetchNews"
+	NodeManagerDecision = "ManagerDecision"
+	NodeSaveDecision    = "SaveDecision"
+	NodeRiskBudget      = "RiskBudget"  // Layer3: 风险预算仓位 + 大盘闸门硬校验
+	NodePlaceOrders     = "PlaceOrders" // Layer4: PENDING 订单落库（修复漏斗断链）
 )
 
 const (
-	keyTradeDate   = "trade_date"              // string: 复盘交易日 YYYY-MM-DD
-	keyPool        = "candidate_pool"          // []qtool.ScreenPoolHit
-	keyPoolJSON    = "candidate_pool_json"     // string: 候选池序列化 JSON（喂 LLM）
-	keyNewsCtx     = "news_context"            // map[string]string: symbol -> 新闻 JSON
-	keyNewsCtxJSON = "news_context_json"       // string: 新闻上下文序列化 JSON（喂 LLM）
-	keyDecisions   = "ai_decisions"            // []agent.DecisionItem: LLM 最终决策
-	keyDecisionIDs = "ai_decision_log_ids"     // []uint64: 落库主键（审计用）
+	keyTradeDate   = "trade_date"          // string: 复盘交易日 YYYY-MM-DD
+	keyPool        = "candidate_pool"      // []qtool.ScreenPoolHit
+	keyPoolJSON    = "candidate_pool_json" // string: 候选池序列化 JSON（喂 LLM）
+	keyNewsCtx     = "news_context"        // map[string]string: symbol -> 新闻 JSON
+	keyNewsCtxJSON = "news_context_json"   // string: 新闻上下文序列化 JSON（喂 LLM）
+	keyDecisions   = "ai_decisions"        // []agent.DecisionItem: LLM 最终决策
+	keyDecisionIDs = "ai_decision_log_ids" // []uint64: 落库主键（审计用）
 
 	// --- Layer3/4 新增信封字段（统一执行计划 Step 5）---
 	keyRiskPlans   = "risk_plans"              // []enrichedDecision: 风控回填止损+数量后的决策
@@ -114,11 +114,11 @@ type FunnelInput struct {
 
 // FunnelConfig 构建漏斗 Graph 所需的全部依赖。
 type FunnelConfig struct {
-	ChatModel    model.BaseChatModel // LLM（eino-ext openai 兼容），必填
-	DB           *gorm.DB            // 已 AutoMigrate 的数据库句柄，必填
-	GatewayURL   string              // Python 数据网关地址，必填
-	MaxLLMRetry  int                 // 决策 JSON 解析失败时的重试次数，默认 1
-	NewsConcurrency int             // 新闻抓取并发上限，默认 5（防网关/数据源压力）
+	ChatModel       model.BaseChatModel // LLM（eino-ext openai 兼容），必填
+	DB              *gorm.DB            // 已 AutoMigrate 的数据库句柄，必填
+	GatewayURL      string              // Python 数据网关地址，必填
+	MaxLLMRetry     int                 // 决策 JSON 解析失败时的重试次数，默认 1
+	NewsConcurrency int                 // 新闻抓取并发上限，默认 5（防网关/数据源压力）
 }
 
 // BuildFunnelGraph 按 START -> FetchPool -> FetchNews -> ManagerDecision -> SaveDecision -> END
@@ -452,11 +452,11 @@ func (sv gormDecisionSaver) SaveDecision(row *dbmodel.AIDecisionLog) error {
 
 // stopFields 候选池 czsc 信号中提取出的止损契约四字段 + 入场价（Step 1 契约）。
 type stopFields struct {
-	PullbackLow     float64
-	StopLoss        float64
-	Invalidation    float64
-	EffectiveStop   float64
-	EntryPrice      float64
+	PullbackLow   float64
+	StopLoss      float64
+	Invalidation  float64
+	EffectiveStop float64
+	EntryPrice    float64
 }
 
 // extractStops 从候选池一只股票的 buy_points[0] 提取止损字段。

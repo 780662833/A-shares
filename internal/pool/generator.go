@@ -6,7 +6,7 @@
 //
 // 迁移后新增能力：全市场流动性初筛（原 Layer 0 base_filter 的 Go 化）——
 //
-//	非 ST、收盘价 >= MinPrice、近 20 日均成交额(代理: 当日成交额) >= MinAvgAmount、
+//	非 ST、收盘价 >= MinPrice、近 20 日均成交额(代理: 当日成交额) > MinAvgAmount、
 //	总市值 >= MinMarketCap；初筛结果作为 SECTOR/FUND 两个资金流来源的前置门槛。
 //
 // 弱依赖原则保持不变：任一来源失败仅记入 warnings，不影响其余来源；
@@ -33,21 +33,19 @@ type Config struct {
 	SectorTopN     int     // 来源1: 资金净流入 Top N 行业板块（默认 3）
 	SectorLeadersK int     // 来源1: 每板块市值/价格最大的 K 只成分股（默认 3）
 	ETFTopM        int     // 来源2: 动量最强 Top M 只 ETF（默认 8）
-	ETFLookback    int     // 来源2: 精算拉取的交易日数（默认 60）
+	ETFLookback    int     // 来源2: 精算拉取的交易日数（默认对齐契约 ContractETFHistoryBars=90）
 	ETFMomWindow   int     // 来源2: 涨幅计算窗口（默认 20）
 	ETFPreFilterN  int     // 来源2: 快照粗筛进入精算的最大 ETF 数（默认 60）
 	LHBMinNetBuy   float64 // 来源3: 机构净买入下限（元, 默认 5e7）
 	LHBLookbackD   int     // 来源3: 龙虎榜回看天数（默认 7）
 
 	// ---- 全市场流动性初筛（Go 层新增闸门）----
-	// 分层口径(TieredPipeline=true)下本初筛仅作为诊断统计(LiquidityPassed),
-	// 不再前置叠加到 SECTOR/FUND 来源的候选发现——ADV20 评估统一由 L4 流动性
-	// 闸门(liquidityGatePool)独立执行, 避免同一门槛在发现与精筛阶段重复淘汰。
-	MinPrice      float64 // 最低收盘价（元, 默认 1.0; 面值退市风险）
-	MinAvgAmount  float64 // 最低日均成交额（元, 默认 1e8 = 1 亿）
-	MinMarketCap  float64 // 最低总市值（元, 默认 5e9 = 50 亿; 0 表示缺失时放行）
-	ExcludeST     bool    // 剔除 ST/*ST（默认 true）
-	LiquidityTopN int     // 通过初筛的股票按成交额保留前 N 只做后续叠加（默认 400, 控制规模）
+	MinPrice             float64 // 最低收盘价（元, 默认 1.0; 面值退市风险）
+	MinAvgAmount         float64 // 最低日均成交额（元, 默认 5e7 = 5 千万, 对齐契约 StockMinADV20; 旧 Python 口径 1e8 偏严）
+	MinMarketCap         float64 // 最低总市值（元, 默认 5e8 = 5 亿; 0 表示缺失时放行）
+	FundFlowMinMarketCap float64 // 契约口径: FUND(龙虎榜)来源个股总市值下限（元, 默认 5e9 = 50 亿; 0 表示不启用）
+	ExcludeST            bool    // 剔除 ST/*ST（默认 true）
+	LiquidityTopN        int     // 通过初筛的股票按成交额保留前 N 只做后续叠加（默认 400, 控制规模）
 
 	// ---- 候选池来源规模上限（<=0 一律视为"不截断", 全量进入后续精筛）----
 	// 历史默认 SectorTopN=3 / SectorLeadersK=3 / ETFTopM=8 使股票类候选恒为
@@ -102,19 +100,20 @@ type Config struct {
 // DefaultConfig 返回与 Python 版对齐的默认参数。
 func DefaultConfig() Config {
 	return Config{
-		SectorTopN:     3,
-		SectorLeadersK: 3,
-		ETFTopM:        8,
-		ETFLookback:    60,
-		ETFMomWindow:   20,
-		ETFPreFilterN:  60,
-		LHBMinNetBuy:   5e7,
-		LHBLookbackD:   7,
-		MinPrice:       1.0,
-		MinAvgAmount:   1e8,
-		MinMarketCap:   5e9,
-		ExcludeST:      true,
-		LiquidityTopN:  400,
+		SectorTopN:           3,
+		SectorLeadersK:       3,
+		ETFTopM:              8,
+		ETFLookback:          ContractETFHistoryBars, // 90（契约口径; 原 Python 迁移值 60 偏短）
+		ETFMomWindow:         20,
+		ETFPreFilterN:        60,
+		LHBMinNetBuy:         5e7,
+		LHBLookbackD:         7,
+		MinPrice:             1.0,
+		MinAvgAmount:         ContractStockMinADV20, // 5e7 = 5 千万（契约口径）
+		MinMarketCap:         5e8,                   // 5 亿（流动性初筛口径）
+		FundFlowMinMarketCap: 5e9,                   // 50 亿（契约 FundFlowMinMarketCap, FUND 来源叠加）
+		ExcludeST:            true,
+		LiquidityTopN:        400,
 
 		// 分层口径（六层架构改造）: 默认启用。来源截断恢复历史基线 3/3/8
 		// （它们是"来源内发现规则", 池子规模由合并去重决定）；fullSourceDefault
@@ -222,20 +221,18 @@ const (
 )
 
 var (
-	stRe      = regexp.MustCompile(`(?i)\*?ST`)
-	acodeRe   = regexp.MustCompile(`^\d{6}$`)
-	etfCodeRe = regexp.MustCompile(`^(sh)?(51|56|58|15|16)\d{4}$|^(\d{6})$`)
+	stRe    = regexp.MustCompile(`(?i)\*?ST`)
+	acodeRe = regexp.MustCompile(`^\d{6}$`)
 )
 
-// isETFCode 场内 ETF 代码启发式：沪 51/56/58 开头、深 15/16 开头的 6 位代码。
-func isETFCode(code string) bool {
-	c := strings.TrimPrefix(code, "sh")
-	c = strings.TrimPrefix(c, "sz")
-	if !acodeRe.MatchString(c) {
+// IsETFCode 启发式判断A股场内ETF代码，仅前置过滤，不可作为最终判定。
+// 覆盖: 沪市 51/56/58 开头、深市 15 开头（含 159 等全部 15xx 段）的 6 位纯数字代码。
+func IsETFCode(code string) bool {
+	if len(code) != 6 || !acodeRe.MatchString(code) {
 		return false
 	}
-	switch c[:2] {
-	case "51", "56", "58", "15", "16":
+	switch code[:2] {
+	case "51", "56", "58", "15":
 		return true
 	}
 	return false
@@ -369,7 +366,10 @@ func (g *Generator) Generate(ctx context.Context, manualSymbols []string, now ti
 
 	// ---- 全市场流动性初筛（Go 层新增, 供 SECTOR/FUND 两来源做前置门槛）----
 	// 弱依赖: 初筛失败仅记入 warnings 并退化为"不设门槛", 绝不阻断池子生成。
-	liquidSet, liquidityCount, err := g.liquidityScreen(ctx)
+	// 快照集合 liquidIdx 同时为 SECTOR 来源提供市值/20日均成交额字段,
+	// 使行业龙头排序可用真实市值口径（对齐 TS 端 filterBasicQuotes 的
+	// circulatingMarketCap 过滤 + 多条件本地筛选设计）。
+	liquidSet, liquidIdx, liquidityCount, err := g.liquidityScreen(ctx)
 	srcStatus := map[string]SourceStatus{"LIQUIDITY_SCREEN": StatusOK}
 	srcErrs := map[string]string{}
 	markSrc := func(name string, e error) {
@@ -412,7 +412,7 @@ func (g *Generator) Generate(ctx context.Context, manualSymbols []string, now ti
 	}
 
 	// ---- 来源 1: 行业龙头（行业资金流 Top N -> 板块成分股 Top K, 流动性门槛叠加）----
-	sectorEntries, err := g.genSectorLeaders(ctx, screenSet)
+	sectorEntries, err := g.genSectorLeaders(ctx, liquidSet, liquidIdx)
 	if err != nil {
 		warnings = append(warnings, "SECTOR_LEADER 失败(已跳过): "+err.Error())
 	} else {
@@ -424,7 +424,7 @@ func (g *Generator) Generate(ctx context.Context, manualSymbols []string, now ti
 	}
 
 	// ---- 来源 3: 龙虎榜机构净买入（叠加流动性门槛）----
-	fundEntries, err := g.genDragonTiger(ctx, now, screenSet)
+	fundEntries, err := g.genDragonTiger(ctx, now, liquidSet, liquidIdx)
 	if err != nil {
 		warnings = append(warnings, "FUND_FLOW 失败(已跳过): "+err.Error())
 	} else {
@@ -499,12 +499,13 @@ func (g *Generator) Generate(ctx context.Context, manualSymbols []string, now ti
 // ---------------------------------------------------------------------------
 
 // liquidityScreen 拉全市场快照并按 Config 阈值过滤, 返回通过集合(code->true)、
-// 通过数量与错误。语义约定: err != nil 时 set 为 nil, 调用方据此"不设门槛"退化;
+// 快照索引(code->StockQuote, 供来源侧做市值/流动性排序与补字段)、通过数量与错误。
+// 语义约定: err != nil 时 set/index 为 nil, 调用方据此"不设门槛"退化;
 // err == nil 且 set 非空时门槛生效。
-func (g *Generator) liquidityScreen(ctx context.Context) (map[string]bool, int, error) {
+func (g *Generator) liquidityScreen(ctx context.Context) (map[string]bool, map[string]StockQuote, int, error) {
 	quotes, err := g.prov.AllStocks(ctx)
 	if err != nil {
-		return nil, 0, err
+		return nil, nil, 0, err
 	}
 	passed := make([]StockQuote, 0, len(quotes)/4)
 	for _, q := range quotes {
@@ -517,7 +518,7 @@ func (g *Generator) liquidityScreen(ctx context.Context) (map[string]bool, int, 
 		if q.Price < g.cfg.MinPrice {
 			continue
 		}
-		if q.AvgAmount20D < g.cfg.MinAvgAmount {
+		if q.AvgAmount20D <= g.cfg.MinAvgAmount {
 			continue
 		}
 		if g.cfg.MinMarketCap > 0 && q.TotalMarketCap > 0 && q.TotalMarketCap < g.cfg.MinMarketCap {
@@ -531,22 +532,24 @@ func (g *Generator) liquidityScreen(ctx context.Context) (map[string]bool, int, 
 		passed = passed[:g.cfg.LiquidityTopN]
 	}
 	set := make(map[string]bool, len(passed))
+	idx := make(map[string]StockQuote, len(passed))
 	for _, q := range passed {
 		set[q.Code] = true
+		idx[q.Code] = q
 	}
 	if len(set) == 0 {
 		// 上游快照异常导致全军覆没: 视为初筛失败, 调用方退化为不设门槛,
 		// 绝不因数据问题把资金流来源整体清空。
-		return nil, 0, context.DeadlineExceeded // 语义: 初筛通过数为 0
+		return nil, nil, 0, context.DeadlineExceeded // 语义: 初筛通过数为 0
 	}
-	return set, len(set), nil
+	return set, idx, len(set), nil
 }
 
 // ---------------------------------------------------------------------------
 // 来源 1: 行业龙头
 // ---------------------------------------------------------------------------
 
-func (g *Generator) genSectorLeaders(ctx context.Context, liquidSet map[string]bool) ([]Entry, error) {
+func (g *Generator) genSectorLeaders(ctx context.Context, liquidSet map[string]bool, liquidIdx map[string]StockQuote) ([]Entry, error) {
 	rank, err := g.prov.SectorFundFlowRank(ctx)
 	if err != nil {
 		return nil, err
@@ -585,12 +588,30 @@ func (g *Generator) genSectorLeaders(ctx context.Context, liquidSet map[string]b
 		if len(filtered) == 0 {
 			continue // 该板块成分股全部未过门槛, 跳过
 		}
-		// 龙头口径: 按最新价降序取 Top K。
-		// （stock-go BoardConstituent 无市值字段, 市值排序不可得; 流动性/规模
-		// 门槛已由 liquidSet 全市场初筛叠加保证, 价格排序为可得的龙头代理。）
-		sort.SliceStable(filtered, func(i, j int) bool { return filtered[i].Price > filtered[j].Price })
-		if len(filtered) > leadersK && leadersK > 0 {
-			filtered = filtered[:leadersK]
+		// 龙头口径（对齐 TS 端"多因子本地筛选 + 排序"设计, 分三级键降级）:
+		//   1) 总市值降序 —— 初筛快照带市值时优先, 真实龙头代理;
+		//   2) 最新价降序 —— 无市值时的可得上游字段;
+		//   3) 代码升序 —— 全缺失时保证确定性。
+		// stock-go BoardConstituent 本身无市值字段, 市值经 liquidIdx 关联补齐。
+		val := func(c ConstituentStock) (cap, price float64) {
+			if q, ok := liquidIdx[c.Code]; ok {
+				return q.TotalMarketCap, q.Price
+			}
+			return 0, c.Price
+		}
+		sort.SliceStable(filtered, func(i, j int) bool {
+			ci, pi := val(filtered[i])
+			cj, pj := val(filtered[j])
+			if ci != cj {
+				return ci > cj
+			}
+			if pi != pj {
+				return pi > pj
+			}
+			return filtered[i].Code < filtered[j].Code
+		})
+		if len(filtered) > g.cfg.SectorLeadersK {
+			filtered = filtered[:g.cfg.SectorLeadersK]
 		}
 		for _, c := range filtered {
 			out = append(out, g.entry(c.Code, c.Name, sourceSector, sec.Name))
@@ -614,7 +635,7 @@ func (g *Generator) genETFMomentum(ctx context.Context, now time.Time) ([]Entry,
 	etfCodes := make([]string, 0, len(codes)/2)
 	for _, c := range codes {
 		code := normalizeCode(c)
-		if code != "" && isETFCode(code) {
+		if code != "" && IsETFCode(code) {
 			etfCodes = append(etfCodes, code)
 		}
 	}
@@ -694,7 +715,7 @@ func (g *Generator) genETFMomentum(ctx context.Context, now time.Time) ([]Entry,
 // 来源 3: 龙虎榜机构净买入
 // ---------------------------------------------------------------------------
 
-func (g *Generator) genDragonTiger(ctx context.Context, now time.Time, liquidSet map[string]bool) ([]Entry, error) {
+func (g *Generator) genDragonTiger(ctx context.Context, now time.Time, liquidSet map[string]bool, liquidIdx map[string]StockQuote) ([]Entry, error) {
 	start := now.AddDate(0, 0, -g.cfg.LHBLookbackD)
 	rows, err := g.prov.DragonTigerInstitution(ctx, start, now)
 	if err != nil {
@@ -711,6 +732,12 @@ func (g *Generator) genDragonTiger(ctx context.Context, now time.Time, liquidSet
 		}
 		if liquidSet != nil && !liquidSet[code] {
 			continue // 流动性初筛叠加
+		}
+		// 契约 FundFlowMinMarketCap=50亿: FUND 来源个股市值单独把关（比初筛 5 亿更严）。
+		// 市值未知（快照缺失该股票或字段为 0）时放行, 遵循"缺失数据不误杀"约定。
+		if q, ok := liquidIdx[code]; ok && g.cfg.FundFlowMinMarketCap > 0 &&
+			q.TotalMarketCap > 0 && q.TotalMarketCap < g.cfg.FundFlowMinMarketCap {
+			continue
 		}
 		e := g.entry(code, r.Name, sourceFund, "龙虎榜机构")
 		v := r.OrgNetAmount

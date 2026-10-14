@@ -17,23 +17,24 @@ import (
 func sprintfCode(i int) string { return fmt.Sprintf("6000%02d", i) }
 
 // TestLiquidityScreenDefaultConfigThresholds 验证默认系统配置阈值下的过滤边界：
-// MinPrice=1.0 / MinAvgAmount=1e8 / MinMarketCap=5e9 / ExcludeST=true / LiquidityTopN=400。
+// MinPrice=1.0 / MinAvgAmount=5e7(契约 StockMinADV20) / MinMarketCap=5e8 / ExcludeST=true / LiquidityTopN=400。
 func TestLiquidityScreenDefaultConfigThresholds(t *testing.T) {
 	f := newFake()
 	f.stocks = []StockQuote{
-		quote("600001", "边界上", 1.0, 1e8, 5e9),     // 恰好等于三个下限 -> 放行（闭区间）
+		quote("600001", "边界上", 1.0, 1.001e8, 5e9), // 价格/市值恰好等于下限、成交额略高于下限 -> 放行
 		quote("600002", "价格差一分", 0.99, 5e8, 1e11), // 低于 MinPrice -> 剔除
-		quote("600003", "缩量一分", 10, 9.99e7, 1e11), // 低于 MinAvgAmount -> 剔除
-		quote("600004", "市值差一点", 10, 5e8, 4.99e9), // 低于 MinMarketCap -> 剔除
+		quote("600003", "缩量一分", 10, 4.99e7, 1e11), // 低于 MinAvgAmount(5e7) -> 剔除
+		quote("600004", "市值差一点", 10, 5e8, 4.99e8), // 低于 MinMarketCap(5e8) -> 剔除
 		quote("600005", "*ST退市警示", 10, 5e8, 1e11), // ST 剔除
+		quote("600006", "缩量边界", 10, 5e7, 1e11),    // 恰好等于 MinAvgAmount -> 剔除（开区间，须严格大于门槛）
 	}
 	g := NewGenerator(f, DefaultConfig())
-	set, n, err := g.liquidityScreen(context.Background())
+	set, _, n, err := g.liquidityScreen(context.Background())
 	if err != nil {
 		t.Fatalf("unexpected err: %v", err)
 	}
 	if n != 1 || len(set) != 1 || !set["600001"] {
-		t.Fatalf("want only 600001 (boundary-equal) passed, got set=%v n=%d", set, n)
+		t.Fatalf("want only 600001 passed (600006 equal-to-threshold must be rejected), got set=%v n=%d", set, n)
 	}
 }
 
@@ -45,7 +46,7 @@ func TestLiquidityScreenZeroMarketCapPasses(t *testing.T) {
 		quote("600001", "市值缺失", 10, 5e8, 0), // TotalMarketCap=0 -> 视同未知, 放行
 	}
 	g := NewGenerator(f, DefaultConfig())
-	set, n, err := g.liquidityScreen(context.Background())
+	set, _, n, err := g.liquidityScreen(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -61,7 +62,7 @@ func TestLiquidityScreenMinMarketCapDisabled(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.MinMarketCap = 0 // 0 表示不设市值门槛
 	g := NewGenerator(f, cfg)
-	set, n, err := g.liquidityScreen(context.Background())
+	set, _, n, err := g.liquidityScreen(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -77,7 +78,7 @@ func TestLiquidityScreenExcludeSTDisabled(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.ExcludeST = false
 	g := NewGenerator(f, cfg)
-	set, _, err := g.liquidityScreen(context.Background())
+	set, _, _, err := g.liquidityScreen(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -95,7 +96,7 @@ func TestLiquidityScreenNonAcodeFiltered(t *testing.T) {
 		quote("600001", "合规A股", 10, 5e9, 1e11),
 	}
 	g := NewGenerator(f, DefaultConfig())
-	set, n, err := g.liquidityScreen(context.Background())
+	set, _, n, err := g.liquidityScreen(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -109,7 +110,7 @@ func TestLiquidityScreenProviderErrorNilSet(t *testing.T) {
 	f := newFake()
 	f.errStocks = errors.New("snapshot unavailable")
 	g := NewGenerator(f, DefaultConfig())
-	set, n, err := g.liquidityScreen(context.Background())
+	set, _, n, err := g.liquidityScreen(context.Background())
 	if err == nil {
 		t.Fatal("want error propagated from AllStocks")
 	}
@@ -127,7 +128,7 @@ func TestLiquidityScreenZeroPassReturnsDeadlineExceeded(t *testing.T) {
 	f := newFake()
 	f.stocks = []StockQuote{quote("600004", "缩量股", 10, 1e6, 1e11)}
 	g := NewGenerator(f, DefaultConfig())
-	set, n, err := g.liquidityScreen(context.Background())
+	set, _, n, err := g.liquidityScreen(context.Background())
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("want context.DeadlineExceeded sentinel on zero-pass, got %v", err)
 	}
@@ -142,12 +143,12 @@ func TestLiquidityScreenTopNDescendingTruncation(t *testing.T) {
 	f := newFake()
 	for i := 0; i < 20; i++ {
 		f.stocks = append(f.stocks, quote(
-			sprintfCode(i), "股", 10, float64(i+1)*1e8, 1e11))
+			sprintfCode(i), "股", 10, float64(i+1)*1e8+1, 1e11))
 	}
 	cfg := DefaultConfig()
 	cfg.LiquidityTopN = 5
 	g := NewGenerator(f, cfg)
-	set, n, err := g.liquidityScreen(context.Background())
+	set, _, n, err := g.liquidityScreen(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -169,12 +170,12 @@ func TestLiquidityScreenTopNDescendingTruncation(t *testing.T) {
 func TestLiquidityScreenTopNDisabled(t *testing.T) {
 	f := newFake()
 	for i := 0; i < 12; i++ {
-		f.stocks = append(f.stocks, quote(sprintfCode(i), "股", 10, float64(i+1)*1e8, 1e11))
+		f.stocks = append(f.stocks, quote(sprintfCode(i), "股", 10, float64(i+1)*1e8+1, 1e11))
 	}
 	cfg := DefaultConfig()
 	cfg.LiquidityTopN = 0
 	g := NewGenerator(f, cfg)
-	_, n, err := g.liquidityScreen(context.Background())
+	_, _, n, err := g.liquidityScreen(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}

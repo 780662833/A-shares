@@ -126,19 +126,26 @@ func (g *Generator) refinePoolWith(ctx context.Context, pool []AggEntry, warning
 	}
 
 	type outcome struct {
-		rejected bool     // 被闸门剔除
-		reason   string   // 剔除原因（诊断用）
-		unknown  bool     // 上游数据缺失 -> 未知放行
-		scored   bool     // 已实际执行资格/财务闸门判定
-		finBlock bool     // 财务维度明确否决（EPS<0 / ROE 不足）
-		hardFlag bool     // 阶段3硬条件异常标记（OHLC/时点/价格）——不剔除, 只降级 tradability
-		chg      *float64 // R60 个股收益率 %（原始值, 非超额）
-		chgShort *float64 // 阶段5: R20 区间涨跌幅（短期动量）
-		rsScore  float64  // 阶段5: RS 双窗口加权总分快照（百分位精化覆盖前的粗排口径）
+		rejected   bool     // 被闸门剔除
+		reason     string   // 剔除原因（诊断用）
+		unknown    bool     // 上游数据缺失 -> 未知放行
+		scored     bool     // 已实际执行资格/财务闸门判定
+		finBlock   bool     // 财务维度明确否决（EPS<0 / ROE 不足）
+		hardFlag   bool     // 阶段3硬条件异常标记（OHLC/时点/价格）——不剔除, 只降级 tradability
+		chg        *float64 // R60 个股收益率 %（原始值, 非超额）
+		shortKnown bool     // 短窗样本充分（端点可计算，即使收益为 0 也算可得）
+		longKnown  bool     // 长窗样本充分（R60 端点在样本内）
+		chgShort   *float64 // 阶段5: R20 区间涨跌幅（短期动量）
 		// 阶段 8: MA 快照透传（daily_stock_metrics 落库输入）
 		closePx, ma20, ma60 *float64
 	}
 	results := make([]outcome, len(stockIdx))
+
+	// 阶段 7 接线：记录每只股票打分时**实际使用**的基准窗口可得性（单票样本不足
+	// 退化口径）。路径 A/B 判定必须与打分共用同一基准视图，否则会出现"分数按短窗
+	// 算、判定却要求 R60>0"的口径分裂。nil 切片在接线处判空，无副作用。
+	stockBenchShort := make([]*float64, len(stockIdx))
+	stockBenchLong := make([]*float64, len(stockIdx))
 
 	// ---- 阶段 5: 双窗口口径解析（R20 短期 + R60 中期）----
 	longWin := g.cfg.RSLongWindow
@@ -234,8 +241,14 @@ func (g *Generator) refinePoolWith(ctx context.Context, pool []AggEntry, warning
 					// 各窗口独立判定样本充分性: 短窗口可得即打短分; 长窗口缺样仅置 nil(单窗口退化),
 					// 绝不因长窗口样本不足而把整只股票踢出打分。
 					res.chgShort = pctChangeOver(bars, shortWin)
+					if res.chgShort != nil {
+						res.shortKnown = true
+					}
 					if len(bars) >= needBars(longWin) {
 						res.chg = pctChangeOver(bars, longWin)
+						if res.chg != nil {
+							res.longKnown = true
+						}
 					}
 					if res.chg == nil && res.chgShort == nil {
 						res.unknown = true
@@ -397,11 +410,17 @@ func (g *Generator) refinePoolWith(ctx context.Context, pool []AggEntry, warning
 				lExcess = *res.chg - *benchChg
 				haveL = true
 			}
-			// 单窗口退化模式的唯一判据是"基准长窗不可得"（见 strength.go
-			// SingleWindowShortOnly 锁定语义）；基准两窗齐备而个股长窗样本
-			// 不足时, 短窗超额必须与长窗超额(记 0)按配置权重加权, 而不是
-			// 退化为纯短窗分数——两种场景的口径必须可区分。
-			longUsable := haveL || (res.chg == nil && benchHasLong)
+			// 接线：记录该票打分时实际参与的基准窗口可得性（与 haveS/haveL 同语义），
+			// 供阶段 7 路径判定复用同一基准视图——单票长窗样本不足时不得再用全局
+			// R60 基准去要求 "R60>0" 硬门槛（口径分裂 bug）。
+			if haveS {
+				v := *benchChgShort
+				stockBenchShort[k] = &v
+			}
+			if haveL {
+				v := *benchChg
+				stockBenchLong[k] = &v
+			}
 			switch {
 			case haveS && longUsable:
 				w := g.cfg.RSShortWeightPct / 100
@@ -553,37 +572,75 @@ func (g *Generator) refinePoolWith(ctx context.Context, pool []AggEntry, warning
 	// 每次运行先重置强度包：精筛关闭/基准不可得时保持 nil（StrengthKnown=false）,
 	// 防止上一轮的 wiring 指针残留把"管线未执行"误标成"打分后落选 STRENGTH"。
 	g.strengthWiring = nil
-	// 输入全部来自本次已采集数据（趋势结构 trendRes、基准 benchChgShort/benchChg）；
-	// ADV20 与行业指数 R20 属流动性/板块侧数据, 由调用方在 liquidityGatePool 之后
-	// 通过 ApplyStrengthStage2 补齐（见 generator.go）——本函数先用"可得因子"打分,
+	// 输入全部来自本次已采集数据（趋势结构 trendRes、基准 benchChgShort/benchChg、
+	// 行业指数经 fetchSector 复取）；ADV20 属流动性侧数据, 由调用方在 liquidityGatePool
+	// 之后通过 RefineScores 补齐——本函数先用"可得因子"打分,
 	// 后续补算会覆盖 RankScore 为完整四因子口径。
 	{
 		w := strengthWiring{BenchR20: benchChgShort, BenchR60: benchChg, SingleWindowShortOnly: benchChgShort != nil && benchChg == nil,
+			StockBenchR20: map[string]*float64{}, StockBenchR60: map[string]*float64{},
+			StockShortKnown: map[string]bool{}, StockLongKnown: map[string]bool{},
 			SectorR20: map[string]*float64{}, Adv: map[string]*float64{},
 			Trend: map[string]trendState{}, RSPrescore: wiringPreScore, ScoredSymbols: wiringScored}
 		for k, idxK := range stockIdx {
-			_ = idxK
 			if trendRes[k].Known || trendRes[k].CloseGeMA20 || trendRes[k].MA20GeMA60 {
 				w.Trend[pool[idxK].Symbol] = trendRes[k]
 			}
 		}
-		// 行业基准：同名行业只请求一次（缓存于 sectorCache）
-		sectorCache := map[string]*float64{}
+		for k, idxK := range stockIdx {
+			if v := stockBenchShort[k]; v != nil {
+				w.StockBenchR20[pool[idxK].Symbol] = v
+			}
+			if v := stockBenchLong[k]; v != nil {
+				w.StockBenchR60[pool[idxK].Symbol] = v
+			}
+			// 样本可得性标志：区分"窗口端点存在但收益恰为 0%"与"样本不足不可得(nil)"。
+			// 仅凭 nil 指针无法表达前者（0% 也是有效测量），退化判定必须用显式标志。
+			if results[k].shortKnown {
+				w.StockShortKnown[pool[idxK].Symbol] = true
+			}
+			if results[k].longKnown {
+				w.StockLongKnown[pool[idxK].Symbol] = true
+			}
+		}
+		// ---- 生产 bug 修复：行业相对强度 RS20_sector 的权威来源是**行业指数**。
+		// 旧实现把中文行业名当指数代码传给 IndexBars, 真实供应商必然取数失败, 且失败
+		// 结果被 sectorCache 永久缓存 nil，SectorR20 恒空 → "跑赢行业"硬门槛永远无法
+		// 确认 → A 路径进不了、四因子评分恒缺行业侧权重。现改为按行业名向 Provider
+		// 请求行业指数 K 线（needBars(shortWin) 口径, 与个股/宽基窗口端点语义一致）;
+		// 取不到诚实置 nil（"无法确认"→ 最高归 B, 评分走权重归一, 绝不猜测为正）。
+		// 同一行业名在批次内只请求一次。
+		type secResult struct {
+			chg *float64
+		}
+		sectorCache := map[string]secResult{}
+		fetchSector := func(name string) *float64 {
+			if c, hit := sectorCache[name]; hit {
+				return c.chg
+			}
+			var v *float64
+			if name != "" {
+				// 与个股/宽基同口径请求 maxWin+1 根：fake/SDK 按尾部定位时 lookback
+				// 差异不会移动窗口端点；长窗样本不足时短窗仍诚实可得。
+				if bars, err := g.prov.IndexBars(ctx, name, needBars(maxWin), now); err == nil && len(bars) >= needBars(shortWin) {
+					v = pctChangeOver(bars, shortWin)
+				}
+			}
+			sectorCache[name] = secResult{chg: v}
+			return v
+		}
+		// 生产 bug 修复：行业侧取数覆盖全部股票类条目（SECTOR_LEADER 与 FUND_FLOW），
+		// 按各自携带的 SectorName 归类——旧实现只给 SECTOR_LEADER 取行业指数，资金流
+		// 来源即便带行业名也恒缺 RS20_sector 因子，A 路径"跑赢行业"硬门槛与四因子评分
+		// 的行业权重被静默清零。同行业名批次内只请求一次。
 		for i := range kept {
 			e := &kept[i]
-			if e.PrimarySource != sourceSector || e.SectorName == "" {
+			if (e.PrimarySource != sourceSector && e.PrimarySource != sourceFund) || e.SectorName == "" {
 				continue
 			}
-			v, hit := sectorCache[e.SectorName]
-			if !hit {
-				if bars, err := g.prov.IndexBars(ctx, e.SectorName, needBars(shortWin), now); err == nil && len(bars) >= needBars(shortWin) {
-					v = pctChangeOver(bars, shortWin)
-				} else {
-					v = nil
-				}
-				sectorCache[e.SectorName] = v
+			if _, has := w.SectorR20[e.SectorName]; !has {
+				w.SectorR20[e.SectorName] = fetchSector(e.SectorName)
 			}
-			w.SectorR20[e.SectorName] = v
 		}
 		kept = g.applyStrengthPathsAndScoresLegacy(kept, w, warnings)
 		g.strengthWiring = &w // 供 Generate() 在流动性闸门后二次精化(ADV因子)复用
@@ -591,18 +648,26 @@ func (g *Generator) refinePoolWith(ctx context.Context, pool []AggEntry, warning
 
 	// ---- 重组整池: 非股票条目保持原位相对顺序, 股票类整体插到其后 ----
 	// （优先级去重已在 Layer 0.5 完成, 此处重排不影响 symbol 唯一性。）
+	// 生产 bug 修复: kept 已经过 applyStrengthPathsAndScores 分段重排(A→B→其余)，
+	// 必须按 kept 的**当前切片顺序**输出。旧实现用下标遍历原 pool 取条目，而 kept
+	// 与 pool 共享底层数组——读 pool[i] 会拿到重排前的原始位置版本，把分段排序
+	// 静默还原成输入顺序（A/B/NONE 段位与 RankPos 全部错位）。
 	out := make([]AggEntry, 0, len(pool))
-	for i, e := range pool {
-		isStock := false
+	// kept 中每个条目都源自 stockIdx 指向的位置；被剔除者(dropped)不回填，
+	// 非股票条目保持原相对顺序在前。
+	isStockIdx := func(i int) bool {
 		for _, si := range stockIdx {
 			if si == i {
-				isStock = true
-				break
+				return true
 			}
 		}
-		if !isStock {
-			out = append(out, e)
+		return false
+	}
+	for i, e := range pool {
+		if isStockIdx(i) {
+			continue // 股票类统一由下方 kept 段以重排后的值输出
 		}
+		out = append(out, e)
 	}
 	out = append(out, kept...)
 	// 交易资格统一推导（黑名单优先; 强度路径 NONE 的纯自动股票条目软阻塞）

@@ -47,23 +47,23 @@ type MarketEnvironmentConfig struct {
 
 // MarketEnvironmentData 网关 data 字段中与风控相关的核心部分。
 type MarketEnvironmentData struct {
-	Index                 string  `json:"index"`
-	TradeDate             string  `json:"trade_date"`
-	Close                 float64 `json:"close"`
-	Ma20                  float64 `json:"ma20"`
-	Ma60                  float64 `json:"ma60"`
-	ChangePct1D           float64 `json:"change_pct_1d"`
-	ChangePct20D          float64 `json:"change_pct_20d"`
-	Regime                string  `json:"regime"` // BULL / SIDEWAYS / BEAR
-	GlobalMaxPositionPct  float64 `json:"global_max_position_pct"`
+	Index                string  `json:"index"`
+	TradeDate            string  `json:"trade_date"`
+	Close                float64 `json:"close"`
+	Ma20                 float64 `json:"ma20"`
+	Ma60                 float64 `json:"ma60"`
+	ChangePct1D          float64 `json:"change_pct_1d"`
+	ChangePct20D         float64 `json:"change_pct_20d"`
+	Regime               string  `json:"regime"` // BULL / SIDEWAYS / BEAR
+	GlobalMaxPositionPct float64 `json:"global_max_position_pct"`
 }
 
 // marketEnvironmentResult InvokableRun 的输出信封。
 type marketEnvironmentResult struct {
-	OK      bool                  `json:"ok"`
+	OK      bool                   `json:"ok"`
 	Data    *MarketEnvironmentData `json:"data,omitempty"`
-	Error   string                `json:"error,omitempty"`
-	Summary string                `json:"summary,omitempty"`
+	Error   string                 `json:"error,omitempty"`
+	Summary string                 `json:"summary,omitempty"`
 }
 
 // MarketEnvironmentTool 查询大盘环境的 Eino 工具。零值不可用。
@@ -154,9 +154,9 @@ func (t *MarketEnvironmentTool) fetch(ctx context.Context) *marketEnvironmentRes
 	}
 
 	var env struct {
-		Code    int                    `json:"code"`
-		Message string                 `json:"message"`
-		Data    MarketEnvironmentData  `json:"data"`
+		Code    int                   `json:"code"`
+		Message string                `json:"message"`
+		Data    MarketEnvironmentData `json:"data"`
 	}
 	if err := json.Unmarshal(body, &env); err != nil {
 		return &marketEnvironmentResult{OK: false, Error: fmt.Sprintf("decode envelope: %v", err)}

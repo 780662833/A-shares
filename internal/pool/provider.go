@@ -197,11 +197,14 @@ func (p *SDKProvider) AllStocks(ctx context.Context) ([]StockQuote, error) {
 	out := make([]StockQuote, 0, len(quotes))
 	for _, q := range quotes {
 		out = append(out, StockQuote{
-			Code:           q.Code,
-			Name:           q.Name,
-			Price:          q.Price,
-			AvgAmount20D:   q.Amount, // 当日成交额做初筛代理值
-			TotalMarketCap: f64(q.TotalMarketCap),
+			Code:  q.Code,
+			Name:  q.Name,
+			Price: q.Price,
+			// 单位适配（契约见 contract.go: Provider 边界输出一律"元"）：
+			// 腾讯 qt.gtimg.cn 字段实测——[37]成交额为"万元"、[45]总市值为"亿元"，
+			// 必须在适配层换算为元，严禁散落到筛选逻辑中。
+			AvgAmount20D:   q.Amount * YuanPerWan,             // 当日成交额(万元->元)做初筛代理值
+			TotalMarketCap: f64(q.TotalMarketCap) * YuanPerYi, // 总市值(亿元->元)
 		})
 	}
 	return out, nil

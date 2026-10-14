@@ -41,9 +41,9 @@ func TestEvaluateStop_Table(t *testing.T) {
 			wantSkip: false, wantQty: 500, wantLotOK: true,
 		},
 		{
-			name:    "未设置风控线",
-			pos:     mkPos("300750", 0, 500, 500, "2026-10-08"),
-			kline:   mkKline(10, 10),
+			name:     "未设置风控线",
+			pos:      mkPos("300750", 0, 500, 500, "2026-10-08"),
+			kline:    mkKline(10, 10),
 			wantSkip: true, wantWhy: "no_stop_line",
 		},
 		{
