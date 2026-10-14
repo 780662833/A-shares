@@ -1,0 +1,481 @@
+// Package pool 实现动态自选股池（Layer 0.5）的 Go 原生生成器。
+//
+// 架构迁移说明：候选池生成已从 Python 网关上移至 Go 层，直接使用
+// github.com/ceheng-io/stock-go SDK（无需 Token，公开行情源）完成——
+//   - 全市场流动性初筛（Quotes.AllCN 批量行情：价格 / 20 日均成交额 / 市值 / ST 剔除）；
+//   - 行业资金流叠加（FundFlow.SectorRank + Board.IndustryConstituents）；
+//   - 龙虎榜机构净买入叠加（DragonTiger.Institution）；
+//   - ETF 动量（CodesFund + Quotes.Fund 快照粗筛 + Kline.CN 精算 20 日涨幅）。
+//
+// Python 端仅保留 czsc 形态确认（/api/czsc/screen_pool、/api/czsc/refresh）。
+//
+// 可测试性：所有 SDK 调用收敛到 Provider 接口，单测注入 fakeProvider
+// 即可离线全链路验证，不触网。
+package pool
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	stock "github.com/ceheng-io/stock-go"
+)
+
+// ---------------------------------------------------------------------------
+// 领域 DTO（与 stock-go types 解耦，字段口径对齐原 Python watchlist_generator）
+// ---------------------------------------------------------------------------
+
+// StockQuote 全市场单只股票的实时快照（流动性初筛输入）。
+type StockQuote struct {
+	Code           string  // 6 位数字代码
+	Name           string  // 证券名称
+	Price          float64 // 最新价（元）
+	AvgAmount20D   float64 // 近 20 个交易日日均成交额（元, 由 K 线补齐; 0 表示未取到）
+	TotalMarketCap float64 // 总市值（元, 0 表示缺失）
+}
+
+// SectorFlow 行业板块当日资金流排行一行。
+type SectorFlow struct {
+	Code          string  // 板块代码, 如 BK0438
+	Name          string  // 板块名称
+	MainNetInflow float64 // 今日主力净流入（元）
+}
+
+// ConstituentStock 板块成分股一行。
+//
+// 注意：stock-go 的 BoardConstituent 不携带市值字段（无 TotalMarketCap），
+// 因此成分股层面**不做**市值过滤/排序——流动性门槛统一由全市场初筛集合
+// liquidSet 叠加承担，龙头排序回退为"最新价 Top K"口径（见 generator.go）。
+type ConstituentStock struct {
+	Code  string
+	Name  string
+	Price float64
+}
+
+// InstitutionBuy 龙虎榜机构席位净买入一行。
+type InstitutionBuy struct {
+	Code         string
+	Name         string
+	Date         string
+	OrgNetAmount float64 // 机构净买入额（元）
+}
+
+// FundSnapshot ETF/基金快照一行。
+type FundSnapshot struct {
+	Code   string
+	Name   string
+	Price  float64
+	Amount float64 // 今日成交额（元, 0 表示数据源未提供）
+}
+
+// DailyClose 一只 ETF 的日线收盘序列（按日期升序）。
+type DailyClose struct {
+	Dates  []string
+	Closes []float64
+}
+
+// StockQualification 单只股票的证券资格 + 财务状态画像（精筛闸门输入）。
+//
+// 数据来源拆分：
+//   - SecurityType / ListingDate：stock-go Data.StockProfile（F10 公司概况）；
+//   - ROEWeighted / ParentNetProfitYoY / BasicEPS：stock-go Data.FinancialIndicators
+//     （最近一期定期报告，字段为 *float64，nil 表示缺失）。
+//
+// 弱依赖约定：上游查询失败时由 Provider 返回 error，Generator 侧仅将该股票
+// 标记为"未知"放行并记入 warnings，绝不因数据缺失误杀整池。
+type StockQualification struct {
+	Code               string
+	SecurityType       string // 证券类型, 如 "其他理财产品"→ETF/LOF、"创业板股票" 等; 空表示未取到
+	ListingDate        string // 上市日期 "2006-01-02"; 空表示未取到
+	ROEWeighted        *float64
+	ParentNetProfitYoY *float64
+	BasicEPS           *float64
+}
+
+// DailyBar 个股日 K 线一行（相对强度计算输入，仅保留所需字段）。
+type DailyBar struct {
+	Date  string
+	Close float64
+}
+
+// DailyAmountRow 个股日 K 成交额行（阶段 4：ADV20 / 交易容量计算输入）。
+// Amount 单位人民币元；<=0 表示当日成交额缺失（不是零！见 liquidity.go 契约注释）。
+type DailyAmountRow struct {
+	Date   string
+	Amount float64
+}
+
+// ---------------------------------------------------------------------------
+// Provider 接口
+// ---------------------------------------------------------------------------
+
+// Provider 抽象候选池生成所需的全部上游数据能力。
+// 生产实现为 SDKProvider（stock-go），测试实现见 provider_fake_test.go。
+type Provider interface {
+	// AllStocks 返回全市场 A 股快照（含沪深京），用于流动性初筛。
+	AllStocks(ctx context.Context) ([]StockQuote, error)
+	// SectorFundFlowRank 返回行业板块资金流排行（今日口径），按净流入降序。
+	SectorFundFlowRank(ctx context.Context) ([]SectorFlow, error)
+	// IndustryConstituents 返回指定行业板块的成分股列表（boardCode 支持 BKxxxx 或名称）。
+	IndustryConstituents(ctx context.Context, boardCode string) ([]ConstituentStock, error)
+	// DragonTigerInstitution 返回 [start,end] 窗口内龙虎榜机构席位净买入统计。
+	DragonTigerInstitution(ctx context.Context, start, end time.Time) ([]InstitutionBuy, error)
+	// FundList 返回全市场公募基金（含场内 ETF）代码清单。
+	FundList(ctx context.Context) ([]string, error)
+	// FundBatchQuote 批量获取基金快照（名称/净值）。
+	FundBatchQuote(ctx context.Context, codes []string) ([]FundSnapshot, error)
+	// ETFCloseSeries 返回一只 ETF 最近 lookback 个交易日的收盘价序列（前复权）。
+	ETFCloseSeries(ctx context.Context, code string, lookback int, end time.Time) (*DailyClose, error)
+
+	// ---- 精筛管线新增能力（证券资格 / 财务状态 / 相对强度）----
+
+	// StockQualification 返回单只股票的资格画像（上市日期/证券类型）与最近一期
+	// 关键财务指标。上游失败返回 error，调用方按"未知放行 + warning"退化。
+	StockQualification(ctx context.Context, code string) (*StockQualification, error)
+	// StockBars 返回个股最近 lookback 个交易日日 K 收盘序列（升序; 不复权，
+	// RS 口径为区间涨跌幅，无需复权精度保证跨票一致性时优先前复权——见 generator.go 注释）。
+	StockBars(ctx context.Context, code string, lookback int, end time.Time) ([]DailyBar, error)
+	// BarsOHLC 返回个股最近 lookback 个交易日的完整 OHLC 序列（升序）。
+	// 阶段 3 证券资格硬条件（OHLC 完整性校验 + 行情时点 as_of 对齐）使用。
+	// SDK 未提供该能力时返回 error，调用方按"未知放行"退化（不误杀、不伪造通过）。
+	BarsOHLC(ctx context.Context, code string, lookback int, end time.Time) ([]barOHLC, error)
+
+	// StockAmounts 返回个股最近 lookback 个交易日"未复权"日成交额序列（升序，元）。
+	// 阶段 4 ADV20/交易容量专用口径：流动性必须使用实际成交额，Provider 实现
+	// 必须以 AdjustNone 拉取——不得用复权价格×成交量反推成交额（见 liquidity.go）。
+	StockAmounts(ctx context.Context, code string, lookback int, end time.Time) ([]DailyAmountRow, error)
+	// IndexBars 返回基准指数（如 "000300" 沪深300）最近 lookback 个交易日日 K 收盘序列（升序）。
+	IndexBars(ctx context.Context, indexCode string, lookback int, end time.Time) ([]DailyBar, error)
+}
+
+// ---------------------------------------------------------------------------
+// SDKProvider: stock-go 生产实现
+// ---------------------------------------------------------------------------
+
+// SDKProvider 基于 stock-go 根入口 *stock.Client 的 Provider 实现。零值不可用。
+type SDKProvider struct {
+	sdk         *stock.Client
+	batchSize   int
+	concurrency int
+	klineWindow int // 补算 20 日均成交额时拉取的 K 线条数
+}
+
+// NewSDKProvider 创建生产 Provider。timeout<=0 时取默认 15s。
+func NewSDKProvider(timeout time.Duration) *SDKProvider {
+	if timeout <= 0 {
+		timeout = 15 * time.Second
+	}
+	sdk := stock.New(
+		stock.WithTimeout(timeout),
+		stock.WithRetry(stock.RetryOptions{MaxRetries: 2}),
+	)
+	return &SDKProvider{sdk: sdk, batchSize: 200, concurrency: 4, klineWindow: 30}
+}
+
+var _ Provider = (*SDKProvider)(nil)
+
+func f64(p *float64) float64 {
+	if p == nil {
+		return 0
+	}
+	return *p
+}
+
+// AllStocks 全市场行情快照 -> StockQuote 列表。
+//
+// 注意：腾讯批量行情只有"当日成交额"，无 20 日均值；为控制网络开销，
+// 这里先用当日成交额作为初筛代理（收盘后当日值≈近端均值），再由
+// liquidityFilter 对通过第一道闸的股票按需精算（见 generator.go）。
+func (p *SDKProvider) AllStocks(ctx context.Context) ([]StockQuote, error) {
+	quotes, err := p.sdk.Quotes.AllCN(ctx, stock.CodeListOptions{}, stock.BatchOptions{
+		BatchSize:   p.batchSize,
+		Concurrency: p.concurrency,
+	})
+	if err != nil {
+		return nil, err
+	}
+	out := make([]StockQuote, 0, len(quotes))
+	for _, q := range quotes {
+		out = append(out, StockQuote{
+			Code:  q.Code,
+			Name:  q.Name,
+			Price: q.Price,
+			// 单位适配（契约见 contract.go: Provider 边界输出一律"元"）：
+			// 腾讯 qt.gtimg.cn 字段实测——[37]成交额为"万元"、[45]总市值为"亿元"，
+			// 必须在适配层换算为元，严禁散落到筛选逻辑中。
+			AvgAmount20D:   q.Amount * YuanPerWan,             // 当日成交额(万元->元)做初筛代理值
+			TotalMarketCap: f64(q.TotalMarketCap) * YuanPerYi, // 总市值(亿元->元)
+		})
+	}
+	return out, nil
+}
+
+// AvgAmountByKline 用东财日 K 精算单只股票近 window 个交易日日均成交额。
+// 失败返回 err, 由调用方决定回退策略（保留代理值）。
+func (p *SDKProvider) AvgAmountByKline(ctx context.Context, code string, window int, end time.Time) (float64, error) {
+	start := end.AddDate(0, 0, int(float64(window)*1.8)+10)
+	rows, err := p.sdk.Kline.CN(ctx, code, stock.HistoryKlineOptions{
+		Period:    stock.KlinePeriodDaily,
+		Adjust:    stock.AdjustNone,
+		StartDate: start.Format("2006-01-02"),
+		EndDate:   end.Format("2006-01-02"),
+	})
+	if err != nil {
+		return 0, err
+	}
+	var sum float64
+	var n int
+	for _, r := range rows[len(rows)-minInt(len(rows), window):] {
+		if a := f64(r.Amount); a > 0 {
+			sum += a
+			n++
+		}
+	}
+	if n == 0 {
+		return 0, context.DeadlineExceeded // 语义: 无有效样本
+	}
+	return sum / float64(n), nil
+}
+
+// SectorFundFlowRank 行业资金流今日排行（东财 clist, 已按净流入降序返回）。
+func (p *SDKProvider) SectorFundFlowRank(ctx context.Context) ([]SectorFlow, error) {
+	rows, err := p.sdk.FundFlow.SectorRank(ctx, stock.FundFlowRankOptions{
+		Indicator:  stock.FundFlowRankToday,
+		SectorType: stock.FundFlowSectorIndustry,
+	})
+	if err != nil {
+		return nil, err
+	}
+	out := make([]SectorFlow, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, SectorFlow{Code: r.Code, Name: r.Name, MainNetInflow: f64(r.MainNetInflow)})
+	}
+	return out, nil
+}
+
+// IndustryConstituents 行业板块成分股。
+func (p *SDKProvider) IndustryConstituents(ctx context.Context, boardCode string) ([]ConstituentStock, error) {
+	rows, err := p.sdk.Board.IndustryConstituents(ctx, boardCode)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]ConstituentStock, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, ConstituentStock{Code: r.Code, Name: r.Name, Price: f64(r.Price)})
+	}
+	return out, nil
+}
+
+// DragonTigerInstitution 龙虎榜机构席位净买入统计。
+func (p *SDKProvider) DragonTigerInstitution(ctx context.Context, start, end time.Time) ([]InstitutionBuy, error) {
+	rows, err := p.sdk.DragonTiger.Institution(ctx, stock.DragonTigerDateOptions{
+		StartDate: start.Format("2006-01-02"),
+		EndDate:   end.Format("2006-01-02"),
+	})
+	if err != nil {
+		return nil, err
+	}
+	out := make([]InstitutionBuy, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, InstitutionBuy{Code: r.Code, Name: r.Name, Date: r.Date, OrgNetAmount: f64(r.OrgNetAmount)})
+	}
+	return out, nil
+}
+
+// FundList 全市场基金代码清单。
+func (p *SDKProvider) FundList(ctx context.Context) ([]string, error) {
+	return p.sdk.Data.CodesFund(ctx)
+}
+
+// FundBatchQuote 批量基金快照（分片防止上游 URL 过长）。
+func (p *SDKProvider) FundBatchQuote(ctx context.Context, codes []string) ([]FundSnapshot, error) {
+	var out []FundSnapshot
+	for i := 0; i < len(codes); i += p.batchSize {
+		end := i + p.batchSize
+		if end > len(codes) {
+			end = len(codes)
+		}
+		chunk := codes[i:end]
+		quotes, err := p.sdk.Quotes.Fund(ctx, chunk)
+		if err != nil {
+			return nil, err
+		}
+		for _, q := range quotes {
+			out = append(out, FundSnapshot{Code: q.Code, Name: q.Name, Price: q.NAV})
+		}
+	}
+	return out, nil
+}
+
+// ETFCloseSeries ETF 日线收盘价（前复权）。
+func (p *SDKProvider) ETFCloseSeries(ctx context.Context, code string, lookback int, end time.Time) (*DailyClose, error) {
+	start := end.AddDate(0, 0, int(float64(lookback)*1.8)+10)
+	rows, err := p.sdk.Kline.CN(ctx, code, stock.HistoryKlineOptions{
+		Period:    stock.KlinePeriodDaily,
+		Adjust:    stock.AdjustQFQ,
+		StartDate: start.Format("2006-01-02"),
+		EndDate:   end.Format("2006-01-02"),
+	})
+	if err != nil {
+		return nil, err
+	}
+	dc := &DailyClose{}
+	for _, r := range rows {
+		c := f64(r.Close)
+		if c <= 0 {
+			continue
+		}
+		dc.Dates = append(dc.Dates, r.Date)
+		dc.Closes = append(dc.Closes, c)
+	}
+	if len(dc.Closes) > lookback {
+		dc.Dates = dc.Dates[len(dc.Dates)-lookback:]
+		dc.Closes = dc.Closes[len(dc.Closes)-lookback:]
+	}
+	return dc, nil
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+// ---------------------------------------------------------------------------
+// 精筛管线新增能力实现（证券资格 / 财务状态 / 相对强度）
+// ---------------------------------------------------------------------------
+
+// StockQualification 组合 F10 概况（上市日期/证券类型）与最近一期财务指标。
+//
+// 两个子查询独立容错：任一失败不阻断另一个，缺失字段留空/nil，由 Generator
+// 侧按"未知放行 + warning"策略处理；仅当两者都失败时才返回 error。
+func (p *SDKProvider) StockQualification(ctx context.Context, code string) (*StockQualification, error) {
+	q := &StockQualification{Code: code}
+	var profileErr, finErr error
+
+	profile, err := p.sdk.Data.StockProfile(ctx, code)
+	if err != nil {
+		profileErr = err
+	} else {
+		q.SecurityType = profile.SecurityType
+		if profile.Issue.ListingDate != nil {
+			q.ListingDate = *profile.Issue.ListingDate
+		}
+	}
+
+	rows, err := p.sdk.Data.FinancialIndicators(ctx, code, stock.FinancialIndicatorOptions{})
+	if err != nil {
+		finErr = err
+	} else if len(rows) > 0 {
+		latest := rows[0] // 上游按报告期降序; 防御性再扫一遍取最新非空行
+		for _, r := range rows {
+			if r.ROEWeighted != nil || r.ParentNetProfitYoY != nil || r.BasicEPS != nil {
+				latest = r
+				break
+			}
+		}
+		q.ROEWeighted = latest.ROEWeighted
+		q.ParentNetProfitYoY = latest.ParentNetProfitYoY
+		q.BasicEPS = latest.BasicEPS
+	}
+
+	if profileErr != nil && finErr != nil {
+		return nil, fmt.Errorf("qualification both sources failed: profile=%v fin=%w", profileErr, finErr)
+	}
+	return q, nil
+}
+
+// StockBars 个股日 K 收盘序列（前复权，保证区间涨跌幅口径跨票可比）。
+func (p *SDKProvider) StockBars(ctx context.Context, code string, lookback int, end time.Time) ([]DailyBar, error) {
+	return p.bars(ctx, code, lookback, end, stock.AdjustQFQ)
+}
+
+// IndexBars 基准指数日 K 收盘序列（指数无复权语义，取不复权）。
+func (p *SDKProvider) IndexBars(ctx context.Context, indexCode string, lookback int, end time.Time) ([]DailyBar, error) {
+	return p.bars(ctx, indexCode, lookback, end, stock.AdjustNone)
+}
+
+func (p *SDKProvider) bars(ctx context.Context, code string, lookback int, end time.Time, adjust stock.AdjustType) ([]DailyBar, error) {
+	start := end.AddDate(0, 0, int(float64(lookback)*1.8)+10)
+	rows, err := p.sdk.Kline.CN(ctx, code, stock.HistoryKlineOptions{
+		Period:    stock.KlinePeriodDaily,
+		Adjust:    adjust,
+		StartDate: start.Format("2006-01-02"),
+		EndDate:   end.Format("2006-01-02"),
+	})
+	if err != nil {
+		return nil, err
+	}
+	bars := make([]DailyBar, 0, len(rows))
+	for _, r := range rows {
+		c := f64(r.Close)
+		if c <= 0 {
+			continue
+		}
+		bars = append(bars, DailyBar{Date: r.Date, Close: c})
+	}
+	if len(bars) > lookback {
+		bars = bars[len(bars)-lookback:]
+	}
+	return bars, nil
+}
+
+// BarsOHLC 个股完整 OHLC 日 K（前复权，与 StockBars 同口径），供阶段 3
+// OHLC 完整性校验与行情时点 as_of 对齐使用。Kline.CN 行含 Open/High/Low/Close。
+func (p *SDKProvider) BarsOHLC(ctx context.Context, code string, lookback int, end time.Time) ([]barOHLC, error) {
+	start := end.AddDate(0, 0, int(float64(lookback)*1.8)+10)
+	rows, err := p.sdk.Kline.CN(ctx, code, stock.HistoryKlineOptions{
+		Period:    stock.KlinePeriodDaily,
+		Adjust:    stock.AdjustQFQ,
+		StartDate: start.Format("2006-01-02"),
+		EndDate:   end.Format("2006-01-02"),
+	})
+	if err != nil {
+		return nil, err
+	}
+	bars := make([]barOHLC, 0, len(rows))
+	for _, r := range rows {
+		bars = append(bars, barOHLC{
+			Date:  r.Date,
+			Open:  f64(r.Open),
+			High:  f64(r.High),
+			Low:   f64(r.Low),
+			Close: f64(r.Close),
+		})
+	}
+	if len(bars) > lookback {
+		bars = bars[len(bars)-lookback:]
+	}
+	return bars, nil
+}
+
+// StockAmounts 个股日成交额序列（阶段 4 ADV20/交易容量专用）。
+//
+// 单位与复权口径说明（契约，见 liquidity.go）：
+//   - stock-go HistoryKline.Amount 为当日实际成交金额，公开口径为人民币元；
+//     适配层不做任何缩放，直接透传——若上游变更单位，唯一需要修改的就是这里。
+//   - Adjust 必须为 AdjustNone（未复权）：流动性判断使用实际成交额，
+//     绝不以复权价格×成交量反推（该值未经数据源验证，且除权日会失真）。
+//   - Amount 缺失（nil/<=0）的行保留 Date 并置 Amount=0，由计算层按
+//     "缺失≠零"规则处理（见 adv20），不在适配层悄悄剔除样本。
+func (p *SDKProvider) StockAmounts(ctx context.Context, code string, lookback int, end time.Time) ([]DailyAmountRow, error) {
+	start := end.AddDate(0, 0, int(float64(lookback)*1.8)+10)
+	rows, err := p.sdk.Kline.CN(ctx, code, stock.HistoryKlineOptions{
+		Period:    stock.KlinePeriodDaily,
+		Adjust:    stock.AdjustNone, // 流动性=实际成交额口径，禁止复权
+		StartDate: start.Format("2006-01-02"),
+		EndDate:   end.Format("2006-01-02"),
+	})
+	if err != nil {
+		return nil, err
+	}
+	out := make([]DailyAmountRow, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, DailyAmountRow{Date: r.Date, Amount: f64(r.Amount)})
+	}
+	if len(out) > lookback {
+		out = out[len(out)-lookback:]
+	}
+	return out, nil
+}

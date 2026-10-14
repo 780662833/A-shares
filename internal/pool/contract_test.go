@@ -1,0 +1,143 @@
+package pool
+
+import "testing"
+
+// ---------------------------------------------------------------------------
+// 阶段 0 数据契约验收：枚举语义、单位换算、参数表对齐
+// ---------------------------------------------------------------------------
+
+func TestSourceStatusSemantics(t *testing.T) {
+	// SUCCESS_EMPTY 是正常空结果：闸门通过（生成器据此产出合法空来源）
+	if !StatusSuccessEmpty.Usable() {
+		t.Fatal("SUCCESS_EMPTY must be usable")
+	}
+	// FAILED 绝不能被当作"通过/空通过"
+	if StatusFailed.Usable() {
+		t.Fatal("FAILED must never be usable")
+	}
+	// 阶段 0 审查 P0-1: 闸门白名单语义 —— PARTIAL/STALE/未定义状态不得通过。
+	for _, s := range []SourceStatus{StatusOK} {
+		if !s.Usable() {
+			t.Fatalf("%s should be usable", s)
+		}
+	}
+	for _, s := range []SourceStatus{StatusPartial, StatusStale, SourceStatus(""), SourceStatus("WHATEVER")} {
+		if s.Usable() {
+			t.Fatalf("%q must NOT pass the gate (whitelist = OK/SUCCESS_EMPTY only)", s)
+		}
+	}
+}
+
+// TestSourceStatusPolicies 验证四种用途下的状态策略矩阵（阶段 0 审查 P0-1）。
+func TestSourceStatusPolicies(t *testing.T) {
+	tests := []struct {
+		name                string
+		status              SourceStatus
+		wantKnown           bool
+		wantComplete        bool
+		wantFreshSignal     bool
+		wantLifecycleUpdate bool
+	}{
+		{"完整成功", StatusOK, true, true, true, true},
+		{"成功空结果", StatusSuccessEmpty, true, true, false, true},
+		{"部分成功", StatusPartial, true, false, false, false},
+		{"数据过期", StatusStale, true, false, false, false},
+		{"获取失败", StatusFailed, true, false, false, false},
+		{"未知状态", SourceStatus(""), false, false, false, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.status.IsKnown(); got != tt.wantKnown {
+				t.Fatalf("IsKnown() = %v, want %v", got, tt.wantKnown)
+			}
+			if got := tt.status.IsCompleteSuccess(); got != tt.wantComplete {
+				t.Fatalf("IsCompleteSuccess() = %v, want %v", got, tt.wantComplete)
+			}
+			if got := tt.status.CanGenerateFreshSignal(); got != tt.wantFreshSignal {
+				t.Fatalf("CanGenerateFreshSignal() = %v, want %v", got, tt.wantFreshSignal)
+			}
+			if got := tt.status.CanUpdateLifecycle(); got != tt.wantLifecycleUpdate {
+				t.Fatalf("CanUpdateLifecycle() = %v, want %v", got, tt.wantLifecycleUpdate)
+			}
+		})
+	}
+}
+
+func TestAmountUnitNormalization(t *testing.T) {
+	// 亿元 -> 元 唯一入口，筛选逻辑只见"元"
+	if got := normalizeYiAmount(1); got != YuanPerYi {
+		t.Fatalf("1亿 should be 1e8元, got %v", got)
+	}
+	if got := normalizeYiAmount(0.5); got != 5e7 {
+		t.Fatalf("0.5亿 should be 5e7, got %v", got)
+	}
+	// 与配置阈值口径一致性: LHBMinNetBuy=5000万 == normalizeYiAmount(0.5)
+	p := Params()
+	if p.LHBMinNetBuy != normalizeYiAmount(0.5) {
+		t.Fatalf("LHB threshold unit mismatch: %v vs %v", p.LHBMinNetBuy, normalizeYiAmount(0.5))
+	}
+	// FUND 来源契约市值门槛 = 50 亿（FundFlowMinMarketCap）; 流动性初筛 MinMarketCap = 5 亿为 Go 层新增口径
+	if p.FundFlowMinMarketCap != normalizeYiAmount(50) {
+		t.Fatalf("fund-flow market cap threshold unit mismatch: %v", p.FundFlowMinMarketCap)
+	}
+	if p.MinMarketCap != 5e8 {
+		t.Fatalf("liquidity screen market cap threshold mismatch: %v, want 5e8", p.MinMarketCap)
+	}
+	if formatYi(5e9) != "50.00亿" {
+		t.Fatalf("formatYi diag output wrong: %s", formatYi(5e9))
+	}
+}
+
+func TestParamsContractTable(t *testing.T) {
+	p := Params()
+	// 第一版参数表逐项核对（均为"元"口径）
+	checks := []struct {
+		name string
+		got  float64
+		want float64
+	}{
+		{"SectorTopN", float64(p.SectorTopN), 3},
+		{"SectorLeadersK", float64(p.SectorLeadersK), 3},
+		{"ETFTopM", float64(p.ETFTopM), 8},
+		{"FundFlowMinNetBuy", p.LHBMinNetBuy, 5e7},            // 5000 万元
+		{"FundFlowMinMarketCap", p.FundFlowMinMarketCap, 5e9}, // 50 亿元（FUND 来源单独叠加）
+		{"LiquidityMinMarketCap", p.MinMarketCap, 5e8},        // 5 亿元（流动性初筛, Go 层新增口径）
+		{"StockMinPrice", p.MinPrice, 1.0},                    // 1 元
+		{"MinListingDays", float64(p.MinListedDays), 120},
+		{"RSWindow(R60)", float64(p.RSWindow), 60},
+	}
+	for _, c := range checks {
+		if c.got != c.want {
+			t.Errorf("%s = %v, want %v", c.name, c.got, c.want)
+		}
+	}
+	// ETF 与股票流动性门槛必须分开定义（不允许共用单一常量）
+	if ContractStockMinADV20 == ContractETFMinADV20 {
+		t.Error("stock and ETF ADV thresholds must differ")
+	}
+	if ContractStockMinADV20 != 5e7 || ContractETFMinADV20 != 2e7 {
+		t.Errorf("ADV contract values wrong: stock=%v etf=%v", ContractStockMinADV20, ContractETFMinADV20)
+	}
+	// StrengthTopN 灰度期不截断
+	if p.RSTopK != 0 {
+		t.Errorf("RSTopK default should be 0 (no truncation in gray release), got %d", p.RSTopK)
+	}
+}
+
+func TestEnumValuesAreFixedStrings(t *testing.T) {
+	// 契约锁定：枚举字面量不可变更（下游落库/日志解析依赖）
+	type kv struct{ got, want string }
+	list := []kv{
+		{string(StatusOK), "OK"}, {string(StatusSuccessEmpty), "SUCCESS_EMPTY"},
+		{string(StatusPartial), "PARTIAL"}, {string(StatusStale), "STALE"}, {string(StatusFailed), "FAILED"},
+		{string(EligPass), "PASS"}, {string(EligBlocked), "BLOCKED"}, {string(EligUnknown), "UNKNOWN"},
+		{string(LiqPass), "PASS"}, {string(LiqWarn), "WARN"}, {string(LiqFail), "FAIL"}, {string(LiqDataInsufficient), "DATA_INSUFFICIENT"},
+		{string(FinPass), "PASS"}, {string(FinWarn), "WARN"}, {string(FinBlocked), "BLOCKED"}, {string(FinDataInsufficient), "DATA_INSUFFICIENT"},
+		{string(StrengthA), "A"}, {string(StrengthB), "B"}, {string(StrengthNone), "NONE"},
+	}
+	for _, p := range list {
+		if p.got != p.want {
+			t.Errorf("enum literal changed: %q != %q", p.got, p.want)
+		}
+	}
+}
