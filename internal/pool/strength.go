@@ -483,7 +483,21 @@ func (g *Generator) applyStrengthPathsAndScores(kept []AggEntry, w strengthWirin
 			out = append(out, assign(e, true))
 		}
 	}
+	// WARN 降权不得越过未知放行条目：直通段按"证据强度"排序——本轮股票类打分且
+	// Scored=true 者（含 RankScore=0 的 WARN×0.5 归零票）在前、未参与打分者其后，
+	// 组内沿用 downrankLess（RankScore→RSScore→原序）。若仅靠 SliceStable 保持输入
+	// 顺序，WARN 票会因输入靠前而稳定排在未知放行 PASS 票之前，违反"降权条目必须
+	// 排到无证据条目之后"的分层契约（TestPipelineWarnDownrankAndProvenance 锁定）。
+	evi, noEv := make([]AggEntry, 0, len(segRest)), make([]AggEntry, 0, len(segRest))
 	for _, e := range segRest {
+		if isStock(e) && e.Scored {
+			evi = append(evi, e)
+		} else {
+			noEv = append(noEv, e)
+		}
+	}
+	sort.SliceStable(evi, func(i, j int) bool { return downrankLess(evi[i], evi[j]) })
+	for _, e := range append(evi, noEv...) {
 		out = append(out, assign(e, isStock(e) && e.Scored))
 	}
 	return out

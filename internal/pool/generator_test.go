@@ -223,9 +223,12 @@ func baseFake() *fakeProvider {
 	f.stockBars = func(code string, lookback int) []DailyBar { return mkFlat(61, 110, 100, 100) }
 	f.indexBars = func(code string, lookback int) []DailyBar { return mkFlat(61, 100, 100, 100) }
 	f.stockAmounts = func(code string, lookback int) []DailyAmountRow {
-		amt := map[string]float64{"600519": 5e9, "300750": 3e9, "601127": 2e9}[code]
+		// 000001: 明确给"低成交额"真实记录(1e7 < MinAvgAmount 5e7) -> ADV20 FAIL 被闸门剔除。
+		// 若返回 nil 则是 DATA_INSUFFICIENT（未知不删, 新架构契约下会保留在池内）——
+		// 本用例断言的是"illiquid 必须被剔", 因此必须注入明确的 FAIL 证据而非缺失。
+		amt := map[string]float64{"600519": 5e9, "300750": 3e9, "601127": 2e9, "000001": 1e7}[code]
 		if amt == 0 {
-			return nil // 000001 等无记录 -> DATA_INSUFFICIENT(保留标记, 不 FAIL)
+			return nil // 其余无记录代码 -> DATA_INSUFFICIENT(保留标记, 不 FAIL)
 		}
 		rows := make([]DailyAmountRow, advWindow)
 		for i := range rows {
