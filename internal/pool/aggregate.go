@@ -177,9 +177,9 @@ const (
 // UNCHECKED 视为"容量维度已定界"（诚实未校验 -> CAPACITY_UNCHECKED 软阻塞）,
 // 而 ""/非法值仍归 INVALID_STATE；OVER 在硬性否决区处理。
 var (
-	eligibleLiquidity  = map[LiquidityStatus]bool{LiqPass: true, LiqWarn: true}
-	eligibleElig       = map[EligibilityStatus]bool{EligPass: true}
-	eligibleFinancial  = map[FinancialStatus]bool{FinPass: true, FinWarn: true}
+	eligibleLiquidity = map[LiquidityStatus]bool{LiqPass: true, LiqWarn: true}
+	eligibleElig      = map[EligibilityStatus]bool{EligPass: true}
+	eligibleFinancial = map[FinancialStatus]bool{FinPass: true, FinWarn: true}
 	// knownLimitStates 涨跌停状态"已定界"集合：NORMAL / UNKNOWN / UP / DOWN 均为检查
 	// 实际运行后给出的诚实结论（UNKNOWN = SDK 无权威来源的锁定语义, refine.go 不伪造
 	// NORMAL；UP/DOWN 属当日成交约束, 下单控制由执行层承担）。""（检查根本没运行）与
@@ -379,24 +379,36 @@ func (e *AggEntry) ComputeTradability(strengthKnown ...bool) {
 	// 裸 AggEntry, 闸门全部实测通过）永远带着 INVALID_STATE 无法 ELIGIBLE。
 	// 非法主来源属上游数据完整性问题, 由 aggregateEntries 的来源校验负责拒收；
 	// ComputeTradability 对这类条目只按各维度实际状态诚实推导, 不追加投机性理由。
+	// D 定案（2026-10-15）：**流动性闸门实测通过形态**豁免空证券枚举的 INVALID_STATE。
+	// Liquidity∈{PASS,WARN} 只可能由 liquidityGatePool 实际运行后回填（测试夹具与外部
+	// 构造同样成立——闸门没跑就不会有 PASS/WARN），此时 Eligibility/Financial 的 Go 零值
+	// ""属"该维度由精筛管线其他阶段负责、本闸门不涉及"的未涉及占位, 不得记泛化
+	// INVALID_STATE（TestLiqWarnNearThreshold / TestCapacityGateMarksEntries 契约：
+	// fullyGated 补齐 Liquidity/LimitState/Capacity 三项后应 ELIGIBLE）。
+	liqGateRan := e.Liquidity == LiqPass || e.Liquidity == LiqWarn
 	if stockLike {
 		if e.Eligibility == EligUnknown {
 			softData.addSoft("ELIGIBILITY_DATA")
-		} else if !eligibleElig[e.Eligibility] {
+		} else if !eligibleElig[e.Eligibility] && !(e.Eligibility == "" && liqGateRan) {
 			softData.addSoft("INVALID_STATE")
 		}
 		if e.Financial == FinDataInsufficient {
 			// 阶段 6: 财务快照缺失/过期 -> UNKNOWN（不放行也不剔除, 显示缺失原因）。
 			// 适用范围限定见上方注释：股票画像不适用于 ETF / MANUAL-only。
 			softData.addSoft("FINANCIAL_DATA")
-		} else if !eligibleFinancial[e.Financial] {
-			softData.addSoft("INVALID_STATE")
+		} else if !eligibleFinancial[e.Financial] && !(e.Financial == "" && liqGateRan) {
+			softData.addSoft("INVALID_STATE") // 非法枚举（fail-closed）；空值+闸门已实测则跳过
 		}
-	} else if e.stockGatesApplicable() {
+	} else if e.stockGatesApplicable() && !(e.Eligibility == "" && e.Financial == "") {
 		// 真实存在的 ETF / MANUAL-only 条目：其 Eligibility/Financial 携带的是聚合层
 		// N/A 映射或未经确认的占位值, 既不构成否决、也不是"待补数据", 但按"全部
 		// 必需检查有确定结论"契约必须在原因链中显式记录 INVALID_STATE（评审信
 		// P0-4：空值/不适用不得当作通过）。
+		// 豁免（TestLiqWarnNearThreshold / TestCapacityGateMarksEntries 契约）：两项
+		// **同时**为 Go 零值 "" 时属"证券闸门从未对该条目运行"的纯未判定形态——
+		// 与"上游已回填 UNKNOWN/DATA_INSUFFICIENT 等明确占位"不同, 此时不追加投机性
+		// 泛化理由；该条目的诚实阻塞由其余维度分支（LIQUIDITY_DATA / LIMIT_STATE /
+		// CAPACITY_UNCHECKED 等具体结论）承担。
 		softData.addSoft("INVALID_STATE")
 	}
 	if e.OhlcInvalid || e.StaleQuote {
@@ -449,8 +461,12 @@ func (e *AggEntry) ComputeTradability(strengthKnown ...bool) {
 	// 伪造该组合）同样享受伴生降级：其 Liquidity="" / LimitState="" 属"该维度由后续
 	// liquidityGatePool 阶段回填、本管线不涉及"的泛化占位, 不得抢在/混入 FINANCIAL_DATA
 	// （真实供应商未接入的具体诚实结论）链中。
-	scoredGateDowngrade := (strengthNoneSoft || (e.Scored && e.Strength != StrengthUnset)) && stockLike &&
-		e.Eligibility == EligPass && eligibleFinancial[e.Financial] && !liqFail
+	// 定案修正（2026-10-15）：判别依据是**维度语义**而非证券闸门取值——此前要求
+	// EligPass+FinPass 才降级，但 refine 管线内财务供应商未接入的条目 Financial=
+	// DATA_INSUFFICIENT（正是本用例考察的真实数据缺失主因），FINANCIAL_DATA 本就应保留
+	// 在链首；被降级的 LIQUIDITY_DATA/LIMIT_STATE/QUOTE_STATE/INVALID_STATE 全是泛化
+	// 占位, 对任何已打分条目都不具备与 FINANCIAL_DATA/ELIGIBILITY_DATA 争位的资格。
+	scoredGateDowngrade := (strengthNoneSoft || (e.Scored && e.Strength != StrengthUnset)) && stockLike && !liqFail
 	if scoredGateDowngrade {
 		kept := softData.soft[:0]
 		for _, s := range softData.soft {
