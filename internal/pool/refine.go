@@ -416,7 +416,6 @@ func (g *Generator) refinePoolWith(ctx context.Context, pool []AggEntry, warning
 			// longUsable：长窗口是否真正参与本票评分——基准长窗可得 ∧ 个股长窗端点
 			// 存在（chg 可计算）二者缺一不可；仅基准可得而个股缺样时只有短窗超额参与
 			// 打分，判定侧同样不得启用长窗口径。
-			longUsable := haveL && res.longKnown
 			if haveS {
 				v := *benchChgShort
 				stockBenchShort[k] = &v
