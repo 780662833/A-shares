@@ -413,10 +413,9 @@ func (g *Generator) refinePoolWith(ctx context.Context, pool []AggEntry, warning
 			// 接线：记录该票打分时实际参与的基准窗口可得性（与 haveS/haveL 同语义），
 			// 供阶段 7 路径判定复用同一基准视图——单票长窗样本不足时不得再用全局
 			// R60 基准去要求 "R60>0" 硬门槛（口径分裂 bug）。
-			// longUsable：长窗口是否真正参与本票评分——基准长窗可得 ∧ 个股长窗端点
-			// 存在（chg 可计算）二者缺一不可；仅基准可得而个股缺样时只有短窗超额参与
-			// 打分，判定侧同样不得启用长窗口径。
-			longUsable := haveL && res.longKnown
+			// 注：haveL 定义即含个股长窗端点存在（res.chg != nil），其本身等价于
+			// "长窗口真正参与本票评分"（原 longUsable := haveL && res.longKnown 为
+			// 恒等冗余死条件，已清理）；仅基准可得而个股缺样时只有短窗超额参与打分。
 			if haveS {
 				v := *benchChgShort
 				stockBenchShort[k] = &v
