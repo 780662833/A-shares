@@ -26,7 +26,7 @@ func main() {
 		return
 	}
 	cfg := pool.DefaultConfig()
-	var nCode, nST, nPrice, nAmtLE1e8, nCap int
+	var nCode, nST, nPrice, nAmtLE1e8 int
 	var pass1e8, pass5kw []pool.StockQuote
 	var zero, noCap int
 	for _, q := range quotes {
@@ -48,24 +48,26 @@ func main() {
 			nPrice++
 			continue
 		}
-		if q.AvgAmount20D > 5e7 {
+		if q.AvgAmount20D > cfg.MinAvgAmount { //20日均成交额>5千万
 			pass5kw = append(pass5kw, q)
 		}
-		if q.AvgAmount20D <= cfg.MinAvgAmount {
+		if q.AvgAmount20D <= cfg.MinAvgAmount { //20日均成交额<=5千万
 			nAmtLE1e8++
 			continue
 		}
-		if cfg.MinMarketCap > 0 && q.TotalMarketCap > 0 && q.TotalMarketCap < cfg.MinMarketCap {
-			nCap++
-			continue
-		}
+		// 若配置了最小市值50亿门槛且市值数据有效，则剔除市值不达标的股票
+		//if cfg.MinMarketCap > 0 && q.TotalMarketCap > 0 && q.TotalMarketCap < cfg.MinMarketCap {
+		//	nCap++
+		//	continue
+		//}
 		pass1e8 = append(pass1e8, q)
 	}
 	fmt.Printf("快照总数=%d  当日成交额=0 的只数=%d (%.1f%%)  市值字段缺失(=0)=%d\n",
 		len(quotes), zero, float64(zero)/float64(len(quotes))*100, noCap)
-	fmt.Printf("漏斗: 非6位代码剔=%d ST剔=%d 价<%.1f剔=%d 额<=1亿剔=%d 市值<50亿剔=%d\n",
-		nCode, nST, cfg.MinPrice, nPrice, nAmtLE1e8, nCap)
-	fmt.Printf("通过默认门槛(额>1亿且市值>=50亿)=%d ; 若门槛改为额>5千万=%d\n", len(pass1e8), len(pass5kw))
+	fmt.Printf("漏斗: 非6位代码剔=%d ST剔=%d 价<%.1f剔=%d 20日均成交额<=5千万剔=%d ",
+		nCode, nST, cfg.MinPrice, nPrice, nAmtLE1e8)
+
+	fmt.Printf("通过默认门槛(额>5千万)=%d ; 若门槛改为额>5千万=%d\n", len(pass1e8), len(pass5kw))
 	sort.Slice(pass5kw, func(i, j int) bool { return pass5kw[i].AvgAmount20D > pass5kw[j].AvgAmount20D })
 	n := 10
 	if len(pass5kw) < n {

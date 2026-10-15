@@ -110,7 +110,7 @@ func DefaultConfig() Config {
 		LHBLookbackD:         7,
 		MinPrice:             1.0,
 		MinAvgAmount:         ContractStockMinADV20, // 5e7 = 5 千万（契约口径）
-		MinMarketCap:         5e8,                   // 5 亿（流动性初筛口径）
+		MinMarketCap:         5e9,                   // 50 亿（流动性初筛口径）
 		FundFlowMinMarketCap: 5e9,                   // 50 亿（契约 FundFlowMinMarketCap, FUND 来源叠加）
 		ExcludeST:            true,
 		LiquidityTopN:        400,
