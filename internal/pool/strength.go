@@ -130,14 +130,14 @@ func classifyPathA_B(o strengthOutcome) pathABResult {
 			return res
 		}
 	}
-	// ---- 路径 B：修复候选（短期强 R20>0 ∧ RS20_index>0，或中期强 R60>0；
-	// RS20_index 硬门槛只约束 A——否则"中期强、短期回调未转正"的修复股永远
-	// 进不了低优先级观察队列，违背 6.3"趋势修复候选"契约语义。指数侧完全
-	// 不可得时（rsIdx20==nil）不猜测给 B，保持 NONE。）----
-	midStrong := o.R60Stock != nil && *o.R60Stock > 0
-	if rsIdxPositive || midStrong {
+	// ---- 路径 B：修复候选（短期强且跑赢大盘：R20>0 ∧ RS20_index>0，
+	// 与 A 共享同一对硬门槛，仅趋势结构/行业强度确认不足才落 B。
+	// 中期强但短期未转正（R60>0, R20≤0）属震荡档证据不足，按契约归 NONE
+	// 保留池内，不以 B 名义进入修复观察队列。指数侧完全不可得时
+	// （rsIdx20==nil）不猜测给 B，保持 NONE。）----
+	if shortPositive && rsIdxPositive {
 		res.path = StrengthB
-		res.reason = "B: 短期强于大盘或中期绝对收益为正, 但趋势结构/行业强度未达A完整条件"
+		res.reason = "B: 短期强于大盘(R20>0且RS20_index>0), 但趋势结构/行业强度未达A完整条件"
 		return res
 	}
 	res.reason = "NONE: R20≤0且RS20_index未确认为正且R60≤0(两窗口均无强势证据)"
@@ -504,6 +504,24 @@ func (g *Generator) applyStrengthPathsAndScoresMode(kept []AggEntry, w strengthW
 		default:
 			segNone = append(segNone, kept[i])
 		}
+	}
+	// trunc 按 PathATopN / PathBTopN 截断分段：段内先按 RankScore 降序稳定排序,
+	// TopN<=0 视为不截断（默认配置语义）。被裁掉的条目并入 NONE 段保留在池内
+	// （软阻塞由 ComputeTradability 的 STRENGTH 承担, 绝不物理删除记录）,
+	// 并输出审计 warning 使每次截断量可追溯。
+	trunc := func(seg []AggEntry, topN int, name string) []AggEntry {
+		sort.SliceStable(seg, func(a, b int) bool { return seg[a].RankScore > seg[b].RankScore })
+		if topN <= 0 || len(seg) <= topN {
+			return seg
+		}
+		overflow := seg[topN:]
+		seg = seg[:topN]
+		for i := range overflow {
+			overflow[i].Strength = StrengthNone
+			segNone = append(segNone, overflow[i])
+		}
+		*warnings = append(*warnings, fmt.Sprintf("STRENGTH %s 路径截断: TopN=%d, 超限 %d 只降级为 NONE 保留观察(不删除)", name, topN, len(overflow)))
+		return seg
 	}
 	segA = trunc(segA, g.cfg.PathATopN, "A")
 	segB = trunc(segB, g.cfg.PathBTopN, "B")

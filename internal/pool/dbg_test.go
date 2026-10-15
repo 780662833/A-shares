@@ -1,6 +1,7 @@
 package pool
 
 import (
+	"context"
 	"fmt"
 	"testing"
 )
@@ -60,4 +61,29 @@ func TestDbgAll(t *testing.T) {
 			fmt.Printf("INVALID %v strength=%v score=%v shortEx=%v longEx=%v reason=%q\n", e.Symbol, e.Strength, e.RankScore, deref(e.RetShortExcess), deref(e.RetLongExcess), e.StrengthReason)
 		}
 	}
+}
+
+func TestDbgTmp602(t *testing.T) {
+f := newFake()
+f.qualify = func(code string) *StockQualification { return qual("2020-01-01", 1, 5) }
+f.indexBars = func(idx string, lookback int) []DailyBar { return mkFlat(61, 100, 100, 100) }
+f.sectorIndexBars = func(name string, lookback int) []DailyBar { return mkFlat(61, 99, 82.5, 82.5) }
+f.stockBars = func(code string, lookback int) []DailyBar {
+switch code {
+case "600001":
+return mkFlat(61, 110, 100, 100)
+case "600002":
+return mkFlat(61, 120, 126.316, 100)
+case "600003":
+return mkFlat(61, 90, 100, 100)
+}
+return nil
+}
+g := NewGenerator(f, refineCfg())
+warns := []string{}
+out := g.refinePoolWith(context.Background(), []AggEntry{entryOf("600002", sourceSector), entryOf("600003", sourceSector), entryOf("600001", sourceSector)}, &warns, testNow, 0, 0)
+for _, e := range out {
+t.Logf("DBG %v strength=%v scored=%v shortRaw=%v longRaw=%v rsIdx=%v rsSec=%v reason=%q trad=%s by=%s liq=%q cap=%q lim=%q",
+e.Symbol, e.Strength, e.Scored, deref(e.RetShortRaw), deref(e.RetLongRaw), deref(e.RS20IndexExcess), deref(e.RS20SectorExcess), e.StrengthReason, e.Tradability, e.BlockedBy, e.Liquidity, e.CapacityStatus, e.LimitState)
+}
 }

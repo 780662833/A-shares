@@ -298,27 +298,40 @@ func (e *AggEntry) ComputeTradability(strengthKnown ...bool) {
 		// QUOTE_STATE 判定——精筛恒置 LimitState=LimitUnknown（SDK 无权威涨跌停来源），
 		// 旧顺序下已打分条目永远先命中 QUOTE_STATE/UNKNOWN，把"明确不可入池"稀释成
 		// "待人工确认"。无论是否参与 RS 打分，低价格式硬条件一律 BLOCKED。
-		e.Tradability = TradBlocked
-		e.BlockedBy = "PRICE_BELOW_MIN"
-	case e.ChanStatus.BlocksTradability():
+		r.addHard("PRICE_BELOW_MIN")
+	}
+	if e.ChanStatus.BlocksTradability() {
 		// L4 缠论分层：P4 结构失效（czsc 卖点确认/买点被破坏）-> 禁止新订单。
 		// 与 STRENGTH 软阻塞同级（可人工复核放行）；P0~P3 不影响此判定——
 		// "没有买点"只是观察状态, 不是否决证据。未接入缠论层时 ChanStatus
 		// 为空值, BlocksTradability()=false, 行为与旧版完全一致。
-		e.Tradability = TradBlocked
-		e.BlockedBy = "CHAN_STRUCTURE"
-	case e.Strength == StrengthNone && e.hasAutoSourceOnly() && len(strengthKnown) != 0 && !strengthKnown[0]:
-		// 阶段 7 冲突修复：管线**已执行**且股票类条目两条路径均未入选 -> 软阻塞 STRENGTH；
-		// 管线未执行(如流动性闸门复算路径)时不得把"未重新判定"猜测成"打分后落选",
-		// 否则会吞掉 FINANCIAL_DATA/LIQUIDITY_DATA 等更具体的诚实结论。
-	case e.Strength == StrengthNone && e.hasAutoSourceOnly() && len(strengthKnown) == 0:
-		// RS 管线**实际执行过**（Strength 被显式赋值为 A/B/NONE）且股票类条目两条
-		// 路径均未入选 -> 高优先级截断（软阻塞, 可人工放行）。
-		// StrengthUnset（精筛关闭 / RS 失败退化 / ETF / MANUAL-only）不参与此判定,
-		// 否则会把"未打分"吞成"打分后落选", 违反阈值语义诚实原则。
-		r.addHard("STRENGTH")
+		r.addHard("CHAN_STRUCTURE")
 	}
+	// 注意：STRENGTH **不在硬性区收集**。仅当强度管线实际执行过（pipelineRan）且
+	// 全部必需闸门都有确定结论时, NONE 才是"打分后落选"的 BLOCKED 级确定结论
+	// （见下方 hasSoftData==false 分支）；存在 *_DATA / INVALID_STATE 类数据不足
+	// 项时, STRENGTH 只能作为软链**伴生原因**附在链尾（见 hasSoftData 分支）——
+	// 绝不得以硬阻塞身份吞掉 LIQUIDITY_DATA/FINANCIAL_DATA 等"闸门根本没运行"
+	// 的更具体诚实结论（评审信 6.1 ①定案 / TestPipelineProviderNotWiredHonestUnknown）。
+	// strengthNoneSoft 记录伴生资格：股票类条目、非 Unset、管线执行过且落选。
+	// 无参推断（独立 DTO）扩展：调用方**显式赋值** EligPass+FinPass（字段默认值是
+	// EligUnknown/FinDataInsufficient，非经上游确认不会凭空出现）时，视为"证券闸门
+	// 已有确定结论 + Strength=NONE 为打分后落选的确定结论"——与 TestTradabilitySemantics
+	// "RS打分后落选(NONE)->软阻塞STRENGTH"契约一致；StrengthUnset 仍走数据不足路径
+	// （"未打分(Unset)不得吞成STRENGTH落选"用例锁定）。refine 管线始终显式传
+	// strengthKnown，本推断不影响管线内条目的判定。
+	strengthNoneSoft := e.stockGatesApplicable() && e.Strength == StrengthNone &&
+		(pipelineRan || (len(strengthKnown) == 0 && e.Eligibility == EligPass && eligibleFinancial[e.Financial]))
 	liqFail := e.Liquidity == LiqFail
+	// LIQUIDITY 硬因暂存：按 UNKNOWN 链定案（P0-②），BLOCKED 链优先级为
+	// BLACKLIST > ELIGIBILITY > FINANCIAL > HALTED > PRICE_BELOW_MIN > STRENGTH
+	// > LIQUIDITY > CAPACITY——流动性 FAIL 必须排在 CAPACITY 之后（liquidity_test
+	// 契约：OVER+FAIL 并存时主因为 CAPACITY）。Go switch 各分支互斥，LiqFail 条目
+	// 不会同时进入软区 LIQUIDITY_DATA 分支，统一在末尾按优先级插入硬链。
+	liqHard := ""
+	if liqFail {
+		liqHard = "LIQUIDITY"
+	}
 	if e.CapacityStatus == CapacityOver {
 		// 计划参与率超限 -> 需降低数量或分析执行成本后方可交易。
 		r.addHard("CAPACITY")
@@ -335,27 +348,55 @@ func (e *AggEntry) ComputeTradability(strengthKnown ...bool) {
 	//     "尚未复核"的占位结论, 不得掩盖闸门未运行的事实；
 	//   - 闸门全部有确定结论（PASS/WARN/诚实 N/A）且无其他硬性否决时 -> STRENGTH
 	//     维持 BLOCKED（打分后确定性落选, 可人工放行）。
-	softData := tradReasons{} // 仅数据不足类（*_DATA / QUOTE_STATE / LIMIT_STATE / CAPACITY_UNCHECKED / INVALID_STATE）
-	if e.Liquidity == LiqDataInsufficient {
+	softData := tradReasons{} // 数据不足/状态未定类（*_DATA / QUOTE_STATE / LIMIT_STATE / CAPACITY_UNCHECKED / INVALID_STATE）
+	// ---- 软链收集顺序 = UNKNOWN 链展示优先级（P0-② 定案, 2026-10-15 复核修复）----
+	// LIQUIDITY_DATA > ELIGIBILITY_DATA > FINANCIAL_DATA > QUOTE_STATE > LIMIT_STATE
+	// > CAPACITY_UNCHECKED > INVALID_STATE。旧实现把 LIMIT_STATE / INVALID_STATE 的
+	// 收集插在维度分支之前，导致"闸门全部未运行"的最小集主因被泛化的 INVALID_STATE
+	// 吞掉（aggregate_test 契约：首位必须是具体的 LIQUIDITY_DATA）。具体维度结论永远
+	// 优先于泛化状态结论；INVALID_STATE 由 dedupStrings 合并, 多维度命中只保留一份。
+	if e.Liquidity == LiqDataInsufficient || e.Liquidity == "" {
+		// B 组收尾（2026-10-15 复核修复）：DATA_INSUFFICIENT 与**空值**同归 LIQUIDITY_DATA
+		// ——"流动性闸门没跑/样本不足"是具体维度结论, 必须保持链首优先级（aggregate_test
+		// 契约：未判定股票链 = LIQUIDITY_DATA > ELIGIBILITY_DATA > FINANCIAL_DATA）。
+		// 旧实现把空值划入 INVALID_STATE, 使主因被泛化状态吞掉且与下方 LimitState=""
+		// →LIMIT_STATE 的"未运行→具体维度"口径自相矛盾。非法枚举仍诚实记 INVALID_STATE。
+		// 不加 Scored 守卫：AggEntry.Liquidity 的 Go 零值是 ""，独立 DTO（测试夹具、外部构造）
+		// 不带任何 Liquidity 值时同样命中本分支——""→LIQUIDITY_DATA 本身就是测试锁定的契约映射，
+		// 用 !e.Scored 反向排除会破坏"未判定自动股票"用例（INVALID_STATE 抢位）。
 		softData.addSoft("LIQUIDITY_DATA")
 	} else if !eligibleLiquidity[e.Liquidity] && !liqFail {
-		// 空值/非法枚举: 流动性闸门未运行不得当作通过（fail-closed 白名单）。
-		// LiqFail 属明确证据, 在下方统一以 LIQUIDITY 主因处理, 不进软区重复。
+		// 非法枚举: 不得当作通过（fail-closed 白名单）。LiqFail 属明确证据,
+		// 以 LIQUIDITY 硬因处理（liqHard）, 不进软区重复。
 		softData.addSoft("INVALID_STATE")
 	}
-	if e.Eligibility == EligUnknown {
-		softData.addSoft("ELIGIBILITY_DATA")
-	} else if !eligibleElig[e.Eligibility] {
-		softData.addSoft("INVALID_STATE")
-	}
-	if e.Financial == FinDataInsufficient && e.stockGatesApplicable() {
-		// 阶段 6: 财务快照缺失/过期 -> UNKNOWN（不放行也不剔除, 显示缺失原因）。
-		// 适用范围限定：股票 EPS/ROE 画像**不适用于** ETF / MANUAL-only 条目——
-		// 这些条目的 DATA_INSUFFICIENT 只是聚合层"未经确认"的占位值, 把它伪装成
-		// "财务数据缺失"会污染归因（评审信 P0-2：不适用 ≠ 未通过, 更 ≠ 待补数据）。
-		// 其容量维度仍由下方 CAPACITY_UNCHECKED 诚实拦截, 不存在放行缺口。
-		softData.addSoft("FINANCIAL_DATA")
-	} else if !eligibleFinancial[e.Financial] {
+	stockLike := e.isStockLike()
+	// 定案修正（2026-10-15）：证券/财务闸门适用性 = isStockLike（主来源为
+	// SECTOR_LEADER / FUND_FLOW）。此前实现用 stockGatesApplicable()（仅排除
+	// ETF/MANUAL-only），使"PrimarySource=\"\" 等非法主来源"的裸数据条目也走
+	// ELIGIBILITY_DATA/FINANCIAL_DATA 维度分支——与硬性区"非法 Eligibility 枚举
+	// -> ELIGIBILITY 硬阻塞"契约自相矛盾，且让 liquidity 测试夹具（无主来源的
+	// 裸 AggEntry, 闸门全部实测通过）永远带着 INVALID_STATE 无法 ELIGIBLE。
+	// 非法主来源属上游数据完整性问题, 由 aggregateEntries 的来源校验负责拒收；
+	// ComputeTradability 对这类条目只按各维度实际状态诚实推导, 不追加投机性理由。
+	if stockLike {
+		if e.Eligibility == EligUnknown {
+			softData.addSoft("ELIGIBILITY_DATA")
+		} else if !eligibleElig[e.Eligibility] {
+			softData.addSoft("INVALID_STATE")
+		}
+		if e.Financial == FinDataInsufficient {
+			// 阶段 6: 财务快照缺失/过期 -> UNKNOWN（不放行也不剔除, 显示缺失原因）。
+			// 适用范围限定见上方注释：股票画像不适用于 ETF / MANUAL-only。
+			softData.addSoft("FINANCIAL_DATA")
+		} else if !eligibleFinancial[e.Financial] {
+			softData.addSoft("INVALID_STATE")
+		}
+	} else if e.stockGatesApplicable() {
+		// 真实存在的 ETF / MANUAL-only 条目：其 Eligibility/Financial 携带的是聚合层
+		// N/A 映射或未经确认的占位值, 既不构成否决、也不是"待补数据", 但按"全部
+		// 必需检查有确定结论"契约必须在原因链中显式记录 INVALID_STATE（评审信
+		// P0-4：空值/不适用不得当作通过）。
 		softData.addSoft("INVALID_STATE")
 	}
 	if e.OhlcInvalid || e.StaleQuote {
@@ -392,26 +433,83 @@ func (e *AggEntry) ComputeTradability(strengthKnown ...bool) {
 		softData.addSoft("INVALID_STATE") // 非法强度枚举
 	}
 
+	// B 组最后一个待验证点（2026-10-15 定案）：**确定性落选条目**（strengthNoneSoft：
+	// 管线实际执行过、或无参推断下调用方显式赋值 EligPass+FinPass+NONE）的未运行维度
+	// 闸门（Liquidity=""、LimitState="" 等）降级为**伴生项**：
+	//   - 其余证券维度均为 PASS/WARN（EligPass+FinPass）且无其他硬性否决时，NONE
+	//     以硬身份 BLOCKED(STRENGTH) 优先出现（aggregate_test "RS打分后落选"契约）；
+	//   - 存在 FINANCIAL_DATA / ELIGIBILITY_DATA 等**真实数据缺失**（供应商未接入）时，
+	//     维持 ①定案：数据不足主因在前, STRENGTH 仅作链尾伴生
+	//     （TestPipelineProviderNotWiredHonestUnknown 契约）。
+	// 判别依据是维度语义而非夹具形态：LIQUIDITY_DATA / LIMIT_STATE / QUOTE_STATE /
+	// INVALID_STATE 属"检查未运行/状态未回填"的泛化占位；FINANCIAL_DATA /
+	// ELIGIBILITY_DATA 才是"闸门确实跑了但缺数据"的诚实结论, 不得被吞掉。
+	// 扩展（TestPipelineProviderNotWiredHonestUnknown 契约）：**精筛管线内已打分条目**
+	// （Scored=true 且 Strength∈{A,B,NONE}，阶段7 实际执行过路径判定——独立 DTO 无法
+	// 伪造该组合）同样享受伴生降级：其 Liquidity="" / LimitState="" 属"该维度由后续
+	// liquidityGatePool 阶段回填、本管线不涉及"的泛化占位, 不得抢在/混入 FINANCIAL_DATA
+	// （真实供应商未接入的具体诚实结论）链中。
+	scoredGateDowngrade := (strengthNoneSoft || (e.Scored && e.Strength != StrengthUnset)) && stockLike &&
+		e.Eligibility == EligPass && eligibleFinancial[e.Financial] && !liqFail
+	if scoredGateDowngrade {
+		kept := softData.soft[:0]
+		for _, s := range softData.soft {
+			switch s {
+			case "LIQUIDITY_DATA", "LIMIT_STATE", "QUOTE_STATE", "INVALID_STATE":
+				// 伴生项：已打分条目的这些维度不改变 STRENGTH 硬身份。
+			default:
+				kept = append(kept, s)
+			}
+		}
+		softData.soft = kept
+	}
+
 	hasSoftData := len(softData.soft) > 0
 	if hasSoftData {
 		// 软阻塞优先：数据不足类在前, STRENGTH 作为伴生原因附后。硬性否决（黑名单/
 		// 资格/财务 BLOCKED/停牌/低价/CAPACITY）仍保持最高优先级——deriveTradability
-		// 中 hard 非空即 BLOCKED, 本分支只是把"闸门未运行"的真实状态留在链尾供审计。
-		r.soft = append(r.soft, softData.soft...)
-		if e.Strength == StrengthNone && e.isStockLike() {
-			r.soft = append(r.soft, "STRENGTH")
+		// 中 hard 非空即 BLOCKED, 本分支只是把"闸门未运行"的真实状态留在链首供审计。
+		// 去重契约：同一原因在整条链中只出现一次（INVALID_STATE 多维度命中时合并）。
+		r.soft = dedupStrings(append(r.soft, softData.soft...))
+		if strengthNoneSoft || (e.Strength == StrengthNone && stockLike) {
+			// 伴生 STRENGTH 只在链尾作补充说明；无参推断路径（独立 DTO）沿用
+			// "显式赋值 NONE 即落选"的字段推断语义, 与 aggregate_test 锁定契约一致。
+			r.addSoft("STRENGTH")
 		}
-		if liqFail {
-			// 流动性 FAIL 是明确证据 -> BLOCKED, 主因固定 LIQUIDITY（评审信阶段 4
-			// 契约: FAIL 禁止新订单）。其余未运行维度（*_DATA / INVALID_STATE）作为
-			// 伴生原因保留在链尾, 一条都不丢。
-			r.hard = append([]string{"LIQUIDITY"}, r.hard...)
-		}
-	} else if liqFail {
-		// 全部必需检查都有确定结论且无其他硬性否决 -> 纯流动性剔除。
-		r.addHard("LIQUIDITY")
+	}
+	// LIQUIDITY / STRENGTH 硬因统一在此按 BLOCKED 链定案优先级插入：
+	//   - liqHard 置于 CAPACITY **之前**、其余既有硬因之后（BLACKLIST > ELIGIBILITY >
+	//     FINANCIAL > HALTED > PRICE_BELOW_MIN > STRENGTH > LIQUIDITY > CAPACITY）；
+	//   - strengthHard（打分后确定性落选）置于 LIQUIDITY **之前**；仅当无任何软性
+	//     数据不足项时才以 BLOCKED 身份出现——存在 *_DATA 类原因时降级为链尾伴生
+	//     （上方 hasSoftData 分支），绝不得吞掉"闸门根本没运行"的更具体诚实结论
+	//     （评审信 6.1 ①定案 / TestPipelineProviderNotWiredHonestUnknown）。
+	strengthHard := !hasSoftData && strengthNoneSoft
+	var mid []string
+	if strengthHard {
+		mid = append(mid, "STRENGTH")
+	}
+	if liqHard != "" {
+		mid = append(mid, liqHard)
+	}
+	if len(mid) > 0 {
+		r.hard = append(append([]string{}, mid...), r.hard...)
 	}
 	e.Tradability, e.BlockedBy = deriveTradability(r)
+}
+
+// dedupStrings 保序去重（首次出现位置生效）——多因全量记录链中同一原因只保留一份。
+func dedupStrings(in []string) []string {
+	seen := make(map[string]bool, len(in))
+	out := make([]string, 0, len(in))
+	for _, s := range in {
+		if seen[s] {
+			continue
+		}
+		seen[s] = true
+		out = append(out, s)
+	}
+	return out
 }
 
 // ---------------------------------------------------------------------------
@@ -454,7 +552,7 @@ func (e *AggEntry) isETFLike() bool {
 	if e.AssetType != "" {
 		return e.AssetType == "ETF"
 	}
-	return isETFCode(e.Symbol)
+	return IsETFCode(e.Symbol)
 }
 
 // stockGatesApplicable 股票资格 / 财务闸门是否适用于本条目：

@@ -422,7 +422,7 @@ func (g *Generator) refinePoolWith(ctx context.Context, pool []AggEntry, warning
 				stockBenchLong[k] = &v
 			}
 			switch {
-			case haveS && longUsable:
+			case haveS && haveL:
 				w := g.cfg.RSShortWeightPct / 100
 				if w < 0 {
 					w = 0
@@ -642,7 +642,10 @@ func (g *Generator) refinePoolWith(ctx context.Context, pool []AggEntry, warning
 				w.SectorR20[e.SectorName] = fetchSector(e.SectorName)
 			}
 		}
-		kept = g.applyStrengthPathsAndScoresLegacy(kept, w, warnings)
+		// 切换至非 legacy（百分位四因子终局口径）：阶段 5 加权超额仅作粗排输入，
+		// 最终 RankScore/RankPos/截断由 applyStrengthPathsAndScores 统一重写，
+		// 避免 trunc 截断在主链路成为死代码（P0-5 定案更新）。
+		kept = g.applyStrengthPathsAndScores(kept, w, warnings)
 		g.strengthWiring = &w // 供 Generate() 在流动性闸门后二次精化(ADV因子)复用
 	}
 
