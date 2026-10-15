@@ -563,7 +563,7 @@ func (g *Generator) refinePoolWith(ctx context.Context, pool []AggEntry, warning
 						continue
 					}
 					if kept[i].RankPos > g.cfg.RSTopK {
-						kept[i].RankPos = 0        // 移出确认段位, 保留记录、分数快照与打分标记(观察队列)
+						kept[i].RankPos = 0           // 移出确认段位, 保留记录、分数快照与打分标记(观察队列)
 						kept[i].DemotedToWatch = true // 独立标志: 阶段7 重组会重编 RankPos, 清零不可靠
 					}
 				}

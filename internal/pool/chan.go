@@ -12,9 +12,9 @@
 //   - P2 BUY2_CONFIRMED     : 2B 确认(一买后首次回调不创新低) -> 重点候选, 仍需交易风控;
 //   - P3 BUY3_CONFIRMED     : 3B 确认(向上离开中枢后回试不入枢) -> 重点候选;
 //   - P4 STRUCTURE_INVALID  : 关键结构被破坏(出现 1S/2S/3S 卖点)或原买点不再成立 ->
-//                             退出买点队列, 记录保留(历史可审计);
+//     退出买点队列, 记录保留(历史可审计);
 //   - DATA_INSUFFICIENT     : czsc 无法给出结构(行情缺失/K线不足/网关失败) -> 诚实标记,
-//                             绝不伪造通过, 也不因此把股票从研究池删除。
+//     绝不伪造通过, 也不因此把股票从研究池删除。
 //
 // 弱依赖原则（与全池一致）：
 //   - 网关不可达 / 单票计算失败 -> 该票 DATA_INSUFFICIENT, 整池保持原样;
@@ -88,11 +88,11 @@ type ChanLayerClient interface {
 
 // ChanSignal czsc 一个买/卖点信号（字段与 data_gateway/czsc_engine.py 输出对齐）。
 type ChanSignal struct {
-	Type          string  `json:"type"`      // 1B/2B/3B 或 1S/2S/3S
-	NameCn        string  `json:"name_cn"`   // 中文名
-	Price         float64 `json:"price"`     // 信号价（回抽笔极值）
-	Dt            string  `json:"dt"`        // 信号确认日 YYYY-MM-DD（结构确认时间）
-	Reason        string  `json:"reason"`    // 人类可读理由（审计）
+	Type          string  `json:"type"`    // 1B/2B/3B 或 1S/2S/3S
+	NameCn        string  `json:"name_cn"` // 中文名
+	Price         float64 `json:"price"`   // 信号价（回抽笔极值）
+	Dt            string  `json:"dt"`      // 信号确认日 YYYY-MM-DD（结构确认时间）
+	Reason        string  `json:"reason"`  // 人类可读理由（审计）
 	PullbackLow   float64 `json:"pullback_low"`
 	StopLoss      float64 `json:"stop_loss"`
 	Invalidation  float64 `json:"invalidation"`
@@ -150,8 +150,8 @@ func NewHTTPChanClient(cfg HTTPChanConfig) (*HTTPChanClient, error) {
 var _ ChanLayerClient = (*HTTPChanClient)(nil)
 
 type chanPoolEnvelope struct {
-	Code    int `json:"code"`
-	Data    *struct {
+	Code int `json:"code"`
+	Data *struct {
 		Pool    []ChanHit `json:"pool"`
 		Blocked []ChanHit `json:"blocked"`
 		Errors  []struct {
@@ -340,7 +340,7 @@ func (g *Generator) ApplyChanLayer(ctx context.Context, pool []AggEntry, warning
 	hits, err := g.chanCli.ScreenBatch(ctx, syms, g.cfg.ChanCacheOnly)
 	if err != nil {
 		log.Printf("[chan] WARN screen batch failed: %v", err)
-		markAll("网关失败:"+err.Error())
+		markAll("网关失败:" + err.Error())
 		return pool
 	}
 	nP := map[ChanStatus]int{}

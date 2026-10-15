@@ -8,7 +8,7 @@
 //  3. P4 条目经 ApplyChanLayer 末尾 ComputeTradability 重推导后
 //     Tradability=BLOCKED, BlockedBy=CHAN_STRUCTURE 的端到端断言
 //     （注: aggregate.go 实际实现使用 CHAN_STRUCTURE 作为 BlockedBy 常量,
-//       早期讨论稿中的 "CHAN_INVALID" 已统一为该命名, 见本文件说明）。
+//     早期讨论稿中的 "CHAN_INVALID" 已统一为该命名, 见本文件说明）。
 package pool
 
 import (
@@ -114,9 +114,9 @@ func TestClassifyChanHit_SevenMappingPaths(t *testing.T) {
 func TestApplyChanLayer_SevenPathsEndToEnd(t *testing.T) {
 	syms := []string{"S1B", "S2B", "S3B", "SSELL", "SCONFLICT", "SOBS", "SMISSING"}
 	fake := &fakeChanClient{hits: map[string]ChanHit{
-		"S1B":  {Symbol: "S1B", BuyPoints: []ChanSignal{buySig("1B", "2026-10-08")}, Summary: "底背驰候选"},
-		"S2B":  {Symbol: "S2B", BuyPoints: []ChanSignal{buySig("2B", "2026-10-09")}, Summary: "二买成立"},
-		"S3B":  {Symbol: "S3B", BuyPoints: []ChanSignal{buySig("3B", "2026-10-10")}, Summary: "三买成立"},
+		"S1B":   {Symbol: "S1B", BuyPoints: []ChanSignal{buySig("1B", "2026-10-08")}, Summary: "底背驰候选"},
+		"S2B":   {Symbol: "S2B", BuyPoints: []ChanSignal{buySig("2B", "2026-10-09")}, Summary: "二买成立"},
+		"S3B":   {Symbol: "S3B", BuyPoints: []ChanSignal{buySig("3B", "2026-10-10")}, Summary: "三买成立"},
 		"SSELL": {Symbol: "SSELL", SellPoints: []ChanSignal{sellSig("2026-10-10")}, Summary: "卖点确认"},
 		"SCONFLICT": {Symbol: "SCONFLICT",
 			BuyPoints:  []ChanSignal{buySig("3B", "2026-10-10")},
