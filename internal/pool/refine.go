@@ -413,6 +413,10 @@ func (g *Generator) refinePoolWith(ctx context.Context, pool []AggEntry, warning
 			// 接线：记录该票打分时实际参与的基准窗口可得性（与 haveS/haveL 同语义），
 			// 供阶段 7 路径判定复用同一基准视图——单票长窗样本不足时不得再用全局
 			// R60 基准去要求 "R60>0" 硬门槛（口径分裂 bug）。
+			// longUsable：长窗口是否真正参与本票评分——基准长窗可得 ∧ 个股长窗端点
+			// 存在（chg 可计算）二者缺一不可；仅基准可得而个股缺样时只有短窗超额参与
+			// 打分，判定侧同样不得启用长窗口径。
+			longUsable := haveL && res.longKnown
 			if haveS {
 				v := *benchChgShort
 				stockBenchShort[k] = &v
@@ -422,7 +426,7 @@ func (g *Generator) refinePoolWith(ctx context.Context, pool []AggEntry, warning
 				stockBenchLong[k] = &v
 			}
 			switch {
-			case haveS && longUsable:
+			case haveS && haveL:
 				w := g.cfg.RSShortWeightPct / 100
 				if w < 0 {
 					w = 0
@@ -559,7 +563,7 @@ func (g *Generator) refinePoolWith(ctx context.Context, pool []AggEntry, warning
 						continue
 					}
 					if kept[i].RankPos > g.cfg.RSTopK {
-						kept[i].RankPos = 0        // 移出确认段位, 保留记录、分数快照与打分标记(观察队列)
+						kept[i].RankPos = 0           // 移出确认段位, 保留记录、分数快照与打分标记(观察队列)
 						kept[i].DemotedToWatch = true // 独立标志: 阶段7 重组会重编 RankPos, 清零不可靠
 					}
 				}
@@ -642,7 +646,10 @@ func (g *Generator) refinePoolWith(ctx context.Context, pool []AggEntry, warning
 				w.SectorR20[e.SectorName] = fetchSector(e.SectorName)
 			}
 		}
-		kept = g.applyStrengthPathsAndScoresLegacy(kept, w, warnings)
+		// 切换至非 legacy（百分位四因子终局口径）：阶段 5 加权超额仅作粗排输入，
+		// 最终 RankScore/RankPos/截断由 applyStrengthPathsAndScores 统一重写，
+		// 避免 trunc 截断在主链路成为死代码（P0-5 定案更新）。
+		kept = g.applyStrengthPathsAndScores(kept, w, warnings)
 		g.strengthWiring = &w // 供 Generate() 在流动性闸门后二次精化(ADV因子)复用
 	}
 
