@@ -765,13 +765,7 @@ func (a *app) generatePoolNative(now time.Time) (*tool.WatchlistGenData, error) 
 	// 阶段 8: 运行审计与快照落库（screening_runs / source_run_status /
 	// watchlist_source_hits / daily_stock_metrics）。落库失败不影响池子生成
 	// 结果——审计缺失要报警但不能反向阻断交易链路。
-	runStatus := "SUCCESS"
-	for _, st := range res.SourceStatuses {
-		if st == pool.StatusPartial {
-			runStatus = "PARTIAL_SUCCESS"
-			break
-		}
-	}
+	runStatus := deriveRunStatus(res.SourceStatuses)
 	if a.gdb != nil {
 		runID, serr := persist.SaveScreeningRun(persist.SaveScreeningRunInputs{
 			GDB: a.gdb, Result: res, Started: now, Status: runStatus,
@@ -790,6 +784,50 @@ func (a *app) generatePoolNative(now time.Time) (*tool.WatchlistGenData, error) 
 	log.Printf("[watchlist] go-native generated=%d liquidity_passed=%d by_source=%v warnings=%d",
 		res.Total, res.LiquidityPassed, res.BySource, len(res.Warnings))
 	return data, nil
+}
+
+// deriveRunStatus 从各数据源运行状态推导整次筛选的运行级状态。
+//
+// 实现的是第 3.3 步冻结契约（表驱动用例见 cmd/runstatgap_test.go
+// TestDeriveRunStatusContract）：
+//
+//	可用来源 = OK / SUCCESS_EMPTY（正常完成且可接受）。
+//	PARTIAL / FAILED / STALE 均为降级状态；降级仅在存在可用来源时
+//	将运行级判为 PARTIAL_SUCCESS。
+//
+//	SourceStatuses 为空            -> FAILED   （无法审计，不得视为成功）
+//	全部 OK / SUCCESS_EMPTY        -> SUCCESS
+//	全部 FAILED                    -> FAILED
+//	仅 FAILED/STALE（无可用来源）  -> FAILED   （STALE 单独出现按不可用处理）
+//	有可用来源 + 任一 PARTIAL      -> PARTIAL_SUCCESS
+//	有可用来源 + 任一 FAILED       -> PARTIAL_SUCCESS
+//	有可用来源 + 任一 STALE        -> PARTIAL_SUCCESS
+//
+// FALLBACK 不在本函数推导——继续由备用流程显式写入（saveFallbackRun），
+// 避免把正常状态推导与备用运行审计混为一谈。
+func deriveRunStatus(statuses map[string]pool.SourceStatus) string {
+	if len(statuses) == 0 {
+		return "FAILED" // 空状态集 = 无法审计，不得判成功
+	}
+	var hasUsable, hasDegraded bool
+	for _, st := range statuses {
+		switch st {
+		case pool.StatusOK, pool.StatusSuccessEmpty:
+			hasUsable = true
+		case pool.StatusPartial, pool.StatusFailed, pool.StatusStale:
+			hasDegraded = true
+		default:
+			// 未知枚举值不参与推导，也不提升状态。
+			hasDegraded = true
+		}
+	}
+	if !hasUsable {
+		return "FAILED" // 全部 FAILED / STALE（或未知状态），没有可用来源
+	}
+	if hasDegraded {
+		return "PARTIAL_SUCCESS" // 存在可用来源且至少一个降级状态
+	}
+	return "SUCCESS"
 }
 
 // ---------------------------------------------------------------------------

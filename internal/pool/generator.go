@@ -16,6 +16,7 @@ package pool
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"regexp"
@@ -110,7 +111,7 @@ func DefaultConfig() Config {
 		LHBLookbackD:         7,
 		MinPrice:             1.0,
 		MinAvgAmount:         ContractStockMinADV20, // 5e7 = 5 千万（契约口径）
-		MinMarketCap:         5e9,                   // 50 亿（流动性初筛口径）
+		MinMarketCap:         5e8,                   // 5 亿（流动性初筛口径）
 		FundFlowMinMarketCap: 5e9,                   // 50 亿（契约 FundFlowMinMarketCap, FUND 来源叠加）
 		ExcludeST:            true,
 		LiquidityTopN:        400,
@@ -380,6 +381,20 @@ func (g *Generator) Generate(ctx context.Context, manualSymbols []string, now ti
 			srcStatus[name] = StatusOK
 		}
 	}
+	// markSrcStatus 3.4.1: 接受来源函数直接返回的状态（支持 PARTIAL/SUCCESS_EMPTY）。
+	// FAILED 与旧 markSrc 行为一致(记错误); PARTIAL 也记录聚合错误供审计;
+	// OK/SUCCESS_EMPTY 不记错误。st 为零值时退化为按 err 判定(兼容未改造来源)。
+	markSrcStatus := func(name string, st SourceStatus, e error) {
+		switch st {
+		case StatusOK, StatusSuccessEmpty, StatusPartial, StatusStale, StatusFailed:
+			srcStatus[name] = st
+			if e != nil {
+				srcErrs[name] = e.Error()
+			}
+		default:
+			markSrc(name, e)
+		}
+	}
 	if err != nil {
 		warnings = append(warnings, "LIQUIDITY_SCREEN 失败(已跳过, 资金流来源退化为不设门槛): "+err.Error())
 		log.Printf("[pool] WARN liquidity screen failed: %v", err)
@@ -400,28 +415,22 @@ func (g *Generator) Generate(ctx context.Context, manualSymbols []string, now ti
 	}
 
 	// ---- 来源 2: ETF 动量 ----
-	etfEntries, err := g.genETFMomentum(ctx, now)
+	etfEntries, etfSt, err := g.genETFMomentum(ctx, now)
 	if err != nil {
 		warnings = append(warnings, "ETF_MOMENTUM 失败(已跳过): "+err.Error())
 	} else {
 		raw = append(raw, etfEntries...)
 	}
-	markSrc("ETF_MOMENTUM", err)
-	if err == nil && len(etfEntries) == 0 {
-		srcStatus["ETF_MOMENTUM"] = StatusSuccessEmpty // 成功取到空结果(与 FAILED 严格区分)
-	}
+	markSrcStatus("ETF_MOMENTUM", etfSt, err)
 
 	// ---- 来源 1: 行业龙头（行业资金流 Top N -> 板块成分股 Top K, 流动性门槛叠加）----
-	sectorEntries, err := g.genSectorLeaders(ctx, screenSet, liquidIdx)
+	sectorEntries, sectorSt, err := g.genSectorLeaders(ctx, screenSet, liquidIdx)
 	if err != nil {
-		warnings = append(warnings, "SECTOR_LEADER 失败(已跳过): "+err.Error())
+		warnings = append(warnings, "SECTOR_LEADER 降级(已跳过或可信度降级): "+err.Error())
 	} else {
 		raw = append(raw, sectorEntries...)
 	}
-	markSrc("SECTOR_LEADER", err)
-	if err == nil && len(sectorEntries) == 0 {
-		srcStatus["SECTOR_LEADER"] = StatusSuccessEmpty
-	}
+	markSrcStatus("SECTOR_LEADER", sectorSt, err)
 
 	// ---- 来源 3: 龙虎榜机构净买入（叠加流动性门槛）----
 	fundEntries, err := g.genDragonTiger(ctx, now, screenSet, liquidIdx)
@@ -549,13 +558,19 @@ func (g *Generator) liquidityScreen(ctx context.Context) (map[string]bool, map[s
 // 来源 1: 行业龙头
 // ---------------------------------------------------------------------------
 
-func (g *Generator) genSectorLeaders(ctx context.Context, liquidSet map[string]bool, liquidIdx map[string]StockQuote) ([]Entry, error) {
+// genSectorLeaders 行业龙头来源（3.4.1: 子请求计数与 PARTIAL 状态生产）。
+// 返回 (候选, 来源级状态, 聚合错误)。判定契约见 deriveSourceStatus:
+// 核心请求(排行)失败 -> FAILED; 板块子请求部分失败且有可用结果 -> PARTIAL;
+// 部分失败且无可用结果 -> FAILED(不伪装 SUCCESS_EMPTY); 全部成功 -> OK/SUCCESS_EMPTY。
+func (g *Generator) genSectorLeaders(ctx context.Context, liquidSet map[string]bool, liquidIdx map[string]StockQuote) ([]Entry, SourceStatus, error) {
 	rank, err := g.prov.SectorFundFlowRank(ctx)
 	if err != nil {
-		return nil, err
+		return nil, StatusFailed, err // 核心必要请求失败: 无论辅助请求如何都不算 PARTIAL
 	}
 	if len(rank) == 0 {
-		return nil, context.DeadlineExceeded // 语义: 上游返回空
+		// 上游正常返回空排行 = 合法无命中(非取数异常), SUCCESS_EMPTY。
+		// (旧实现用 DeadlineExceeded 哨兵把空排行标成 FAILED, 本行按冻结契约修正。)
+		return nil, StatusSuccessEmpty, nil
 	}
 	// 按主力净流入降序取 Top N（防御性排序, 不信任上游顺序）；TopN<=0 = 全量板块。
 	sectorTopN, leadersK, _ := g.cfg.effectiveSourceLimits()
@@ -568,14 +583,23 @@ func (g *Generator) genSectorLeaders(ctx context.Context, liquidSet map[string]b
 	}
 
 	var out []Entry
+	total := len(top)
+	okCount := 0
+	subErrs := map[string]error{}
 	for _, sec := range top {
 		boardKey := sec.Code
 		if boardKey == "" {
 			boardKey = sec.Name // IndustryConstituents 支持名称查询
 		}
 		cons, err := g.prov.IndustryConstituents(ctx, boardKey)
-		if err != nil || len(cons) == 0 {
-			continue // 单板块失败跳过, 不影响其他板块
+		if err != nil {
+			// 单板块取数失败: 记入错误集, 不影响其他板块(降级但保留可用结果)。
+			subErrs[boardKey] = err
+			continue
+		}
+		okCount++
+		if len(cons) == 0 {
+			continue // 成功但空成分股: 计成功, 不计失败
 		}
 		// 流动性门槛叠加（set==nil 表示初筛失败, 不设门槛）
 		filtered := cons[:0:0]
@@ -617,20 +641,78 @@ func (g *Generator) genSectorLeaders(ctx context.Context, liquidSet map[string]b
 			out = append(out, g.entry(c.Code, c.Name, sourceSector, sec.Name))
 		}
 	}
-	if len(out) == 0 {
-		return nil, context.Canceled // 所有板块均失败
+	st, aggErr := deriveSourceStatus(total, okCount, subErrs, false, len(out) > 0)
+	return out, st, aggErr
+}
+
+// deriveSourceStatus 按冻结契约把子请求计数与结果可用性折算为来源级状态:
+//
+//	核心必要请求失败(hadCoreFailure)          -> FAILED（辅助成功不得洗白核心失败）
+//	全部子请求失败(okCount==0 && total>0)     -> FAILED
+//	部分失败 + 有可用结果                     -> PARTIAL
+//	部分失败 + 无可用结果                     -> FAILED（空输出+存在失败 != SUCCESS_EMPTY）
+//	全部成功 + 有结果 / 合法无命中            -> OK / SUCCESS_EMPTY
+//	返回的聚合错误仅对 FAILED/PARTIAL 非空, 供 source_run_status.error_reason 审计。
+func deriveSourceStatus(total, okCount int, subErrs map[string]error, hadCoreFailure, hasUsableResult bool) (SourceStatus, error) {
+	if hadCoreFailure {
+		return StatusFailed, coreFailureError(subErrs)
 	}
-	return out, nil
+	failed := total - okCount
+	if failed < 0 {
+		failed = 0
+	}
+	switch {
+	case total > 0 && okCount == 0:
+		return StatusFailed, aggregateSubErrors("所有子请求均失败", subErrs)
+	case failed > 0 && hasUsableResult:
+		return StatusPartial, aggregateSubErrors("部分子请求失败(已保留可用结果)", subErrs)
+	case failed > 0 && !hasUsableResult:
+		// 关键边界: 部分失败且最终无候选时不能判 SUCCESS_EMPTY——
+		// 无法区分"合法无命中"与"失败板块恰好覆盖了全部命中", 保守降级为 FAILED。
+		return StatusFailed, aggregateSubErrors("部分子请求失败且无可用结果", subErrs)
+	case hasUsableResult:
+		return StatusOK, nil
+	default:
+		return StatusSuccessEmpty, nil
+	}
+}
+
+// aggregateSubErrors 确定性聚合子请求错误（按 key 排序, 避免 map 遍历乱序进入审计字段）。
+func aggregateSubErrors(prefix string, subErrs map[string]error) error {
+	if len(subErrs) == 0 {
+		return errors.New(prefix)
+	}
+	keys := make([]string, 0, len(subErrs))
+	for k := range subErrs {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, k := range keys {
+		parts = append(parts, k+": "+subErrs[k].Error())
+	}
+	return fmt.Errorf("%s [%d/%d 失败]: %s", prefix, len(keys), len(keys), strings.Join(parts, "; "))
+}
+
+func coreFailureError(subErrs map[string]error) error {
+	if len(subErrs) == 0 {
+		return nil // 调用方直接透传原始核心错误
+	}
+	return aggregateSubErrors("核心请求失败", subErrs)
 }
 
 // ---------------------------------------------------------------------------
 // 来源 2: ETF 动量
 // ---------------------------------------------------------------------------
 
-func (g *Generator) genETFMomentum(ctx context.Context, now time.Time) ([]Entry, error) {
+// genETFMomentum ETF 动量来源（3.4.1: 子请求计数与 PARTIAL 状态生产）。
+// 核心必要请求 = FundList/FundBatchQuote(失败即 FAILED); K 线精算为逐候选子请求,
+// 部分失败且有可用结果 -> PARTIAL; 全部成功但合法无命中(如列表无 ETF)按现状契约
+// 维持 FAILED(空 ETF 列表视为上游异常, 本阶段不改该语义)。
+func (g *Generator) genETFMomentum(ctx context.Context, now time.Time) ([]Entry, SourceStatus, error) {
 	codes, err := g.prov.FundList(ctx)
 	if err != nil {
-		return nil, err
+		return nil, StatusFailed, err // 核心请求失败
 	}
 	etfCodes := make([]string, 0, len(codes)/2)
 	for _, c := range codes {
@@ -640,12 +722,12 @@ func (g *Generator) genETFMomentum(ctx context.Context, now time.Time) ([]Entry,
 		}
 	}
 	if len(etfCodes) == 0 {
-		return nil, context.DeadlineExceeded
+		return nil, StatusFailed, context.DeadlineExceeded
 	}
 
 	snaps, err := g.prov.FundBatchQuote(ctx, etfCodes)
 	if err != nil {
-		return nil, err
+		return nil, StatusFailed, err // 核心请求失败
 	}
 	// 剔除货币/债券/理财类（名称启发式, 与 Python 版一致）
 	badKW := []string{"货币", "现金", "债", "理财"}
@@ -667,7 +749,7 @@ func (g *Generator) genETFMomentum(ctx context.Context, now time.Time) ([]Entry,
 		sort.SliceStable(candidates, func(i, j int) bool { return candidates[i].Amount > candidates[j].Amount })
 	}
 	if len(candidates) == 0 {
-		return nil, context.DeadlineExceeded // 全部为货币/债券类, 无候选
+		return nil, StatusFailed, context.DeadlineExceeded // 全部为货币/债券类, 无候选
 	}
 	if len(candidates) > g.cfg.ETFPreFilterN {
 		candidates = candidates[:g.cfg.ETFPreFilterN]
@@ -678,21 +760,36 @@ func (g *Generator) genETFMomentum(ctx context.Context, now time.Time) ([]Entry,
 		mom float64
 	}
 	var ranked []scored
+	total := len(candidates)
+	okCount := 0
+	subErrs := map[string]error{}
 	for _, s := range candidates {
 		dc, err := g.prov.ETFCloseSeries(ctx, s.Code, g.cfg.ETFLookback, now)
 		if err != nil || dc == nil {
-			continue // 单只 ETF 失败跳过
+			// 单只 ETF 取数失败: 记入错误集, 不影响其他 ETF。
+			if err == nil {
+				err = errors.New("empty close series")
+			}
+			subErrs[s.Code] = err
+			continue
 		}
+		okCount++
 		mom := momentumPct(dc.Closes, g.cfg.ETFMomWindow)
 		if mom == nil {
-			continue
+			continue // 成功但数据不足以计算动量: 计成功, 不计失败
 		}
 		e := g.entry(s.Code, s.Name, sourceETF, s.Name)
 		e.Momentum20DPct = mom
 		ranked = append(ranked, scored{e: e, mom: *mom})
 	}
-	if len(ranked) == 0 {
-		return nil, context.DeadlineExceeded
+	// 有可用结果 -> OK/PARTIAL; 无结果且存在子请求失败 -> FAILED(不伪装 SUCCESS_EMPTY);
+	// 无结果且全部成功 -> SUCCESS_EMPTY。
+	st, aggErr := deriveSourceStatus(total, okCount, subErrs, false, len(ranked) > 0)
+	if st == StatusSuccessEmpty {
+		return nil, st, nil // ranked 为空但候选 K 线全部成功: 合法无命中
+	}
+	if len(ranked) == 0 && aggErr != nil {
+		return nil, st, aggErr
 	}
 	sort.SliceStable(ranked, func(i, j int) bool { return ranked[i].mom > ranked[j].mom })
 	// ETFTopM<=0 = 全量保留（遗留问题修复: 旧默认 8 使 ETF 恒为 8 条）。
@@ -708,7 +805,7 @@ func (g *Generator) genETFMomentum(ctx context.Context, now time.Time) ([]Entry,
 		}
 		out = append(out, r.e)
 	}
-	return out, nil
+	return out, st, aggErr
 }
 
 // ---------------------------------------------------------------------------
