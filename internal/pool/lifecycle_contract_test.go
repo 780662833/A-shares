@@ -16,6 +16,9 @@ package pool
 import (
 	"context"
 	"errors"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"os"
 	"strings"
 	"testing"
@@ -38,6 +41,7 @@ func mkManualEvidenceRec() AggEntry {
 // 因此这两行的可观测代理是"是否进入过期/清除路径":
 //   - OK + persistedHit=false 且未过 ExpireDate -> LifeKeep, 记录原样(不算未命中、不清除);
 //   - SUCCESS_EMPTY + persistedHit=false 且已过 ExpireDate -> LifeExpire(确认未命中的既定处理)。
+//
 // 注意现状偏差(合同冲突点 A): SUCCESS_EMPTY 命中时走 TOUCH 分支刷新 LastSeenAt/ExpireDate,
 // 与 OK 完全共用——按冻结合同, SUCCESS_EMPTY 语义是"请求成功但无命中", 不应视为有效命中续期。
 // 该子用例当前应失败, 修复前禁止改动其他用例来凑绿。
@@ -146,30 +150,73 @@ func TestTransitionContract_ManualEvidenceProtection(t *testing.T) {
 // 当前快照没有 data_as_of / DataAsOf 字段(3.4.3 成果不在本工作区), 因此:
 //   - 先证明字段确实不存在(防误启哨兵的前提);
 //   - 再锁定"LastSeenAt 为零值(新鲜度锚点未知)时, Transition 必须诚实 STALE 而非伪造过期/永久保留"。
+//
 // 未来接入 DataAsOf 时, 本哨兵会强制作者处理"空 data_as_of 不参与衰减"这一分支。
 func TestLifecycleContract_NoMissCounterFieldExists(t *testing.T) {
 	// 防误启哨兵: 本阶段冻结"不新建第二套计数器"。AggEntry 上若出现 MissCount/DataAsOf 字段,
 	// 说明有人引入了新计数机制或数据日期字段, 必须先回到合同评审而不是直接让测试变绿。
-	// Go 反射式检查用编译期赋值即可: 以下两行在字段存在时会编译失败并留下明确指引。
 	_ = AggEntry{} // 结构体存在性检查占位
-	// 显式文本检查(比反射更直白, 且在 CI 日志里给出可读原因):
-	src := readAggregateSource(t)
-	if strings.Contains(src, "MissCount") {
-		t.Error("AggEntry 出现 MissCount 字段: 违反『不另建第二套计数机制』合同, 需先评审")
+
+	// 使用 go/ast 解析 AggEntry 的**结构体字段标识符**, 逐个精确比较, 不使用
+	// strings.Contains 子串匹配——后者会被注释文本、既有财务快照字段 FinDataAsOf
+	// (aggregate.go L158, json:"fin_data_as_of", 属阶段6功能, 并非独立 DataAsOf)
+	// 以及缩进/换行差异误命中, 造成哨兵假阳性。
+	fields := aggEntryFieldNames(t)
+	if len(fields) == 0 {
+		t.Fatal("防误启哨兵失效: 未能从 aggregate.go 解析出 AggEntry 结构体字段")
 	}
-	// DataAsOf 检查只针对 AggEntry 结构体本身(类型定义区间), 不能全文匹配——
-	// aggregate.go 注释与 FinDataAsOf(阶段6财务快照字段)会误命中。
-	if i := strings.Index(src, "type AggEntry struct"); i >= 0 {
-		body := src[i:]
-		if j := strings.Index(body, "\n}\n"); j >= 0 {
-			body = body[:j]
+	for _, name := range fields {
+		if name == "MissCount" {
+			t.Error("AggEntry 出现 MissCount 字段: 违反『不另建第二套计数机制』合同, 需先评审")
 		}
-		if strings.Contains(body, "DataAsOf") {
+		if name == "DataAsOf" {
 			t.Error("AggEntry 出现 DataAsOf 字段但本工作区未包含 3.4.3 的新鲜度合同实现, 需先对齐后再启用衰减")
 		}
-	} else {
-		t.Error("防误启哨兵失效: 未在 aggregate.go 中找到 AggEntry 类型定义")
 	}
+	// 反向自检: 解析器必须能看到已知存在的生命周期字段, 否则说明 AST 提取范围错误,
+	// 哨兵将退化为恒真(永远看不到任何字段)。
+	seen := map[string]bool{}
+	for _, name := range fields {
+		seen[name] = true
+	}
+	for _, must := range []string{"HitThisRun", "SourceLifecycle", "ExpireDate", "FinDataAsOf"} {
+		if !seen[must] {
+			t.Fatalf("防误启哨兵失效: AST 未解析出已知字段 %s(提取范围错误), 共解析到 %d 个字段", must, len(fields))
+		}
+	}
+}
+
+// aggEntryFieldNames 用 go/parser + go/ast 从 aggregate.go 提取 AggEntry 结构体的
+// 全部字段标识符(仅顶层字段名, 不含注释/JSON tag/其他类型)。
+func aggEntryFieldNames(t *testing.T) []string {
+	t.Helper()
+	fileName := "aggregate.go"
+	if _, err := os.Stat(fileName); err != nil {
+		t.Skipf("source file unavailable: %v", err)
+	}
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, fileName, nil, 0)
+	if err != nil {
+		t.Fatalf("parse %s: %v", fileName, err)
+	}
+	var names []string
+	ast.Inspect(file, func(n ast.Node) bool {
+		ts, ok := n.(*ast.TypeSpec)
+		if !ok || ts.Name.Name != "AggEntry" {
+			return true
+		}
+		st, ok := ts.Type.(*ast.StructType)
+		if !ok {
+			return false
+		}
+		for _, field := range st.Fields.List {
+			for _, ident := range field.Names {
+				names = append(names, ident.Name)
+			}
+		}
+		return false
+	})
+	return names
 }
 
 func TestTransitionContract_UnknownFreshnessAnchor(t *testing.T) {
@@ -236,16 +283,6 @@ func TestLifecycleContract_RetryIdempotent(t *testing.T) {
 	// 持久层 UNIQUE(run_id,symbol,source) 的读回一致性由 internal/persist 的
 	// pool_store_test.go(幂等更新用例)负责, 本阶段不重复建设; 3.4.4 的 DB 往返
 	// 生命周期字段测试因 WatchlistItem 缺少 lifecycle 列而暂不可写——登记为缺口, 不造字段。
-}
-
-// readAggregateSource 读取 aggregate.go 源文本用于防误启哨兵检查。
-func readAggregateSource(t *testing.T) string {
-	t.Helper()
-	b, err := os.ReadFile("aggregate.go")
-	if err != nil {
-		t.Skipf("source text unavailable: %v", err)
-	}
-	return string(b)
 }
 
 // ---- 端到端 PARTIAL 用例的候选淘汰定位(检查点 4 证据留存, 只读诊断, 不改夹具) ----

@@ -894,7 +894,9 @@ const (
 func Transition(rec AggEntry, persistedHit bool, refreshStatus SourceStatus, autoExpireDays int, now time.Time) (AggEntry, LifeAction) {
 	out := rec
 	// 人工白名单与黑名单永不被自动逻辑改写（4.2: 白名单独立于自动过期; 黑名单终态）
-	if rec.PrimarySource == sourceManual || rec.Blacklisted {
+	// MANUAL 保护必须检查**全部证据来源**: PrimarySource 只是优先级最高的展示口径,
+	// 混合来源条目(SECTOR 主 + MANUAL 证据)同样承载人工意图, 不得被自动生命周期降级/删除。
+	if rec.PrimarySource == sourceManual || rec.Blacklisted || rec.HasManualSource() {
 		return out, LifeProtect
 	}
 	switch refreshStatus {
@@ -909,7 +911,18 @@ func Transition(rec AggEntry, persistedHit bool, refreshStatus SourceStatus, aut
 		}
 		out.SourceLifecycle = "STALE" // 未知记录: 保留原数据, 禁止当作当前有效信号
 		return out, LifeMarkStale
-	case StatusOK, StatusSuccessEmpty:
+	case StatusSuccessEmpty:
+		// SUCCESS_EMPTY = 请求成功但合法无命中。它与 OK 语义相反, 不得共用 TOUCH 续期分支
+		// （合同冲突点 A 修复）:
+		//   - persistedHit=true 属于调用方输入矛盾——状态机不得据此伪装成有效命中续期,
+		//     保守处理为 KEEP(原样保留, 不动 LastSeenAt/ExpireDate, 不计未命中);
+		//   - persistedHit=false 是 SUCCESS_EMPTY 的正常形态("本次确认未命中"),
+		//     走唯一允许的自然过期路径(与 OK 不再命中共用下述截止日判定)。
+		if persistedHit {
+			return out, LifeKeep
+		}
+		fallthrough
+	case StatusOK:
 		if persistedHit {
 			out.LastSeenAt = now
 			if autoExpireDays <= 0 {

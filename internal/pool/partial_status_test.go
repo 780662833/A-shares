@@ -83,7 +83,12 @@ func TestDeriveSourceStatus(t *testing.T) {
 func TestGenerateSectorPartialViaEndToEnd(t *testing.T) {
 	f := baseFake()
 	// 第三个板块取数失败；前两个板块正常出龙头 -> 有可用结果 -> PARTIAL
-	f.sectorRank = append(f.sectorRank, SectorFlow{Code: "BK9999", Name: "失败板块", MainNetInflow: 9e9})
+	f.sectorRank = []SectorFlow{
+		{Code: "BK0488", Name: "食品饮料", MainNetInflow: 9e9},
+		{Code: "BK0438", Name: "汽车整车", MainNetInflow: 8e9},
+		{Code: "BK9999", Name: "失败板块", MainNetInflow: 7e9},
+		{Code: "BK1234", Name: "测试空板块", MainNetInflow: 1e9},
+	}
 	f.constituentsErr = map[string]error{"BK9999": errors.New("board down")}
 	g := NewGenerator(f, DefaultConfig())
 	res, err := g.Generate(context.Background(), nil, testNow)
