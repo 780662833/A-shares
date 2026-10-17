@@ -39,6 +39,15 @@ type fakeProvider struct {
 	sectorIndexBars func(sectorName string, lookback int) []DailyBar
 	// indexBarsErr: 非宽基指数请求的注入错误（模拟行业指数取数失败, 走 error 契约而非 panic）。
 	indexBarsErr error
+
+	// ---- 3.4.1: 来源级 PARTIAL 生产测试的错误注入钩子（nil/空 = 行为不变）----
+	// 此前 SectorRank/Constituents/FundList/FundBatchQuote 恒返回 nil 错误,
+	// "单板块失败 continue"路径不可测; 以下钩子仅影响测试替身, 不影响生产代码。
+	sectorRankErr     error            // SectorFundFlowRank 注入错误(核心请求失败)
+	constituentsErr   map[string]error // IndustryConstituents 按板块注入错误
+	fundListErr       error            // FundList 注入错误
+	fundBatchQuoteErr error            // FundBatchQuote 注入错误
+	etfKlineErr       map[string]error // ETFCloseSeries 按 ETF 代码注入错误
 }
 
 func newFake() *fakeProvider {
@@ -54,10 +63,16 @@ func (f *fakeProvider) AllStocks(ctx context.Context) ([]StockQuote, error) {
 }
 func (f *fakeProvider) SectorFundFlowRank(ctx context.Context) ([]SectorFlow, error) {
 	func() { f.mu.Lock(); defer f.mu.Unlock(); f.calls["SectorRank"]++ }()
+	if f.sectorRankErr != nil {
+		return nil, f.sectorRankErr
+	}
 	return f.sectorRank, nil
 }
 func (f *fakeProvider) IndustryConstituents(ctx context.Context, board string) ([]ConstituentStock, error) {
 	func() { f.mu.Lock(); defer f.mu.Unlock(); f.calls["Constituents:"+board]++ }()
+	if e, ok := f.constituentsErr[board]; ok {
+		return nil, e
+	}
 	return f.constituents[board], nil
 }
 func (f *fakeProvider) DragonTigerInstitution(ctx context.Context, start, end time.Time) ([]InstitutionBuy, error) {
@@ -66,14 +81,23 @@ func (f *fakeProvider) DragonTigerInstitution(ctx context.Context, start, end ti
 }
 func (f *fakeProvider) FundList(ctx context.Context) ([]string, error) {
 	func() { f.mu.Lock(); defer f.mu.Unlock(); f.calls["FundList"]++ }()
+	if f.fundListErr != nil {
+		return nil, f.fundListErr
+	}
 	return f.fundCodes, nil
 }
 func (f *fakeProvider) FundBatchQuote(ctx context.Context, codes []string) ([]FundSnapshot, error) {
 	func() { f.mu.Lock(); defer f.mu.Unlock(); f.calls["FundQuote"]++ }()
+	if f.fundBatchQuoteErr != nil {
+		return nil, f.fundBatchQuoteErr
+	}
 	return f.fundSnaps, nil
 }
 func (f *fakeProvider) ETFCloseSeries(ctx context.Context, code string, lookback int, end time.Time) (*DailyClose, error) {
 	func() { f.mu.Lock(); defer f.mu.Unlock(); f.calls["Kline:"+code]++ }()
+	if e, ok := f.etfKlineErr[code]; ok {
+		return nil, e
+	}
 	if f.kline == nil {
 		return nil, errors.New("no kline")
 	}
@@ -219,7 +243,10 @@ func baseFake() *fakeProvider {
 		quote("601127", "赛力斯", 100, 2e9, 1e11),
 	}
 	f.sectorRank = []SectorFlow{{Code: "BK0438", Name: "汽车整车", MainNetInflow: 3e9},
-		{Code: "BK0488", Name: "食品饮料", MainNetInflow: 5e9}}
+		{Code: "BK0488", Name: "食品饮料", MainNetInflow: 5e9},
+		// 第三个板块: 成分股全部未过流动性初筛(市值/成交额不足) -> 龙头为空。
+		// 使 sectorTopN=3, 与 partial_status_test 注入单板块失败后形成 2/3 ok 的部分失败。
+		{Code: "BK1234", Name: "测试空板块", MainNetInflow: 6e9}}
 	f.constituents["BK0488"] = []ConstituentStock{{Code: "600519", Name: "贵州茅台", Price: 1500},
 		{Code: "000001", Name: "平安银行", Price: 12}} // 000001 未过初筛 -> 应被门槛剔除
 	f.constituents["BK0438"] = []ConstituentStock{{Code: "601127", Name: "赛力斯", Price: 100},
@@ -422,9 +449,12 @@ func TestSectorLeaderOrderingTopK(t *testing.T) {
 	cfg.SectorLeadersK = 2
 	g := NewGenerator(f, cfg)
 	// 无市值索引: 降级为价格降序 top2
-	out, err := g.genSectorLeaders(context.Background(), map[string]bool{"600010": true, "600011": true, "600012": true}, nil)
+	out, st, err := g.genSectorLeaders(context.Background(), map[string]bool{"600010": true, "600011": true, "600012": true}, nil)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if st != StatusOK {
+		t.Fatalf("sector status=%q want OK", st)
 	}
 	if len(out) != 2 || out[0].Symbol != "600012" || out[1].Symbol != "600011" {
 		t.Fatalf("want price-desc top2 [600012 600011], got %+v", out)
@@ -436,9 +466,12 @@ func TestSectorLeaderOrderingTopK(t *testing.T) {
 		"600011": quote("600011", "B", 15, 5e8, 1e12),
 		"600012": quote("600012", "C", 25, 5e8, 2e12),
 	}
-	out, err = g.genSectorLeaders(context.Background(), map[string]bool{"600010": true, "600011": true, "600012": true}, idx)
+	out, st, err = g.genSectorLeaders(context.Background(), map[string]bool{"600010": true, "600011": true, "600012": true}, idx)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if st != StatusOK {
+		t.Fatalf("sector status=%q want OK (second call)", st)
 	}
 	if len(out) != 2 || out[0].Symbol != "600010" || out[1].Symbol != "600012" {
 		t.Fatalf("want cap-desc top2 [600010 600012], got %+v", out)
