@@ -415,19 +415,28 @@ func (g *Generator) Generate(ctx context.Context, manualSymbols []string, now ti
 	}
 
 	// ---- 来源 2: ETF 动量 ----
+	// 3.4.3 生产缺陷修复: PARTIAL/SUCCESS_EMPTY 携带的聚合错误仅供审计, 不得像
+	// FAILED 一样丢弃有效候选——旧实现以 err!=nil 一刀切跳过追加, 使"部分子请求
+	// 失败但已保留可用结果"的来源候选全部消失(SourceHit.PARTIAL 证据随之不可见)。
 	etfEntries, etfSt, err := g.genETFMomentum(ctx, now)
-	if err != nil {
+	if err != nil && etfSt == StatusFailed {
 		warnings = append(warnings, "ETF_MOMENTUM 失败(已跳过): "+err.Error())
 	} else {
+		if err != nil {
+			warnings = append(warnings, fmt.Sprintf("ETF_MOMENTUM %s(已保留可用结果): %s", etfSt, err.Error()))
+		}
 		raw = append(raw, etfEntries...)
 	}
 	markSrcStatus("ETF_MOMENTUM", etfSt, err)
 
 	// ---- 来源 1: 行业龙头（行业资金流 Top N -> 板块成分股 Top K, 流动性门槛叠加）----
 	sectorEntries, sectorSt, err := g.genSectorLeaders(ctx, screenSet, liquidIdx)
-	if err != nil {
+	if err != nil && sectorSt == StatusFailed {
 		warnings = append(warnings, "SECTOR_LEADER 降级(已跳过或可信度降级): "+err.Error())
 	} else {
+		if err != nil {
+			warnings = append(warnings, fmt.Sprintf("SECTOR_LEADER %s(已保留可用结果): %s", sectorSt, err.Error()))
+		}
 		raw = append(raw, sectorEntries...)
 	}
 	markSrcStatus("SECTOR_LEADER", sectorSt, err)
@@ -482,6 +491,34 @@ func (g *Generator) Generate(ctx context.Context, manualSymbols []string, now ti
 	// eligibility/tradability（P4 结构失效除外, 见 ComputeTradability）。
 	pool = g.ApplyChanLayer(ctx, pool, &warnings, now)
 
+	// ---- 第 3.4.4 步（B）：生产接入生命周期状态机 Transition() ----
+	// 位置选择：全部精筛闸门之后、构造 Result 之前——此时 HitThisRun/证据已定型，
+	// 且 EXPIRED 条目只标记不删除（watchlist_items 保留历史行由既有 sweep 处理）。
+	// persistedHit 口径 = 本次运行是否命中该证券（HitThisRun，由 entryHitVerified
+	// 写入的"确认有效命中"），不是任何持久计数器——当前模型没有 MissCount 列，
+	// 本补丁不虚构计数，也不声称计数已持久化。
+	// refreshStatus 口径 = 该证券各来源本轮刷新状态的最差值（FAILED > STALE >
+	// PARTIAL > SUCCESS_EMPTY > OK）：MANUAL 保护已由 Transition 内部按全部
+	// Sources 证据检查；PARTIAL/FAILED/STALE 在 Transition 中一律不进未命中
+	// 过期路径。持久层无该证券记录时跳过——新记录的生命周期锚点由聚合器初始化。
+	if statusOf != nil {
+		for i := range pool {
+			e := &pool[i]
+			prev := statusOf(e.Symbol)
+			if prev == nil {
+				continue
+			}
+			worst := worstRefreshStatus(e.Sources)
+			next, act := Transition(*e, e.HitThisRun, worst, autoExpireDaysForPool, now)
+			if act == LifeKeep {
+				continue // KEEP: 原样保留，不动任何时间锚点
+			}
+			e.SourceLifecycle = next.SourceLifecycle
+			e.LastSeenAt = next.LastSeenAt
+			e.ExpireDate = next.ExpireDate
+		}
+	}
+
 	bySource := map[string]int{}
 	for _, e := range pool {
 		bySource[e.PrimarySource]++
@@ -501,6 +538,40 @@ func (g *Generator) Generate(ctx context.Context, manualSymbols []string, now ti
 		ConfigHash:      g.cfg.Hash(),
 		StrategyVersion: g.cfg.StrategyVersion(),
 	}, nil
+}
+
+// autoExpireDaysForPool 自动来源记录的默认生命周期（7 个自然日, 约等于 5 个
+// 交易日）。与 tool.WatchlistExpireDuration(7*24h) 同口径——Transition() 的续期/
+// 过期判定必须与落库侧 ApplyWatchlistPool 的 ExpireDate 计算一致, 否则内存状态
+// 与数据库状态分叉。合同常量 AutoExpireDays=7 在 aggregate_test.go 中锁定同一数值。
+const autoExpireDaysForPool = 7
+
+// worstRefreshStatus 返回一组来源证据里最差的刷新状态（FAILED > STALE > PARTIAL >
+// SUCCESS_EMPTY > OK）。空证据诚实返回 FAILED——有记录却无任何来源证据属于上游
+// 数据完整性问题, Transition 将保守标 STALE, 绝不伪装成正常命中或合法空结果。
+func worstRefreshStatus(hits []SourceHit) SourceStatus {
+	worst := StatusOK
+	for _, h := range hits {
+		st := h.Status.orDefault(StatusOK)
+		switch st {
+		case StatusFailed:
+			return StatusFailed
+		case StatusStale:
+			worst = StatusStale
+		case StatusPartial:
+			if worst != StatusStale {
+				worst = StatusPartial
+			}
+		case StatusSuccessEmpty:
+			if worst == StatusOK {
+				worst = StatusSuccessEmpty
+			}
+		}
+	}
+	if len(hits) == 0 {
+		return StatusFailed
+	}
+	return worst
 }
 
 // ---------------------------------------------------------------------------

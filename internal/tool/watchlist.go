@@ -129,7 +129,15 @@ func FetchGeneratedWatchlist(ctx context.Context, baseURL string, manualSymbols 
 // ---------------------------------------------------------------------------
 
 // ApplyWatchlistPool 按生命周期规则把生成结果写入 SQLite。now 注入以便测试时间边界。
-func ApplyWatchlistPool(gdb *gorm.DB, data *watchlistGenData, now time.Time) (*UpdateWatchlistResult, error) {
+//
+// sourceStatuses 为本轮实际来源刷新状态（pool.Result.SourceStatuses 的字符串口径，
+// 键为来源名如 SECTOR_LEADER/ETF_MOMENTUM/FUND_FLOW/LIQUIDITY_SCREEN）。
+// F-2 冻结合同（第 4 步 E 审计结论）：当前 watchlist_items 没有可信的来源级
+// data_as_of 字段，LastSeenAt/运行时刻/旧 ExpireDate 都不能冒充行情有效日期，
+// 因此自动过期 sweep 安全降级为逐条保守审计——识别潜在过期候选并记录跳过原因，
+// 但不写 INACTIVE。PARTIAL/FAILED/STALE、状态缺失或未知同样不得触发失效；
+// MANUAL 行继续受保护。恢复时间驱动的自动失效需要先恢复可信数据日期证据链。
+func ApplyWatchlistPool(gdb *gorm.DB, data *watchlistGenData, now time.Time, sourceStatuses map[string]string) (*UpdateWatchlistResult, error) {
 	if gdb == nil {
 		return nil, errors.New("watchlist: nil db")
 	}
@@ -195,26 +203,53 @@ func ApplyWatchlistPool(gdb *gorm.DB, data *watchlistGenData, now time.Time) (*U
 		}
 	}
 
-	// 清理过期: 非 MANUAL、ACTIVE、今日未被命中、ExpireDate 已过 -> INACTIVE
-	// （保留历史行不物理删除; BLACKLIST 因 status<>ACTIVE 天然豁免）
-	codes := make([]any, 0, len(seen))
-	for c := range seen {
-		codes = append(codes, c)
-	}
-	q := gdb.Table("watchlist_items").
-		Where("status = ?", model.WatchStatusActive).
+	// —— F-2: 过期候选的保守逐条审计（不再执行基于旧 expire_date 的批量 INACTIVE 更新）——
+	// BLACKLIST 因 status<>ACTIVE 天然豁免; MANUAL 行继续受保护。
+	// 查询本身失败必须向上返回错误, 不能只记日志后宣称持久化成功。
+	var candidates []model.WatchlistItem
+	cq := gdb.Where("status = ?", model.WatchStatusActive).
 		Where("source_type <> ?", model.WatchSourceManual).
 		Where("expire_date IS NOT NULL AND expire_date < ?", now)
-	if len(codes) > 0 {
-		q = q.Where("code NOT IN ?", codes)
+	if len(seen) > 0 {
+		missed := make([]any, 0, len(seen))
+		for c := range seen {
+			missed = append(missed, c)
+		}
+		cq = cq.Where("code NOT IN ?", missed)
 	}
-	out := q.Update("status", model.WatchStatusInactive)
-	if out.Error != nil {
-		log.Printf("watchlist: inactivate sweep failed: %v", out.Error)
-	} else {
-		res.Inactivated = int(out.RowsAffected)
+	if err := cq.Find(&candidates).Error; err != nil {
+		return res, fmt.Errorf("watchlist: expiry audit query: %w", err)
+	}
+	for _, cand := range candidates {
+		log.Printf("watchlist: expiry candidate kept code=%s expire_date=%s reason=%s",
+			cand.Code, cand.ExpireDate.Format(time.RFC3339), expirySkipReason(sourceStatuses))
 	}
 	return res, nil
+}
+
+// expirySkipReason 依据本轮来源状态与数据日期证据链给出保守保留原因。
+// 无论来源状态如何, 本阶段都不允许时间驱动失效（缺少可信 data_as_of 证据链）;
+// 状态维度仅用于审计区分: PARTIAL/FAILED/STALE 与缺失/未知状态在合同上本就
+// 禁止依据未命中推进生命周期, 完整成功(OK/SUCCESS_EMPTY)也不足以单独放行失效。
+func expirySkipReason(sourceStatuses map[string]string) string {
+	if len(sourceStatuses) == 0 {
+		return "source statuses missing/unknown (conservative keep)"
+	}
+	for _, s := range sourceStatuses {
+		switch strings.ToUpper(strings.TrimSpace(s)) {
+		case "PARTIAL":
+			return "source refresh PARTIAL (lifecycle update forbidden)"
+		case "FAILED":
+			return "source refresh FAILED (lifecycle update forbidden)"
+		case "STALE":
+			return "source refresh STALE (lifecycle update forbidden)"
+		case "OK", "SUCCESS_EMPTY":
+			// 完整成功可作审计信号, 但仍无数据日期证据 -> 继续保守保留。
+		default:
+			return "source status unknown (conservative keep)"
+		}
+	}
+	return "no reliable data_as_of evidence chain (auto-expiry suspended)"
 }
 
 func normalizeSourceType(s string) string {

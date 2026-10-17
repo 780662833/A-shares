@@ -315,6 +315,10 @@ type app struct {
 	broker *broker.MockBroker
 	syncer *datasync.DataSyncer // Phase 5.5：复盘前行情落库（修复数据与撮合脱节断层）
 
+	// lastRunSourceStatuses 最近一次 Go 原生 Generate() 的来源刷新状态（F-2: 传给
+	// ApplyWatchlistPool 做保守过期审计; Python 网关/FALLBACK 链路无法提供 -> nil 即状态未知）。
+	lastRunSourceStatuses map[string]string
+
 	mu       sync.Mutex // 防止手动触发与 cron 同时跑同一流程
 	running  map[string]bool
 	reviewFn reviewRunner // Phase 5 Graph 执行器（LLM 未配置时为降级实现）
@@ -682,18 +686,20 @@ func (a *app) runWatchlistUpdate(trigger string) error {
 			ctx, cancel := context.WithTimeout(context.Background(), a.cfg.WatchTimeout+30*time.Second)
 			defer cancel()
 			data, err = tool.FetchGeneratedWatchlist(ctx, a.cfg.GatewayURL, a.cfg.Watchlist, a.cfg.WatchTimeout)
+			a.lastRunSourceStatuses = nil // FALLBACK 链路无本轮 Go 来源状态 -> 按未知保守处理
 		}
 	} else {
 		ctx, cancel := context.WithTimeout(context.Background(), a.cfg.WatchTimeout+30*time.Second)
 		defer cancel()
 		data, err = tool.FetchGeneratedWatchlist(ctx, a.cfg.GatewayURL, a.cfg.Watchlist, a.cfg.WatchTimeout)
+		a.lastRunSourceStatuses = nil // Python 网关载荷不含来源状态 -> 按未知保守处理
 	}
 	if err != nil {
 		log.Printf("[watchlist] FAILED trigger=%s err=%v (沿用现有池子)", trigger, err)
 		return fmt.Errorf("update watchlist: %w", err)
 	}
 
-	res, err := tool.ApplyWatchlistPool(a.gdb, data, time.Now())
+	res, err := tool.ApplyWatchlistPool(a.gdb, data, time.Now(), a.lastRunSourceStatuses)
 	if res != nil {
 		log.Printf("[watchlist] applied trigger=%s trade_date=%s generated=%d inserted=%d updated=%d skipped_manual=%d inactivated=%d by_source=%v warnings=%d elapsed=%s",
 			trigger, res.TradeDate, res.Generated, res.Inserted, res.Updated,
@@ -777,6 +783,7 @@ func (a *app) generatePoolNative(now time.Time) (*tool.WatchlistGenData, error) 
 				runID, runStatus, res.ConfigHash, res.StrategyVersion, res.Total)
 		}
 	}
+	a.lastRunSourceStatuses = stringifySourceStatuses(res.SourceStatuses)
 	data, err := res.ToGenData()
 	if err != nil {
 		return nil, err
@@ -828,6 +835,19 @@ func deriveRunStatus(statuses map[string]pool.SourceStatus) string {
 		return "PARTIAL_SUCCESS" // 存在可用来源且至少一个降级状态
 	}
 	return "SUCCESS"
+}
+
+// stringifySourceStatuses 把 pool 层的来源状态枚举转成 ApplyWatchlistPool 需要的
+// 字符串口径（map[string]string）。空输入返回 nil —— 调用方以 nil 表达"状态未知"。
+func stringifySourceStatuses(statuses map[string]pool.SourceStatus) map[string]string {
+	if len(statuses) == 0 {
+		return nil
+	}
+	m := make(map[string]string, len(statuses))
+	for k, v := range statuses {
+		m[k] = string(v)
+	}
+	return m
 }
 
 // ---------------------------------------------------------------------------
