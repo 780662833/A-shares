@@ -6,11 +6,11 @@
 //   - FreshnessUnknown       "无可信日期"的诚实哨兵常量。
 //
 // 语义严格遵循 generator.go 既有注释中冻结的合同：
-//   1. 只有通过验证的日期才能进入 Result.SourceDates / Entry.SourceDate；
-//   2. 缺失即未知——持久化边界落 UNKNOWN 哨兵，绝不用 RunID / TradeDate /
-//      time.Now() 兜底伪造来源日期；
-//   3. 时区口径唯一：A 股所有业务日期折算以 Asia/Shanghai 为准（与 cmd 层
-//      shanghaiLocation() 同口径，见 main.go L1045 注释）。
+//  1. 只有通过验证的日期才能进入 Result.SourceDates / Entry.SourceDate；
+//  2. 缺失即未知——持久化边界落 UNKNOWN 哨兵，绝不用 RunID / TradeDate /
+//     time.Now() 兜底伪造来源日期；
+//  3. 时区口径唯一：A 股所有业务日期折算以 Asia/Shanghai 为准（与 cmd 层
+//     shanghaiLocation() 同口径，见 main.go L1045 注释）。
 package pool
 
 import (

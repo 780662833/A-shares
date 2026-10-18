@@ -222,6 +222,13 @@ type Result struct {
 	SourceDates map[string]string `json:"source_dates,omitempty"`
 	// SourceErrors 记录 FAILED/PARTIAL 来源的具体错误原因（source_run_status.error_reason）。
 	SourceErrors map[string]string `json:"source_errors,omitempty"`
+	// TransitionDecisions 补丁 A：Transition() 的逐证券决策旁路（键=证券代码）。
+	// 覆盖两类记录：1) 本轮池内且持久层已有记录的条目（与 Pool[] 内的动作/锚点同值）；
+	// 2) 持久层已知但本轮未再出现在池中的旧候选——它们没有 Pool 载体，只能经此传递。
+	// 仅供 cmd 层直接喂给 ApplyWatchlistPool（ExtraDecisions），**不参与 ToGenData
+	// JSON round-trip**（omitempty + WatchlistGenData 无对应字段 => 网关载荷保持
+	// 干净，Python 链路继续走显式旧载荷兼容分支）。
+	TransitionDecisions map[string]AggEntry `json:"-"`
 	// ConfigHash 参数配置指纹（sha256 前 12 位）, 每次成功运行随 screening_runs 保存,
 	// 供日后比较不同规则版本对候选池的影响。
 	ConfigHash string `json:"config_hash,omitempty"`
@@ -488,9 +495,19 @@ func (g *Generator) Generate(ctx context.Context, manualSymbols []string, now ti
 	markSrc("MANUAL", nil) // 人工来源无外部取数; 已保存的人工记录不因自动刷新清除(聚合层保证)
 
 	// ---- 持久层状态注入（黑名单事实位 + 既有生命周期锚点; nil-safe, 单测可不接 DB）----
+	// 补丁 A：knownCodes 登记持久层**全部**已知记录（含本轮已跌出池子的旧候选）。
+	// Transition() 的接入范围必须覆盖这些记录——只遍历当前 pool 无法对"本轮未再
+	// 出现"的旧记录做 KEEP/EXPIRE/MARK_STALE 决策，落库层就仍会绕过状态机。
 	var statusOf func(string) *AggEntry
+	var knownCodes []string
+	transitionDecisions := map[string]AggEntry{} // 补丁 A: Transition 逐证券决策旁路（见 Result.TransitionDecisions）
 	if g.PersistentStatus != nil {
 		ps := g.PersistentStatus(ctx)
+		knownCodes = make([]string, 0, len(ps))
+		for c := range ps {
+			knownCodes = append(knownCodes, c)
+		}
+		sort.Strings(knownCodes) // 确定性顺序: 重复运行的审计输出与迁移序列可复现
 		statusOf = func(code string) *AggEntry {
 			v, ok := ps[code]
 			if !ok {
@@ -533,22 +550,62 @@ func (g *Generator) Generate(ctx context.Context, manualSymbols []string, now ti
 	// refreshStatus 口径 = 该证券各来源本轮刷新状态的最差值（FAILED > STALE >
 	// PARTIAL > SUCCESS_EMPTY > OK）：MANUAL 保护已由 Transition 内部按全部
 	// Sources 证据检查；PARTIAL/FAILED/STALE 在 Transition 中一律不进未命中
-	// 过期路径。持久层无该证券记录时跳过——新记录的生命周期锚点由聚合器初始化。
+	// 过期路径。
+	// 补丁 A 范围扩展：遍历对象不再只是当前 pool——持久层已知但本轮未再出现的
+	// 记录（prevOnly）同样必须过一遍状态机（persistedHit=false），否则其 KEEP/
+	// EXPIRE/MARK_STALE 决策缺失，落库层只能绕过状态机自行推算。这些记录不在
+	// 本轮 data.Pool 中，动作与锚点经 Result.TransitionDecisions 旁路传递（不落
+	// watchlist_items 新列，schema 不变）。
 	if statusOf != nil {
+		dec := make(map[string]AggEntry, len(pool)+len(knownCodes))
+		inPool := make(map[string]bool, len(pool))
 		for i := range pool {
 			e := &pool[i]
 			prev := statusOf(e.Symbol)
+			inPool[e.Symbol] = true
 			if prev == nil {
-				continue
+				continue // 持久层无记录的新候选: 生命周期锚点由聚合器初始化, 动作留空
 			}
 			worst := worstRefreshStatus(e.Sources)
 			next, act := Transition(*e, e.HitThisRun, worst, autoExpireDaysForPool, now)
+			e.LifecycleAction = act
 			if act == LifeKeep {
-				continue // KEEP: 原样保留，不动任何时间锚点
+				// KEEP: 原样保留，不动任何时间锚点。补丁 A 边界修正：聚合阶段可能已把
+				// LastSeenAt 提前刷成 now（收到记录≠新鲜度证明的历史遗留路径），KEEP 的
+				// "不动锚点"必须以持久层锚点为准回滚，否则 KEEP 会继承错误续期。
+				e.LastSeenAt = prev.LastSeenAt
+				e.ExpireDate = prev.ExpireDate
+				e.SourceLifecycle = prev.SourceLifecycle
+				dec[e.Symbol] = *e
+				continue
 			}
 			e.SourceLifecycle = next.SourceLifecycle
 			e.LastSeenAt = next.LastSeenAt
 			e.ExpireDate = next.ExpireDate
+			dec[e.Symbol] = *e
+		}
+		// 持久层已知、本轮未出现在池中的旧记录：以持久层自身为 rec、
+		// persistedHit=false 走同一条 Transition 规则。worstRefreshStatus(nil)=
+		// FAILED（诚实"本轮无证据"，Transition 标 STALE，绝不误续期也绝不批量失效）。
+		// MANUAL/BLACKLIST 由 Transition 的 PROTECT 分支最先拦截。
+		for _, code := range knownCodes {
+			if inPool[code] {
+				continue
+			}
+			prev := statusOf(code)
+			if prev == nil {
+				continue
+			}
+			rec := *prev
+			next, act := Transition(rec, false, worstRefreshStatus(nil), autoExpireDaysForPool, now)
+			rec.LifecycleAction = act
+			rec.SourceLifecycle = next.SourceLifecycle
+			rec.LastSeenAt = next.LastSeenAt
+			rec.ExpireDate = next.ExpireDate
+			dec[code] = rec
+		}
+		if len(dec) > 0 {
+			transitionDecisions = dec
 		}
 	}
 
@@ -558,19 +615,20 @@ func (g *Generator) Generate(ctx context.Context, manualSymbols []string, now ti
 	}
 
 	return &Result{
-		TradeDate:       tradeDate,
-		Total:           len(pool),
-		BySource:        bySource,
-		Pool:            pool,
-		Warnings:        warnings,
-		LiquidityPassed: liquidityCount,
-		AsOf:            tradeDate,
-		RunID:           g.runID,
-		SourceStatuses:  srcStatus,
-		SourceDates:     srcDates,
-		SourceErrors:    srcErrs,
-		ConfigHash:      g.cfg.Hash(),
-		StrategyVersion: g.cfg.StrategyVersion(),
+		TradeDate:           tradeDate,
+		Total:               len(pool),
+		BySource:            bySource,
+		Pool:                pool,
+		Warnings:            warnings,
+		LiquidityPassed:     liquidityCount,
+		AsOf:                tradeDate,
+		RunID:               g.runID,
+		SourceStatuses:      srcStatus,
+		SourceDates:         srcDates,
+		SourceErrors:        srcErrs,
+		TransitionDecisions: transitionDecisions,
+		ConfigHash:          g.cfg.Hash(),
+		StrategyVersion:     g.cfg.StrategyVersion(),
 	}, nil
 }
 
@@ -1016,6 +1074,12 @@ func (g *Generator) entry(code, name, source, sector string) Entry {
 // ToGenData 将生成结果转换为 tool.WatchlistGenData 同构载荷（JSON round-trip），
 // 供 cmd 层在 Go 原生模式下直接复用既有 tool.ApplyWatchlistPool 落库逻辑，
 // 无需改动生命周期规则与 DB schema。
+//
+// 补丁 A：逐证券 LifecycleAction 是 AggEntry 的导出 JSON 字段，round-trip 后不再
+// 丢弃；时间锚点**不随载荷透传**——pool 层 Transition 以运行时刻为锚且只输出日期
+// 粒度，若原样透传会倒退库内 RFC3339 时分秒精度并造成重复应用漂移（违反幂等验收）。
+// TOUCH 契约由 ApplyWatchlistPool 用注入的 now 落地同一口径锚点；其余动作一律不动
+// 锚点。持久层已知但本轮缺席的旧候选决策经 ExtraDecisions 旁路补齐。
 func (r *Result) ToGenData() (*tool.WatchlistGenData, error) {
 	raw, err := json.Marshal(r)
 	if err != nil {
@@ -1025,7 +1089,28 @@ func (r *Result) ToGenData() (*tool.WatchlistGenData, error) {
 	if err := json.Unmarshal(raw, &data); err != nil {
 		return nil, fmt.Errorf("unmarshal to WatchlistGenData: %w", err)
 	}
+	if len(r.TransitionDecisions) > 0 {
+		extra := make(map[string]json.RawMessage, len(r.TransitionDecisions))
+		for code, e := range r.TransitionDecisions {
+			payload, err := LifecycleDecisionPayload(e)
+			if err != nil {
+				return nil, fmt.Errorf("encode lifecycle decision %s: %w", code, err)
+			}
+			extra[code] = payload
+		}
+		data.ExtraDecisions = extra
+	}
 	return &data, nil
+}
+
+// LifecycleDecisionPayload 把一条状态机决策编码为 tool 层 ExtraDecisions 可解码的
+// JSON 子集（仅含写入层需要的字段；不携带时间锚点，理由见 ToGenData 注释）。
+// 单独导出以便测试直接构造旁路载荷，同时保证生产路径与测试使用同一编码器。
+func LifecycleDecisionPayload(e AggEntry) (json.RawMessage, error) {
+	type decision struct {
+		LifecycleAction string `json:"lifecycle_action"`
+	}
+	return json.Marshal(decision{LifecycleAction: string(e.LifecycleAction)})
 }
 
 // Hash 返回当前参数配置的指纹（sha256 前 12 位十六进制）。

@@ -45,6 +45,18 @@ type WatchEntry struct {
 	SectorName  string   `json:"sector_name"`
 	Momentum20D *float64 `json:"momentum_20d_pct,omitempty"`
 	OrgNetBuy   *float64 `json:"org_net_buy,omitempty"`
+
+	// ---- 补丁 A：逐证券生命周期决策（Transition() 输出，JSON round-trip 不再丢弃）----
+	// LifecycleAction: TOUCH/KEEP/EXPIRE/MARK_STALE/PROTECT；空串 = 旧版网关载荷
+	// （Python 链路无此字段），走显式兼容分支，绝不当作状态机 TOUCH 的隐式别名。
+	LifecycleAction string `json:"lifecycle_action,omitempty"`
+	// LastSeenAt / ExpireDate: 状态机计算后的时间锚点。**仅动作携带日期粒度的值**
+	// （pool 层 Transition 以运行时刻 now 为锚，落库层保留的 RFC3339 时分秒精度
+	// 高于该口径，若原样透传会倒退时分秒并触发幂等漂移——因此 Go 生成器路径不填
+	// 这两个字段，由 ApplyWatchlistPool 按 TOUCH 契约以注入的 now 落地；写入层
+	// 不得对其它动作自行推算新锚点）。载荷缺失必要锚点时按保守规则处理，不静默补算。
+	LastSeenAt  *time.Time `json:"last_seen_at,omitempty"`
+	ExpireDateP *time.Time `json:"expire_date,omitempty"`
 }
 
 // WatchlistGenData 网关 /api/watchlist/generate 的 data 字段（导出供 cmd 层日志/统计使用）。
@@ -54,6 +66,11 @@ type WatchlistGenData struct {
 	BySource  map[string]int `json:"by_source"`
 	Pool      []WatchEntry   `json:"pool"`
 	Warnings  []string       `json:"warnings"`
+
+	// ExtraDecisions 补丁 A：持久层已知但本轮未出现在 Pool 中的旧候选的状态机决策
+	// （键=证券代码，值为 pool 层 AggEntry 同构 JSON 载荷，见 pool.LifecycleDecisionPayload）。
+	// Python 网关载荷没有该键 -> nil -> 行为与旧版完全一致。仅供 cmd 原生链路注入。
+	ExtraDecisions map[string]json.RawMessage `json:"extra_decisions,omitempty"`
 }
 
 type watchlistGenData = WatchlistGenData
@@ -68,11 +85,106 @@ type watchlistGenEnvelope struct {
 type UpdateWatchlistResult struct {
 	Generated   int      `json:"generated"`               // 网关返回的池子大小
 	Inserted    int      `json:"inserted"`                // 新插入条数
-	Updated     int      `json:"updated"`                 // 已存在被刷新 LastSeenAt 的条数
+	Updated     int      `json:"updated"`                 // 已存在且按状态机 TOUCH 刷新的条数
+	Kept        int      `json:"kept"`                    // 补丁 A: KEEP 动作——保留原锚点, 不续期
+	AuditOnly   int      `json:"audit_only"`              // 补丁 A: MARK_STALE/EXPIRE/未知动作——保守审计, 不改生命周期
 	SkippedMan  int      `json:"skipped_manual_existing"` // 已存在且为 MANUAL, 跳过不覆盖
-	Inactivated int      `json:"inactivated"`             // 本轮被置为 INACTIVE 的过期记录数
+	Inactivated int      `json:"inactivated"`             // 本轮被置为 INACTIVE 的过期记录数（F-2 冻结下恒为 0）
 	Warnings    []string `json:"warnings,omitempty"`
 	TradeDate   string   `json:"trade_date"`
+}
+
+// ---------------------------------------------------------------------------
+// 补丁 A：生命周期动作契约（写入层与 pool.Transition 的唯一映射入口）
+// ---------------------------------------------------------------------------
+
+const (
+	actionTouch     = "TOUCH"
+	actionKeep      = "KEEP"
+	actionExpire    = "EXPIRE"
+	actionMarkStale = "MARK_STALE"
+	actionProtect   = "PROTECT"
+)
+
+type applyMode int
+
+const (
+	modeInvalid   applyMode = iota // 空动作（旧载荷兼容分支）解析失败后的哨兵，不应到达 switch
+	applyModeTouch                 // TOUCH: 唯一允许正常刷新生命周期锚点的动作
+	applyModeKeep                  // KEEP: 保留原时间锚点, 不因收到记录而续期
+	applyModeAuditOnly             // MARK_STALE / EXPIRE / 未知动作: 保守保留 + 审计
+	applyModeProtect               // PROTECT: 人工意图/黑名单, 自动逻辑不得改写
+)
+
+// lifecycleActionContract 把载荷中的动作字符串映射为写入模式。
+// 返回 ok=false 表示非空但不属于合法枚举 -> 调用方必须走保守保留（绝不误续期）。
+//   - 空串 = 旧版 Python 网关载荷（无该字段）：识别为兼容契约"收到即命中"，
+//     等价 TOUCH，但**仅限**行级非人工/非黑名单记录（护栏在调用点，先于本映射生效；
+//     即便旧载荷把 MANUAL 票混进 Pool，也不会被自动续期改写）。
+//   - 大小写/空白宽容归一，与 normalizeSourceType 同风格。
+func lifecycleActionContract(action string) (applyMode, bool) {
+	switch strings.ToUpper(strings.TrimSpace(action)) {
+	case "":
+		return applyModeTouch, true // 显式兼容分支: 旧载荷"收到即命中", 不是状态机 TOUCH 的别名
+	case actionTouch:
+		return applyModeTouch, true
+	case actionKeep:
+		return applyModeKeep, true
+	case actionProtect:
+		return applyModeProtect, true
+	case actionExpire, actionMarkStale:
+		return applyModeAuditOnly, true
+	default:
+		return applyModeAuditOnly, false // 未知动作: 保守保留, 不退化为续期
+	}
+}
+
+// contractActionLabel 审计日志用的动作标签（未知值原样回显便于排障）。
+func contractActionLabel(action string) string {
+	if a := strings.ToUpper(strings.TrimSpace(action)); a != "" {
+		return a
+	}
+	return "LEGACY(implicit-touch)"
+}
+
+// anchorOrConservative 解析 TOUCH 应落地的 ExpireDate：
+//   - 载荷携带 expire_date -> 使用状态机传来的值（决策统一口径）；
+//   - 载荷缺失 -> 返回 nil，由调用点区分"库内有旧值(保持不动)"与"库内无值(按注入
+//     now + WatchlistExpireDuration 落地)"，不在写入层静默补算第三种口径。
+func anchorOrConservative(e WatchEntry, now time.Time) *time.Time {
+	if e.ExpireDateP != nil && !e.ExpireDateP.IsZero() {
+		exp := *e.ExpireDateP
+		return &exp
+	}
+	return nil
+}
+
+// nonAnchorMeta 提取 KEEP/AUDIT_ONLY 模式下允许更新的非生命周期元数据。
+// 绝不包含 last_seen_at / expire_date / status / source_type——这些只能由
+// TOUCH（或既有插入路径的人工语义）改写。
+func nonAnchorMeta(e WatchEntry) map[string]any {
+	meta := map[string]any{}
+	if e.Name != "" {
+		meta["name"] = e.Name
+	}
+	if e.SectorName != "" {
+		meta["sector_name"] = e.SectorName
+	}
+	return meta
+}
+
+// extraDecision 是 ExtraDecisions 旁路的最小解码结构（pool.LifecycleDecisionPayload 子集）。
+type extraDecision struct {
+	LifecycleAction string `json:"lifecycle_action"`
+}
+
+// LifecycleActionString 供 pool 层回填载荷时复用同一枚举拼写检查（防止两侧漂移）。
+func isValidLifecycleAction(a string) bool {
+	switch strings.ToUpper(strings.TrimSpace(a)) {
+	case actionTouch, actionKeep, actionExpire, actionMarkStale, actionProtect:
+		return true
+	}
+	return false
 }
 
 // ---------------------------------------------------------------------------
@@ -137,6 +249,9 @@ func FetchGeneratedWatchlist(ctx context.Context, baseURL string, manualSymbols 
 // 因此自动过期 sweep 安全降级为逐条保守审计——识别潜在过期候选并记录跳过原因，
 // 但不写 INACTIVE。PARTIAL/FAILED/STALE、状态缺失或未知同样不得触发失效；
 // MANUAL 行继续受保护。恢复时间驱动的自动失效需要先恢复可信数据日期证据链。
+//
+// 补丁 A（决策统一）：既有记录的更新不再"收到即续期"，而是执行 Transition()
+// 已算出的逐证券动作；动作缺失/非法时按显式兼容规则处理（见 lifecycleActionContract）。
 func ApplyWatchlistPool(gdb *gorm.DB, data *watchlistGenData, now time.Time, sourceStatuses map[string]string) (*UpdateWatchlistResult, error) {
 	if gdb == nil {
 		return nil, errors.New("watchlist: nil db")
@@ -158,6 +273,9 @@ func ApplyWatchlistPool(gdb *gorm.DB, data *watchlistGenData, now time.Time, sou
 		err := gdb.Where("code = ?", code).First(&existing).Error
 		switch {
 		case errors.Is(err, gorm.ErrRecordNotFound):
+			// 新候选入池：不属于五动作迁移（无持久记录可迁移），沿用既有人工/自动
+			// 初始化语义。Go 链路中该条目 LifecycleAction 恒为空（Transition 只覆盖
+			// 持久层已有记录），旧载荷兼容分支对其同样只影响"存在感"字段。
 			item := model.WatchlistItem{
 				Code:       code,
 				Name:       e.Name,
@@ -178,28 +296,112 @@ func ApplyWatchlistPool(gdb *gorm.DB, data *watchlistGenData, now time.Time, sou
 		case err != nil:
 			return res, fmt.Errorf("watchlist: query %s: %w", code, err)
 		default:
-			// 人工白名单/黑名单: 不覆盖来源与状态, 仅刷新存在感(黑名单连 LastSeenAt 也不动, 保持纯人工语义)
-			if existing.SourceType == model.WatchSourceManual || existing.Status == model.WatchStatusBlacklist {
+			// —— 补丁 A：按状态机动作决定写入，不再独立推算生命周期 ——
+			// 行级人工/黑名单护栏优先于一切动作（含载荷缺字段的旧链路）：
+			existingManual := existing.SourceType == model.WatchSourceManual
+			existingBlacklist := existing.Status == model.WatchStatusBlacklist
+			mode, ok := lifecycleActionContract(e.LifecycleAction)
+			if !ok {
+				res.Warnings = append(res.Warnings,
+					fmt.Sprintf("watchlist: unknown lifecycle_action %q for %s (conservative keep)", e.LifecycleAction, code))
+			}
+			switch mode {
+			case applyModeProtect:
 				res.SkippedMan++
 				continue
+			case applyModeKeep:
+				if meta := nonAnchorMeta(e); len(meta) > 0 {
+					if err := gdb.Model(&model.WatchlistItem{}).Where("id = ?", existing.ID).Updates(meta).Error; err != nil {
+						return res, fmt.Errorf("watchlist: keep %s metadata: %w", code, err)
+					}
+				}
+				res.Kept++
+				continue
+			case applyModeTouch:
+				if existingManual || existingBlacklist {
+					res.SkippedMan++ // 护栏：即便载荷带 TOUCH 也不得改写人工/黑名单意图
+					continue
+				}
+				updates := map[string]any{"last_seen_at": now, "status": model.WatchStatusActive}
+				if e.LastSeenAt != nil && !e.LastSeenAt.Equal(now) {
+					updates["last_seen_at"] = *e.LastSeenAt // 使用状态机传来的锚点（若载荷携带）
+				}
+				if exp := anchorOrConservative(e, now); exp != nil {
+					updates["expire_date"] = *exp
+				} else if existing.ExpireDate == nil {
+					// 载荷缺失必要锚点且库内无旧值：按 TOUCH 契约以注入 now 落地（唯一
+					// 允许正常刷新锚点的动作），不静默跳过导致记录永不过期。
+					exp := now.Add(WatchlistExpireDuration)
+					updates["expire_date"] = exp
+				}
+				if e.Name != "" {
+					updates["name"] = e.Name
+				}
+				if e.SectorName != "" {
+					updates["sector_name"] = e.SectorName
+				}
+				if st := normalizeSourceType(e.SourceType); st != "" && st != existing.SourceType {
+					updates["source_type"] = st
+				}
+				if err := gdb.Model(&model.WatchlistItem{}).Where("id = ?", existing.ID).Updates(updates).Error; err != nil {
+					return res, fmt.Errorf("watchlist: update %s: %w", code, err)
+				}
+				res.Updated++
+			case applyModeAuditOnly:
+				// MARK_STALE / EXPIRE / 未知动作：保留原状态与原时间锚点，只允许非生命
+				// 周期元数据（名称/板块）更新；绝不写 STALE/EXPIRED 等模型外枚举，绝不
+				// 借道 status 恢复自动失效。
+				if meta := nonAnchorMeta(e); len(meta) > 0 {
+					if err := gdb.Model(&model.WatchlistItem{}).Where("id = ?", existing.ID).Updates(meta).Error; err != nil {
+						return res, fmt.Errorf("watchlist: audit-only %s metadata: %w", code, err)
+					}
+				}
+				log.Printf("watchlist: lifecycle audit-only code=%s action=%s reason=%s",
+					code, contractActionLabel(e.LifecycleAction), expirySkipReason(sourceStatuses))
+				res.AuditOnly++
 			}
-			updates := map[string]any{"last_seen_at": now, "status": model.WatchStatusActive}
-			if e.Name != "" {
-				updates["name"] = e.Name
-			}
-			if e.SectorName != "" {
-				updates["sector_name"] = e.SectorName
-			}
-			if st := normalizeSourceType(e.SourceType); st != "" && st != existing.SourceType {
-				updates["source_type"] = st
-			}
-			// 重新命中即续期
-			exp := now.Add(WatchlistExpireDuration)
-			updates["expire_date"] = exp
-			if err := gdb.Model(&model.WatchlistItem{}).Where("id = ?", existing.ID).Updates(updates).Error; err != nil {
-				return res, fmt.Errorf("watchlist: update %s: %w", code, err)
-			}
-			res.Updated++
+		}
+	}
+
+	// —— 补丁 A：持久层已知但本轮未出现在 Pool 中的旧候选（ExtraDecisions 旁路）——
+	// 这些记录由 Generate() 的 Transition 全量遍历产出（persistedHit=false 口径），
+	// 使 KEEP/MARK_STALE/EXPIRE/PROTECT 决策不再依赖"是否出现在本轮池子"。
+	for code, raw := range data.ExtraDecisions {
+		code = strings.TrimSpace(code)
+		if !symbolPattern.MatchString(code) || seen[code] {
+			continue // 已在主循环处理或非法代码
+		}
+		var d extraDecision
+		if err := json.Unmarshal(raw, &d); err != nil {
+			res.Warnings = append(res.Warnings, fmt.Sprintf("watchlist: bad extra decision for %s: %v", code, err))
+			continue
+		}
+		mode, ok := lifecycleActionContract(d.LifecycleAction)
+		if !ok {
+			res.Warnings = append(res.Warnings,
+				fmt.Sprintf("watchlist: unknown lifecycle_action %q for %s (conservative keep)", d.LifecycleAction, code))
+		}
+		var existing model.WatchlistItem
+		err := gdb.Where("code = ?", code).First(&existing).Error
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			continue // 旁路指向库里已不存在的记录: 无事可做（不新建）
+		}
+		if err != nil {
+			return res, fmt.Errorf("watchlist: query extra %s: %w", code, err)
+		}
+		switch mode {
+		case applyModeProtect:
+			res.SkippedMan++
+		case applyModeKeep:
+			res.Kept++
+		case applyModeTouch:
+			// 旧候选本轮缺席却收到 TOUCH 属上游矛盾输入：保守降级为审计保留。
+			log.Printf("watchlist: lifecycle audit-only code=%s action=TOUCH(absent-from-pool) reason=inconsistent input", code)
+			res.AuditOnly++
+		case applyModeAuditOnly:
+			log.Printf("watchlist: lifecycle audit-only code=%s action=%s reason=%s",
+				code, contractActionLabel(d.LifecycleAction), expirySkipReason(sourceStatuses))
+			res.AuditOnly++
 		}
 	}
 
