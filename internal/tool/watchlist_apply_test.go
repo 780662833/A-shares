@@ -17,12 +17,25 @@ import (
 
 func newWatchTestDB(t *testing.T) *gorm.DB {
 	t.Helper()
+
 	gdb, err := gorm.Open(sqlite.Open(filepath.Join(t.TempDir(), "w.db")), &gorm.Config{
 		Logger: gormlogger.Default.LogMode(gormlogger.Silent),
 	})
 	if err != nil {
 		t.Fatalf("open db: %v", err)
 	}
+
+	// 测试结束时关闭底层连接，避免 Windows 无法删除临时 SQLite 文件。
+	sqlDB, err := gdb.DB()
+	if err != nil {
+		t.Fatalf("get underlying db: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := sqlDB.Close(); err != nil {
+			t.Errorf("close test db: %v", err)
+		}
+	})
+
 	if err := gdb.AutoMigrate(&model.WatchlistItem{}); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
@@ -62,11 +75,11 @@ func TestApplyWatchlistPool_Lifecycle(t *testing.T) {
 		TradeDate: "2026-10-12",
 		Pool: []WatchEntry{
 			entry("600519", "贵州茅台改名?", model.WatchSourceETF), // 已存在且为 MANUAL -> 跳过不覆盖
-			entry("300750", "宁德时代", model.WatchSourceETF),    // 新插入
-			entry("000888", "屏蔽票", model.WatchSourceSector),  // BLACKLIST 终态 -> 跳过
-			entry("123", "非法代码", model.WatchSourceFund),      // 非 6 位数字 -> 丢弃
-			entry("300750", "重复条目", model.WatchSourceFund),   // 同日重复 -> seen 双保险丢弃
-			entry("002594", "比亚迪", model.WatchSourceSector),  // 新插入
+			entry("300750", "宁德时代", model.WatchSourceETF),      // 新插入
+			entry("000888", "屏蔽票", model.WatchSourceSector),     // BLACKLIST 终态 -> 跳过
+			entry("123", "非法代码", model.WatchSourceFund),        // 非 6 位数字 -> 丢弃
+			entry("300750", "重复条目", model.WatchSourceFund),     // 同日重复 -> seen 双保险丢弃
+			entry("002594", "比亚迪", model.WatchSourceSector),     // 新插入
 			entry("688117", "刚入池又出池", model.WatchSourceFund), // 本轮命中 -> 应 ACTIVE+续期
 		},
 		Warnings: []string{"FUND_FLOW 失败(已跳过): mock"},
