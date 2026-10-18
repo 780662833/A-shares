@@ -3,6 +3,7 @@
 package tool
 
 import (
+	"encoding/json"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -295,3 +296,273 @@ func TestActiveWatchlistCodes_KeepsExpiredActiveRows_F25(t *testing.T) {
 }
 
 func ptrTime(t time.Time) *time.Time { return &t }
+
+// ---------------------------------------------------------------------------
+// 补丁 A（第 1 阶段）：生命周期动作契约 —— 五动作数据库语义、锚点透传、
+// 时间零漂移、旧载荷兼容分离、保护与未知值。断言对象是真实数据库行，
+// 不是映射函数返回值。
+// ---------------------------------------------------------------------------
+
+
+// sameTime 比较两个时间的"同一时刻"语义（忽略时区/表示差异），符合裁定：
+// 核对还原后的时间值，不要求 JSON 文本逐字节相同。
+func sameTime(a, b time.Time) bool {
+	if a.IsZero() != b.IsZero() {
+		return false
+	}
+	return a.Equal(b)
+}
+
+func TestApplyLifecycleContract_FiveActions(t *testing.T) {
+	gdb := newWatchTestDB(t)
+	now := time.Date(2026, 10, 17, 15, 30, 45, 123456789, time.UTC) // 故意带时分秒纳秒
+	base := now.AddDate(0, 0, -3)                                   // 上次确认命中
+	oldExp := base.AddDate(0, 0, 7)
+	seed := func(code, src, status string, ls, exp time.Time) {
+		it := model.WatchlistItem{Code: code, Name: "旧名", SourceType: src, Status: status,
+			AddedDate: base, LastSeenAt: ptrTime(ls), ExpireDate: ptrTime(exp)}
+		if err := gdb.Create(&it).Error; err != nil {
+			t.Fatalf("seed %s: %v", code, err)
+		}
+	}
+	seed("600001", model.WatchSourceSector, model.WatchStatusActive, base, oldExp) // TOUCH
+	seed("600002", model.WatchSourceSector, model.WatchStatusActive, base, oldExp) // KEEP
+	seed("600003", model.WatchSourceSector, model.WatchStatusActive, base, oldExp) // MARK_STALE
+	seed("600004", model.WatchSourceSector, model.WatchStatusActive, base, oldExp) // EXPIRE
+	seed("600005", model.WatchSourceManual, model.WatchStatusActive, base, oldExp)       // PROTECT(人工)
+	seed("600006", model.WatchSourceSector, model.WatchStatusBlacklist, base, oldExp)
+	seed("600007", model.WatchSourceSector, model.WatchStatusActive, base, oldExp) // 未知动作
+	seed("600008", model.WatchSourceSector, model.WatchStatusActive, base, oldExp) // 空动作(旧载荷)
+	seed("600009", model.WatchSourceSector, model.WatchStatusActive, base, oldExp) // TOUCH缺锚点
+
+	// 状态机口径的 TOUCH 锚点：自然日 AddDate(0,0,7)，与写入层 now+7*24h 不同——
+	// 若落库读回等于本值即证明使用了透传锚点而非重算值。
+	smSeen := now.Truncate(time.Second)
+	smExp := smSeen.AddDate(0, 0, 7)
+
+	mk := func(sym, action string, ls, exp *time.Time) WatchEntry {
+		e := WatchEntry{Symbol: sym, Name: "新名-" + sym, SourceType: string(model.WatchSourceSector), LifecycleAction: action}
+		e.LastSeenAt, e.ExpireDateP = ls, exp
+		return e
+	}
+	data := &WatchlistGenData{Pool: []WatchEntry{
+		mk("600001", "TOUCH", ptrTime(smSeen), ptrTime(smExp)),
+		mk("600002", "KEEP", ptrTime(base), ptrTime(oldExp)),
+		mk("600003", "MARK_STALE", nil, nil),
+		mk("600004", "EXPIRE", nil, nil),
+		mk("600005", "PROTECT", nil, nil),
+		mk("600006", "PROTECT", nil, nil),
+		mk("600007", "TELEPORT", nil, nil), // 非空但非法枚举
+		mk("600008", "", nil, nil),         // 旧版 Python 载荷：无动作字段
+		mk("600009", "TOUCH", nil, nil),    // Go 链路矛盾输入：TOUCH 缺锚点
+	}}
+	res, err := ApplyWatchlistPool(gdb, data, now, map[string]string{"SECTOR_LEADER": "FAILED"})
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	check := func(code string, wantLS, wantExp time.Time, wantStatus, wantSrc, wantName model.WatchlistItem) {}
+	_ = check
+	get := func(code string) model.WatchlistItem { return mustFind(t, gdb, code) }
+
+	// 1. TOUCH：使用状态机透传锚点（含时分秒截断口径与自然日 AddDate 差），不是 now/Add(7*24h) 重算值。
+	it := get("600001")
+	if it.LastSeenAt == nil || !sameTime(*it.LastSeenAt, smSeen) {
+		t.Errorf("TOUCH last_seen_at=%v want state-machine %v (not recomputed)", it.LastSeenAt, smSeen)
+	}
+	if it.ExpireDate == nil || !sameTime(*it.ExpireDate, smExp) {
+		t.Errorf("TOUCH expire_date=%v want state-machine %v", it.ExpireDate, smExp)
+	}
+	recomputed := now.Add(WatchlistExpireDuration)
+	if it.ExpireDate != nil && sameTime(*it.ExpireDate, recomputed) {
+		t.Errorf("TOUCH expire_date 被写入层重算为 now+7*24h，违反透传裁定")
+	}
+	if it.Status != model.WatchStatusActive || it.Name != "新名-600001" {
+		t.Errorf("TOUCH status/name = %s/%s", it.Status, it.Name)
+	}
+
+	// 2. KEEP：出现于本轮池也不续期——原锚点逐字段保持；仅元数据可更新。
+	it = get("600002")
+	if it.LastSeenAt == nil || !sameTime(*it.LastSeenAt, base) {
+		t.Errorf("KEEP last_seen_at 被刷新: %v want %v", it.LastSeenAt, base)
+	}
+	if it.ExpireDate == nil || !sameTime(*it.ExpireDate, oldExp) {
+		t.Errorf("KEEP expire_date 被刷新: %v", it.ExpireDate)
+	}
+
+	// 3. MARK_STALE：保留 ACTIVE 与锚点，绝不写 STALE 枚举。
+	it = get("600003")
+	if it.Status != model.WatchStatusActive {
+		t.Errorf("MARK_STALE 改写了 status=%s（禁止写入模型外枚举）", it.Status)
+	}
+	if it.LastSeenAt == nil || !sameTime(*it.LastSeenAt, base) || it.ExpireDate == nil || !sameTime(*it.ExpireDate, oldExp) {
+		t.Errorf("MARK_STALE 动了时间锚点: %v/%v", it.LastSeenAt, it.ExpireDate)
+	}
+
+	// 4. EXPIRE：F-2 冻结——保留记录，不写 INACTIVE/EXPIRED。
+	it = get("600004")
+	if it.Status != model.WatchStatusActive {
+		t.Errorf("EXPIRE 借修复恢复了失效: status=%s", it.Status)
+	}
+	if it.LastSeenAt == nil || !sameTime(*it.LastSeenAt, base) {
+		t.Errorf("EXPIRE 动了时间锚点: %v", it.LastSeenAt)
+	}
+
+	// 5. PROTECT：MANUAL 与 BLACKLIST 不可被自动逻辑改写（名称也不动）。
+	it = get("600005")
+	if it.SourceType != model.WatchSourceManual || it.Name != "旧名" || it.LastSeenAt == nil || !sameTime(*it.LastSeenAt, base) {
+		t.Errorf("PROTECT 改写了 MANUAL 行: %+v", it)
+	}
+	it = get("600006")
+	if it.Status != model.WatchStatusBlacklist {
+		t.Errorf("PROTECT 改写了 BLACKLIST: status=%s", it.Status)
+	}
+
+	// 6. 未知动作：保守保留，不退化为 TOUCH；产生警告。
+	it = get("600007")
+	if it.LastSeenAt == nil || !sameTime(*it.LastSeenAt, base) || it.Status != model.WatchStatusActive {
+		t.Errorf("未知动作退化为续期: %+v", it)
+	}
+	if !strings.Contains(strings.Join(res.Warnings, "|"), "unknown lifecycle_action") {
+		t.Errorf("未知动作缺少警告: %v", res.Warnings)
+	}
+
+	//  7. 空动作旧载荷：独立兼容分支"收到即命中"，以注入 now 续期（既有 Python 契约），
+	//     与 Go TOUCH 路径互不掩盖。
+	it = get("600008")
+	if it.LastSeenAt == nil || !sameTime(*it.LastSeenAt, now) {
+		t.Errorf("旧载荷兼容分支未生效: last_seen_at=%v want now=%v", it.LastSeenAt, now)
+	}
+	if it.ExpireDate == nil || !sameTime(*it.ExpireDate, now.Add(WatchlistExpireDuration)) {
+		t.Errorf("旧载荷兼容分支续期口径变化: %v", it.ExpireDate)
+	}
+
+	// 8. Go 链路 TOUCH 缺锚点：不得静默续期——保守保留 + 明确审计警告。
+	it = get("600009")
+	if it.LastSeenAt == nil || !sameTime(*it.LastSeenAt, base) {
+		t.Errorf("TOUCH 缺锚点被静默续期: %v", it.LastSeenAt)
+	}
+	if it.ExpireDate == nil || !sameTime(*it.ExpireDate, oldExp) {
+		t.Errorf("TOUCH 缺锚点 expire_date 被改动: %v", it.ExpireDate)
+	}
+	if !strings.Contains(strings.Join(res.Warnings, "|"), "without state-machine anchor") {
+		t.Errorf("TOUCH 缺锚点缺少警告: %v", res.Warnings)
+	}
+	if res.Inactivated != 0 {
+		t.Errorf("F-2 冻结被破坏: Inactivated=%d", res.Inactivated)
+	}
+	if res.Updated != 2 || res.Kept != 1 || res.AuditOnly != 4 || res.SkippedMan != 2 {
+		t.Errorf("统计不符: updated=%d kept=%d audit=%d prot=%d", res.Updated, res.Kept, res.AuditOnly, res.SkippedMan)
+	}
+}
+
+func TestApplyLifecycleContract_TouchIdempotentNoDrift(t *testing.T) {
+	gdb := newWatchTestDB(t)
+	now := time.Date(2026, 10, 17, 15, 30, 45, 0, time.UTC)
+	base := now.AddDate(0, 0, -3)
+	smSeen := now.Truncate(time.Second)
+	smExp := smSeen.AddDate(0, 0, 7)
+	if err := gdb.Create(&model.WatchlistItem{Code: "600001", Name: "x", SourceType: model.WatchSourceSector,
+		Status: model.WatchStatusActive, AddedDate: base, LastSeenAt: ptrTime(base), ExpireDate: ptrTime(base.AddDate(0, 0, 7))}).Error; err != nil {
+		t.Fatal(err)
+	}
+	entry := WatchEntry{Symbol: "600001", SourceType: string(model.WatchSourceSector), LifecycleAction: "TOUCH",
+		LastSeenAt: ptrTime(smSeen), ExpireDateP: ptrTime(smExp)}
+	first, err := ApplyWatchlistPool(gdb, &WatchlistGenData{Pool: []WatchEntry{entry}}, now, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Updated != 1 {
+		t.Fatalf("first apply updated=%d", first.Updated)
+	}
+	a := mustFind(t, gdb, "600001")
+	// 第二次在更晚的运行时刻应用同一份载荷：锚点必须仍是状态机的值，零漂移。
+	later := now.Add(45 * time.Minute)
+	if _, err := ApplyWatchlistPool(gdb, &WatchlistGenData{Pool: []WatchEntry{entry}}, later, nil); err != nil {
+		t.Fatal(err)
+	}
+	b := mustFind(t, gdb, "600001")
+	if a.LastSeenAt == nil || b.LastSeenAt == nil || !a.LastSeenAt.Equal(*b.LastSeenAt) {
+		t.Errorf("重复应用 last_seen_at 漂移: %v -> %v", a.LastSeenAt, b.LastSeenAt)
+	}
+	if a.ExpireDate == nil || b.ExpireDate == nil || !a.ExpireDate.Equal(*b.ExpireDate) {
+		t.Errorf("重复应用 expire_date 漂移: %v -> %v", a.ExpireDate, b.ExpireDate)
+	}
+	if !sameTime(*b.LastSeenAt, smSeen) || !sameTime(*b.ExpireDate, smExp) {
+		t.Errorf("锚点不再是状态机值: %v/%v", b.LastSeenAt, b.ExpireDate)
+	}
+}
+
+func TestApplyLifecycleContract_NewCandidateInsertUnchanged(t *testing.T) {
+	gdb := newWatchTestDB(t)
+	now := time.Date(2026, 10, 17, 15, 0, 0, 0, time.UTC)
+	// Go 链路新候选：库里没有记录，Transition 初始化锚点由插入路径落库（既有人工/自动初始化语义不变）。
+	res, err := ApplyWatchlistPool(gdb, &WatchlistGenData{Pool: []WatchEntry{
+		{Symbol: "600519", Name: "贵州茅台", SourceType: "SECTOR_LEADER"},
+	}}, now, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Inserted != 1 {
+		t.Fatalf("inserted=%d", res.Inserted)
+	}
+	it := mustFind(t, gdb, "600519")
+	if it.Status != model.WatchStatusActive || it.LastSeenAt == nil || !sameTime(*it.LastSeenAt, now) {
+		t.Errorf("新候选初始化语义改变: %+v", it)
+	}
+	// 人工新候选仍按既有人工语义：不设过期。
+	res2, err := ApplyWatchlistPool(gdb, &WatchlistGenData{Pool: []WatchEntry{
+		{Symbol: "600520", Name: "人工票", SourceType: "MANUAL"},
+	}}, now, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res2.Inserted != 1 || mustFind(t, gdb, "600520").ExpireDate != nil {
+		t.Errorf("人工新候选不应携带过期锚点")
+	}
+}
+
+func TestApplyLifecycleContract_ExtraDecisionsAbsentCandidates(t *testing.T) {
+	gdb := newWatchTestDB(t)
+	now := time.Date(2026, 10, 17, 15, 0, 0, 0, time.UTC)
+	base := now.AddDate(0, 0, -30)
+	oldExp := base.AddDate(0, 0, 7)
+	for _, c := range []string{"600001", "600002"} {
+		if err := gdb.Create(&model.WatchlistItem{Code: c, Name: "旧", SourceType: model.WatchSourceSector,
+			Status: model.WatchStatusActive, AddedDate: base, LastSeenAt: ptrTime(base), ExpireDate: ptrTime(oldExp)}).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	raw := func(s string) json.RawMessage { return json.RawMessage(s) }
+	data := &WatchlistGenData{
+		Pool: []WatchEntry{{Symbol: "600003", Name: "新", SourceType: "SECTOR_LEADER"}},
+		ExtraDecisions: map[string]json.RawMessage{
+			"600001": raw(`{"lifecycle_action":"MARK_STALE","last_seen_at":"` + base.Format(time.RFC3339Nano) + `"}`),
+			"600002": raw(`{"lifecycle_action":"EXPIRE"}`),
+			"600099": raw(`{"lifecycle_action":"KEEP"}`),       // 库里不存在: 不新建
+			"600003": raw(`{"lifecycle_action":"MARK_STALE"}`), // 主循环已处理: 旁路跳过
+		},
+	}
+	res, err := ApplyWatchlistPool(gdb, data, now, map[string]string{"SECTOR_LEADER": "FAILED"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.AuditOnly != 2 {
+		t.Errorf("旁路 audit-only 计数=%d want 2", res.AuditOnly)
+	}
+	var cnt int64
+	gdb.Model(&model.WatchlistItem{}).Where("code = ?", "600099").Count(&cnt)
+	if cnt != 0 {
+		t.Errorf("旁路不得为缺席代码新建记录")
+	}
+	it := mustFind(t, gdb, "600001")
+	if it.Status != model.WatchStatusActive || it.LastSeenAt == nil || !sameTime(*it.LastSeenAt, base) {
+		t.Errorf("旁路 MARK_STALE 改写了生命周期: %+v", it)
+	}
+	it = mustFind(t, gdb, "600002")
+	if it.Status != model.WatchStatusActive || it.ExpireDate == nil || !sameTime(*it.ExpireDate, oldExp) {
+		t.Errorf("旁路 EXPIRE 恢复失效或改动锚点: %+v", it)
+	}
+	if res.Inactivated != 0 {
+		t.Errorf("Inactivated=%d, F-2 冻结被破坏", res.Inactivated)
+	}
+}

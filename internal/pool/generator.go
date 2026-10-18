@@ -564,7 +564,17 @@ func (g *Generator) Generate(ctx context.Context, manualSymbols []string, now ti
 			prev := statusOf(e.Symbol)
 			inPool[e.Symbol] = true
 			if prev == nil {
-				continue // 持久层无记录的新候选: 生命周期锚点由聚合器初始化, 动作留空
+				// 持久层无记录的新候选：不属于五动作迁移（无既有记录可迁移），但按
+				// 第 1 阶段裁定仍透传状态机口径的初始锚点——Transition 对全新记录的
+				// TOUCH 语义即"以本次运行时刻为新鲜度起点"。载荷缺失时写入层会保守
+				// 保留并告警，因此这里必须显式携带，不允许落库层重算。
+				next, act := Transition(*e, e.HitThisRun, worstRefreshStatus(e.Sources), autoExpireDaysForPool, now)
+				e.LifecycleAction = act
+				e.SourceLifecycle = next.SourceLifecycle
+				e.LastSeenAt = next.LastSeenAt
+				e.ExpireDate = next.ExpireDate
+				dec[e.Symbol] = *e
+				continue
 			}
 			worst := worstRefreshStatus(e.Sources)
 			next, act := Transition(*e, e.HitThisRun, worst, autoExpireDaysForPool, now)
@@ -1104,13 +1114,26 @@ func (r *Result) ToGenData() (*tool.WatchlistGenData, error) {
 }
 
 // LifecycleDecisionPayload 把一条状态机决策编码为 tool 层 ExtraDecisions 可解码的
-// JSON 子集（仅含写入层需要的字段；不携带时间锚点，理由见 ToGenData 注释）。
+// JSON 子集。**按第 1 阶段裁定：逐证券透传 Transition() 返回的时间锚点**
+// （LastSeenAt / ExpireDate），不允许写入层对 Go 原生链路自行重算——否则
+// AddDate(0,0,7)（自然日）与 Add(7*24h)（定长时）在带夏令时的运行环境下会
+// 产生不同结果，两处独立计算"通常相同"不构成契约。ExtraDecisions 旁路只覆盖
+// 本轮缺席的旧候选，其动作恒为非 TOUCH（MARK_STALE/EXPIRE/KEEP/PROTECT），
+// 锚点在此仅作审计留证，写入层不得据其刷新任何列。
 // 单独导出以便测试直接构造旁路载荷，同时保证生产路径与测试使用同一编码器。
 func LifecycleDecisionPayload(e AggEntry) (json.RawMessage, error) {
 	type decision struct {
-		LifecycleAction string `json:"lifecycle_action"`
+		LifecycleAction string     `json:"lifecycle_action"`
+		LastSeenAt      *time.Time `json:"last_seen_at,omitempty"`
+		ExpireDate      *time.Time `json:"expire_date,omitempty"`
 	}
-	return json.Marshal(decision{LifecycleAction: string(e.LifecycleAction)})
+	d := decision{LifecycleAction: string(e.LifecycleAction)}
+	if !e.LastSeenAt.IsZero() {
+		ls := e.LastSeenAt
+		d.LastSeenAt = &ls
+	}
+	d.ExpireDate = e.ExpireDate
+	return json.Marshal(d)
 }
 
 // Hash 返回当前参数配置的指纹（sha256 前 12 位十六进制）。
