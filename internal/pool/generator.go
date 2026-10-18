@@ -957,13 +957,19 @@ func tradeDateOf(t time.Time) string {
 // 来源 3: 龙虎榜机构净买入
 // ---------------------------------------------------------------------------
 
-func (g *Generator) genDragonTiger(ctx context.Context, now time.Time, liquidSet map[string]bool, liquidIdx map[string]StockQuote) ([]Entry, error) {
+// genDragonTiger 龙虎榜机构净买入来源。
+// 第三返回值 rawSrcDate：本轮命中行中出现的最后一个非空 InstitutionBuy.Date
+// **原始值**（未验证）。A.4 合同冻结该来源的日期登记资格——供应商语义（交易日
+// 归属/发布滞后口径）尚未核实，调用侧只把它作为条目级审计信息保留在
+// Entry.SourceDate，绝不登记进 srcDates、绝不参与来源级新鲜度结论。
+func (g *Generator) genDragonTiger(ctx context.Context, now time.Time, liquidSet map[string]bool, liquidIdx map[string]StockQuote) ([]Entry, string, error) {
 	start := now.AddDate(0, 0, -g.cfg.LHBLookbackD)
 	rows, err := g.prov.DragonTigerInstitution(ctx, start, now)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	var out []Entry
+	rawSrcDate := ""
 	for _, r := range rows {
 		code := normalizeCode(r.Code)
 		if code == "" || g.cfg.ExcludeST && stRe.MatchString(r.Name) {
@@ -984,9 +990,13 @@ func (g *Generator) genDragonTiger(ctx context.Context, now time.Time, liquidSet
 		e := g.entry(code, r.Name, sourceFund, "龙虎榜机构")
 		v := r.OrgNetAmount
 		e.OrgNetBuy = &v
+		if r.Date != "" {
+			rawSrcDate = r.Date // 原始值审计透传（rows 升序口径下取最后命中行）；未验证，不入 srcDates
+			e.SourceDate = r.Date
+		}
 		out = append(out, e)
 	}
-	return out, nil // 空结果合法（当日无满足阈值的机构买入）
+	return out, rawSrcDate, nil // 空结果合法（当日无满足阈值的机构买入）
 }
 
 // ---------------------------------------------------------------------------

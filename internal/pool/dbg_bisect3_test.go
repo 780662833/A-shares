@@ -49,7 +49,7 @@ warns := []string{}
 
 _, liquidIdx, _, _ := g.liquidityScreen(ctx)
 var raw []Entry
-etfEntries, etfSt, _ := g.genETFMomentum(ctx, testNow)
+etfEntries, etfSt, _, _ := g.genETFMomentum(ctx, testNow)
 raw = append(raw, etfEntries...)
 sectorEntries, sectorSt, _ := g.genSectorLeaders(ctx, nil, liquidIdx)
 fmt.Println("SECTOR st:", sectorSt)

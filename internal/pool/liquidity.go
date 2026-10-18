@@ -100,9 +100,20 @@ const (
 // 与 refinePool 同级的弱依赖原则：单票取数失败 → DATA_INSUFFICIENT（未知），
 // 不剔除记录（研究资格保留），tradability 经 QUOTE_STATE 路径自然降级为 UNKNOWN。
 // 被明确判 FAIL 的股票类条目剔除并记聚合 warning；全军覆没视为数据事故退化放行。
-func (g *Generator) liquidityGatePool(ctx context.Context, pool []AggEntry, warnings *[]string, now time.Time) []AggEntry {
+//
+// A.4 新鲜度透传链（tradeDate/srcDates 参数）：ADV20 计算窗口内最后一个通过
+// normalizeBusinessDate 验证的成交额行日期，写入条目 LiqDataAsOf（内存态诊断
+// 字段，round-trip 丢弃、不扩 schema）。任何一根未通过验证的行都不参与该结论；
+// 全部不可证时保持空串——诚实未知，绝不兜底成运行日。srcDates 当前仅作调用
+// 侧接线保留（来源级日期与本闸门的行级日期语义不同，不互相替代）。
+func (g *Generator) liquidityGatePool(ctx context.Context, pool []AggEntry, warnings *[]string, tradeDate string, srcDates map[string]string) []AggEntry {
 	if !g.cfg.LiquidityEnabled {
 		return pool
+	}
+	_ = srcDates // 接线保留：来源级可信日期映射不参与本闸门的行级日期判定。
+	bound := tradeDate
+	if _, err := time.Parse("2006-01-02", bound); err != nil {
+		bound = tradeDateOf(time.Now()) // 评估日非法时以上海时区当日为上界，仅用于未来边界校验
 	}
 	type outcome struct {
 		res   AdvResult
@@ -115,7 +126,7 @@ func (g *Generator) liquidityGatePool(ctx context.Context, pool []AggEntry, warn
 	for i := range pool {
 		e := &pool[i]
 		isETF := e.PrimarySource == sourceETF || e.AssetType == "ETF"
-		rows, err := g.prov.StockAmounts(ctx, e.Symbol, advWindow, now)
+		rows, err := g.prov.StockAmounts(ctx, e.Symbol, advWindow, time.Now())
 		if err != nil || len(rows) == 0 {
 			e.Liquidity = LiqDataInsufficient
 			e.CapacityStatus = CapacityUnchecked
@@ -124,6 +135,17 @@ func (g *Generator) liquidityGatePool(ctx context.Context, pool []AggEntry, warn
 		res := adv20(rows)
 		v := res.Adv
 		e.AvgAmount20D = &v
+		// A.4：ADV20 窗口内最后一个有效样本行（Amount>0，即实际参与均值计算）
+		// 的业务日期，逐行验证后取最大者；不可证则留空（诚实未知）。
+		for j := len(rows) - 1; j >= 0; j-- {
+			if rows[j].Amount <= 0 {
+				continue
+			}
+			if d, dErr := normalizeBusinessDate(rows[j].Date, bound); dErr == nil {
+				e.LiqDataAsOf = d
+			}
+			break
+		}
 		switch {
 		case !res.Valid:
 			// R2：有效样本 < 20 → DATA_INSUFFICIENT（不 FAIL、不 PASS）

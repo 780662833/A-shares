@@ -158,6 +158,13 @@ type AggEntry struct {
 	FinDataAsOf       string `json:"fin_data_as_of,omitempty"`
 	FinProviderSource string `json:"fin_provider,omitempty"`
 	FinReasons        string `json:"fin_reasons,omitempty"` // WARN/BLOCKED/DATA_INSUFFICIENT 判定理由（审计用）
+
+	// ---- A.4 数据新鲜度合同（内存态诊断字段，round-trip 自然丢弃、不扩 schema）----
+	// SourceDate 该条目所来自来源的真实业务日期（Entry.SourceDate 透传；空=未知）。
+	// LiqDataAsOf ADV20 计算窗口内最后一个通过 normalizeBusinessDate 验证的成交额
+	// 行日期（liquidityGatePool 回填；空=不可证，绝不兜底成运行日）。
+	SourceDate  string `json:"source_date,omitempty"`
+	LiqDataAsOf string `json:"liq_data_as_of,omitempty"`
 }
 
 // Tradability 状态常量（最终交易资格, 进入审批流程的唯一闸门）。
