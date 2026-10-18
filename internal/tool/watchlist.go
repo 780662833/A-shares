@@ -267,18 +267,25 @@ func normalizeSourceType(s string) string {
 	}
 }
 
-// ActiveWatchlistCodes 返回当前应参与每日粗筛的股票代码（ACTIVE 全量 + 未过期的所有来源）。
+// ActiveWatchlistCodes 返回当前应参与每日粗筛的股票代码（仅按 status = ACTIVE 过滤）。
 // 供 review 流水线在动态池模式下替代环境变量 ASHARE_WATCHLIST 硬编码列表。
+//
+// F-2.5 语义修复：本函数**不得**再依据 ExpireDate 排除仍为 ACTIVE 的行。
+// 3.4.4/F-2 已冻结"自动失效暂停"合同——写入路径（ApplyWatchlistPool）在缺乏
+// 可信 data_as_of 证据时不将记录置 INACTIVE；若读取路径继续用旧 ExpireDate
+// 过滤，等于通过另一条路径实现相同的过期效果，两条生产环节会对同一条记录给
+// 出不同结论。因此这里只认 status 字段；now 参数保留仅为兼容既有调用方签名。
+//
+// 恢复基于日期的读取过滤的前置条件与自动过期恢复相同：必须先建立可信的
+// 来源级数据有效日期证据链并经独立审批，不得用运行时间或 LastSeenAt 推断。
 func ActiveWatchlistCodes(gdb *gorm.DB, now time.Time) ([]string, error) {
+	_ = now // F-2.5: 读取过滤不再使用运行时刻（签名保持兼容）
 	var items []model.WatchlistItem
 	if err := gdb.Where("status = ?", model.WatchStatusActive).Find(&items).Error; err != nil {
 		return nil, err
 	}
 	codes := make([]string, 0, len(items))
 	for _, it := range items {
-		if it.ExpireDate != nil && it.ExpireDate.Before(now) {
-			continue // 理论上 sweep 已置 INACTIVE, 双保险
-		}
 		codes = append(codes, it.Code)
 	}
 	return codes, nil

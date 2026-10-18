@@ -251,14 +251,23 @@ func TestExpirySkipReasonContract(t *testing.T) {
 	}
 }
 
-func TestActiveWatchlistCodes_ExcludesExpiredAndInactive(t *testing.T) {
+// F-2.5 语义变更（经批准的合同修正，非为消除失败而改断言）：
+// 自动失效已暂停（ApplyWatchlistPool 不再依据旧 ExpireDate 写 INACTIVE），
+// 读取路径必须与之保持一致——只按 status = ACTIVE 过滤，绝不因 ExpireDate
+// 已过而排除 ACTIVE 行。否则写入侧保留、读取侧淘汰，同一记录在两个生产
+// 环节得到矛盾结论，等于变相恢复未经证据链审批的自动过期。
+func TestActiveWatchlistCodes_KeepsExpiredActiveRows_F25(t *testing.T) {
 	gdb := newWatchTestDB(t)
 	now := time.Now()
 	rows := []model.WatchlistItem{
 		{Code: "000001", SourceType: model.WatchSourceManual, Status: model.WatchStatusActive, AddedDate: now},
-		{Code: "000002", SourceType: model.WatchSourceETF, Status: model.WatchStatusActive, AddedDate: now, ExpireDate: ptrTime(now.Add(-time.Minute))}, // 漏网过期 -> 双保险剔除
+		// 过期但状态仍 ACTIVE：F-2.5 后必须继续返回（ExpireDate 不参与读取过滤）。
+		{Code: "000002", SourceType: model.WatchSourceETF, Status: model.WatchStatusActive, AddedDate: now, ExpireDate: ptrTime(now.Add(-time.Minute))},
+		// INACTIVE 行无论日期如何都不返回。
 		{Code: "000003", SourceType: model.WatchSourceFund, Status: model.WatchStatusInactive, AddedDate: now},
 		{Code: "000004", SourceType: model.WatchSourceSector, Status: model.WatchStatusActive, AddedDate: now, ExpireDate: ptrTime(now.Add(time.Hour))},
+		// 过期且 INACTIVE：由 status 排除，而非 ExpireDate。
+		{Code: "000005", SourceType: model.WatchSourceETF, Status: model.WatchStatusInactive, AddedDate: now, ExpireDate: ptrTime(now.Add(-24 * time.Hour))},
 	}
 	for i := range rows {
 		if err := gdb.Create(&rows[i]).Error; err != nil {
@@ -273,8 +282,15 @@ func TestActiveWatchlistCodes_ExcludesExpiredAndInactive(t *testing.T) {
 	for _, c := range codes {
 		set[c] = true
 	}
-	if !set["000001"] || !set["000004"] || set["000002"] || set["000003"] || len(codes) != 2 {
-		t.Errorf("codes=%v want {000001,000004}", codes)
+	// 期望：全部 ACTIVE 行返回（含 ExpireDate 已过的 000002）；INACTIVE 不返回。
+	if !set["000001"] || !set["000002"] || !set["000004"] {
+		t.Errorf("expired-but-ACTIVE rows must not be filtered out by ExpireDate (F-2.5), codes=%v", codes)
+	}
+	if set["000003"] || set["000005"] {
+		t.Errorf("INACTIVE rows must never be returned, codes=%v", codes)
+	}
+	if len(codes) != 3 {
+		t.Errorf("codes=%v want exactly {000001,000002,000004}", codes)
 	}
 }
 
