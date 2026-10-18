@@ -50,11 +50,12 @@ type WatchEntry struct {
 	// LifecycleAction: TOUCH/KEEP/EXPIRE/MARK_STALE/PROTECT；空串 = 旧版网关载荷
 	// （Python 链路无此字段），走显式兼容分支，绝不当作状态机 TOUCH 的隐式别名。
 	LifecycleAction string `json:"lifecycle_action,omitempty"`
-	// LastSeenAt / ExpireDate: 状态机计算后的时间锚点。**仅动作携带日期粒度的值**
-	// （pool 层 Transition 以运行时刻 now 为锚，落库层保留的 RFC3339 时分秒精度
-	// 高于该口径，若原样透传会倒退时分秒并触发幂等漂移——因此 Go 生成器路径不填
-	// 这两个字段，由 ApplyWatchlistPool 按 TOUCH 契约以注入的 now 落地；写入层
-	// 不得对其它动作自行推算新锚点）。载荷缺失必要锚点时按保守规则处理，不静默补算。
+	// LastSeenAt / ExpireDateP: Transition() 返回的时间锚点，**按第 1 阶段裁定逐条
+	// 透传**——Go 原生链路的 TOUCH 必须携带这两个值，写入层直接使用、不得重算
+	// （pool 侧 AddDate(0,0,7) 自然日口径与落库侧 Add(7*24h) 定长时在夏令时环境
+	// 并不等价，两处独立计算不构成契约）。缺失锚点的非空 TOUCH 属上游矛盾输入，
+	// 保守保留并告警；空动作的旧 Python 载荷走独立兼容分支（沿用既有续期规则）。
+	// 测试核对的是还原后的时间值与数据库读回值，不要求 JSON 文本逐字节相同。
 	LastSeenAt  *time.Time `json:"last_seen_at,omitempty"`
 	ExpireDateP *time.Time `json:"expire_date,omitempty"`
 }
@@ -109,11 +110,11 @@ const (
 type applyMode int
 
 const (
-	modeInvalid   applyMode = iota // 空动作（旧载荷兼容分支）解析失败后的哨兵，不应到达 switch
-	applyModeTouch                 // TOUCH: 唯一允许正常刷新生命周期锚点的动作
-	applyModeKeep                  // KEEP: 保留原时间锚点, 不因收到记录而续期
-	applyModeAuditOnly             // MARK_STALE / EXPIRE / 未知动作: 保守保留 + 审计
-	applyModeProtect               // PROTECT: 人工意图/黑名单, 自动逻辑不得改写
+	modeInvalid        applyMode = iota // 空动作（旧载荷兼容分支）解析失败后的哨兵，不应到达 switch
+	applyModeTouch                      // TOUCH: 唯一允许正常刷新生命周期锚点的动作
+	applyModeKeep                       // KEEP: 保留原时间锚点, 不因收到记录而续期
+	applyModeAuditOnly                  // MARK_STALE / EXPIRE / 未知动作: 保守保留 + 审计
+	applyModeProtect                    // PROTECT: 人工意图/黑名单, 自动逻辑不得改写
 )
 
 // lifecycleActionContract 把载荷中的动作字符串映射为写入模式。
@@ -148,9 +149,11 @@ func contractActionLabel(action string) string {
 }
 
 // anchorOrConservative 解析 TOUCH 应落地的 ExpireDate：
-//   - 载荷携带 expire_date -> 使用状态机传来的值（决策统一口径）；
-//   - 载荷缺失 -> 返回 nil，由调用点区分"库内有旧值(保持不动)"与"库内无值(按注入
-//     now + WatchlistExpireDuration 落地)"，不在写入层静默补算第三种口径。
+//   - 载荷携带 expire_date -> 使用状态机传来的值（第 1 阶段裁定：决策统一口径，
+//     写入层不得重算）；
+//   - 载荷缺失 -> 返回 nil，调用点必须走"保守保留 + 审计警告"分支——包括库里
+//     没有旧值的记录，也**不得**在写入层用 now+WatchlistExpireDuration 补算
+//     （那是被撤销的旧设计）。缺锚点的 TOUCH 属上游矛盾输入，宁可少续期。
 func anchorOrConservative(e WatchEntry, now time.Time) *time.Time {
 	if e.ExpireDateP != nil && !e.ExpireDateP.IsZero() {
 		exp := *e.ExpireDateP
@@ -173,9 +176,12 @@ func nonAnchorMeta(e WatchEntry) map[string]any {
 	return meta
 }
 
-// extraDecision 是 ExtraDecisions 旁路的最小解码结构（pool.LifecycleDecisionPayload 子集）。
+// extraDecision 是 ExtraDecisions 旁路的解码结构（pool.LifecycleDecisionPayload 同构：
+// 动作 + 状态机透传的时间锚点；锚点在本旁路仅作审计留证，非 TOUCH 动作不得据其刷新）。
 type extraDecision struct {
-	LifecycleAction string `json:"lifecycle_action"`
+	LifecycleAction string     `json:"lifecycle_action"`
+	LastSeenAt      *time.Time `json:"last_seen_at,omitempty"`
+	ExpireDate      *time.Time `json:"expire_date,omitempty"`
 }
 
 // LifecycleActionString 供 pool 层回填载荷时复用同一枚举拼写检查（防止两侧漂移）。
@@ -322,18 +328,30 @@ func ApplyWatchlistPool(gdb *gorm.DB, data *watchlistGenData, now time.Time, sou
 					res.SkippedMan++ // 护栏：即便载荷带 TOUCH 也不得改写人工/黑名单意图
 					continue
 				}
-				updates := map[string]any{"last_seen_at": now, "status": model.WatchStatusActive}
-				if e.LastSeenAt != nil && !e.LastSeenAt.Equal(now) {
-					updates["last_seen_at"] = *e.LastSeenAt // 使用状态机传来的锚点（若载荷携带）
+				if e.LifecycleAction != "" && e.LastSeenAt == nil {
+					// Go 原生链路的 TOUCH 必须携带状态机锚点；缺失 = 上游矛盾输入。
+					// 按裁定保守保留原时间字段并产生明确审计警告，绝不静默重算续期。
+					// （空动作走的是旧版 Python 兼容分支，沿用其"收到即命中 + now 续期"
+					// 既有契约，不受本校验约束——见 watchlist_apply_test 的分离测试。）
+					res.Warnings = append(res.Warnings,
+						fmt.Sprintf("watchlist: TOUCH without state-machine anchor for %s (conservative keep, no renewal)", code))
+					log.Printf("watchlist: lifecycle audit-only code=%s action=TOUCH(missing-anchor) reason=inconsistent input", code)
+					res.AuditOnly++
+					continue
+				}
+				updates := map[string]any{"status": model.WatchStatusActive}
+				if e.LastSeenAt != nil {
+					updates["last_seen_at"] = *e.LastSeenAt // 状态机传来的锚点（Go 链路必携带）
+				} else {
+					updates["last_seen_at"] = now // 仅旧载荷兼容分支可达：沿用既有"收到即命中"续期规则
 				}
 				if exp := anchorOrConservative(e, now); exp != nil {
 					updates["expire_date"] = *exp
-				} else if existing.ExpireDate == nil {
-					// 载荷缺失必要锚点且库内无旧值：按 TOUCH 契约以注入 now 落地（唯一
-					// 允许正常刷新锚点的动作），不静默跳过导致记录永不过期。
+				} else if e.LastSeenAt == nil {
+					// 旧载荷兼容分支：Python 网关无 expire_date 字段，沿用既有续期口径。
 					exp := now.Add(WatchlistExpireDuration)
 					updates["expire_date"] = exp
-				}
+				} // Go 链路缺 expire_date 已在上方整体保守保留，不会到达此处补算路径
 				if e.Name != "" {
 					updates["name"] = e.Name
 				}
