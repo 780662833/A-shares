@@ -5,7 +5,6 @@ package pool
 
 import (
 	"context"
-	"strings"
 	"testing"
 	"time"
 )
@@ -153,27 +152,50 @@ func TestLiquidityGatePool_TradeDateIsTheBound(t *testing.T) {
 	}
 }
 
-func TestDragonTiger_RawDateNotCertified(t *testing.T) {
-	// 审查意见二.3：genDragonTiger 的第三返回值是未验证原始日期——Generate 侧
-	// 明确 `_ = fundSrcDateRaw` 不入 srcDates；这里锁定函数本身的透传语义：
-	// 原始值可审计（非空即最后命中行的 Date），但不做任何归一化/校验。
+func TestDragonTiger_RawDateBeyondBoundNotCertified(t *testing.T) {
+	// 审查意见二.3（收紧版）：两层契约分开断言，不混为一谈——
+	//
+	//	层 1【原样透传】：genDragonTiger 第三返回值与命中条目 SourceDate 必须是
+	//	  供应商原始值的字节级保真拷贝（2026-10-09 是合法 YYYY-MM-DD 日期，
+	//	  不得因格式被拒绝或改写；它只作为审计证据存在）。
+	//	层 2【不予认证】：A.4 冻结该来源的日期登记资格——即便原始值本身是
+	//	  合法日期串，也不得未经边界验证就进入可信来源日期集合。用早于该
+	//	  日期的上界（2026-10-08）演示验证器拒判口径：超出评估边界的日期
+	//	  不可认证——测试名与注释表达"超出日期边界，未获认证"而非"格式非法"。
 	f := baseFake()
 	f.dragon = append(f.dragon, InstitutionBuy{
-		Code: "600519", Name: "贵州茅台", OrgNetAmount: 5e8, Date: "2026/10/09", // 畸形格式
+		Code: "600519", Name: "贵州茅台", OrgNetAmount: 5e8, Date: "2026-10-09", // 合法格式的原始日期
 	})
 	g := NewGenerator(f, DefaultConfig())
 	entries, rawDate, err := g.genDragonTiger(context.Background(), testNow, nil, nil)
 	if err != nil {
 		t.Fatalf("genDragonTiger 不应报错: %v", err)
 	}
-	if len(entries) == 0 {
-		t.Fatal("夹具应产生至少一条命中")
+
+	// —— 层 1：精确定位 600519（genDragonTiger 产出裸 6 位代码），断言原样透传 ——
+	var hit *Entry
+	for i := range entries {
+		if entries[i].Symbol == "600519" {
+			hit = &entries[i]
+			break
+		}
 	}
-	if !strings.Contains(strings.Join([]string{rawDate, entries[0].SourceDate}, "|"), "2026/10/09") {
-		t.Fatalf("原始日期必须原样审计透传: raw=%q entry=%q", rawDate, entries[0].SourceDate)
+	if hit == nil {
+		t.Fatalf("夹具应产生 600519 命中, got %+v", entries)
 	}
-	// 且该原始值无法通过验证器——证明"入 srcDates 即违约"的判断成立。
-	if _, verr := normalizeBusinessDate(rawDate, "2026-10-12"); verr == nil {
-		t.Fatal("畸形原始日期不应可通过验证")
+	if rawDate != "2026-10-09" {
+		t.Fatalf("原始日期必须字节级审计透传: raw=%q", rawDate)
+	}
+	if hit.SourceDate != rawDate {
+		t.Fatalf("条目 SourceDate 应与原始来源日期完全一致: entry=%q raw=%q", hit.SourceDate, rawDate)
+	}
+
+	// —— 层 2：超出日期边界 → 验证器拒判，不予认证为可信来源日期 ——
+	if _, verr := normalizeBusinessDate(rawDate, "2026-10-08"); verr == nil {
+		t.Fatal("2026-10-09 相对上界 2026-10-08 属未来日期，验证器必须拒绝认证")
+	}
+	// 对照：同一日期串在评估界内可正常认证——证明本测试拒判依据是边界而非格式。
+	if got, verr := normalizeBusinessDate(rawDate, "2026-10-12"); verr != nil || got != "2026-10-09" {
+		t.Fatalf("合法日期在界内应可通过验证: got=%q err=%v", got, verr)
 	}
 }
