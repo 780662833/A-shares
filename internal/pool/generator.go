@@ -177,6 +177,19 @@ type Entry struct {
 	// 零值在聚合层按 StatusOK 处理（兼容 Python 链路无此字段的旧载荷）。
 	HitStatus SourceStatus `json:"hit_status,omitempty"`
 
+	// ---- A.4 数据新鲜度合同：来源级真实业务日期（内存态诊断字段，不扩 schema）----
+	// SourceDate 该条目所来自来源的真实业务数据截止日期（YYYY-MM-DD），必须来自
+	// 实际参与计算的上游日线/榜单日期并经 normalizeBusinessDate 验证；绝不由
+	// GeneratedAt、time.Now() 或 TradeDate 推导。无可信日期时保持空串——空即诚实
+	// 未知，由持久化边界统一落 UNKNOWN 哨兵。round-trip 诊断字段（WatchlistGenData
+	// 无对应列，序列化往返自然丢弃）。
+	SourceDate string `json:"source_date,omitempty"`
+	// LiqDataAsOf 流动性指标(ADV20)实际参与计算窗口的可信截止日（A.4 透传链）。
+	LiqDataAsOf string `json:"liq_data_as_of,omitempty"`
+	// FinDataAsOf 财务供应商数据截止日期（既有新鲜度合同参考实现，语义独立，
+	// 不与 AnnouncementDt/ReportPeriod 互相替代）。
+	FinDataAsOf string `json:"fin_data_as_of,omitempty"`
+
 	// ---- 阶段 8: MA20/MA60 趋势快照（refine.go 在同一条收盘序列上计算后透传给
 	// 聚合层, 供 daily_stock_metrics 落库; 样本不足时保持 nil, 绝不伪造）----
 	Close *float64 `json:"close,omitempty"` // 截止 as_of 的最新有效收盘价（元）
@@ -201,6 +214,12 @@ type Result struct {
 	// SourceStatuses 四个自动来源 + 全市场初筛的本轮执行状态。FAILED 只更新该
 	// 来源的错误状态并保留最后一次有效结果——绝不把请求失败解释成"今天没有命中"。
 	SourceStatuses map[string]SourceStatus `json:"source_statuses,omitempty"`
+	// SourceDates A.4 新鲜度合同：每个来源本轮**真实业务数据截止日期**（已验证，
+	// YYYY-MM-DD）。与 SourceStatuses 同为来源级映射，但语义严格分离：状态证明
+	// "本轮怎么执行的"，日期证明"数据截止于何时"。无可信日期的来源**不得**在此
+	// 登记（读取端按缺失处理并落 UNKNOWN 哨兵）；绝不用 RunID/TradeDate/运行时刻
+	// 兜底。SUCCESS_EMPTY 来源同样只有在日期可证时才出现在这里。
+	SourceDates map[string]string `json:"source_dates,omitempty"`
 	// SourceErrors 记录 FAILED/PARTIAL 来源的具体错误原因（source_run_status.error_reason）。
 	SourceErrors map[string]string `json:"source_errors,omitempty"`
 	// ConfigHash 参数配置指纹（sha256 前 12 位）, 每次成功运行随 screening_runs 保存,
@@ -373,6 +392,10 @@ func (g *Generator) Generate(ctx context.Context, manualSymbols []string, now ti
 	liquidSet, liquidIdx, liquidityCount, err := g.liquidityScreen(ctx)
 	srcStatus := map[string]SourceStatus{"LIQUIDITY_SCREEN": StatusOK}
 	srcErrs := map[string]string{}
+	// srcDates A.4 新鲜度合同：来源级真实业务日期映射（键与 srcStatus 同名）。
+	// 只有能从实际参与计算的上游数据中提取并通过 normalizeBusinessDate 验证的
+	// 日期才会出现在这里；缺失即未知——持久化边界落 UNKNOWN，绝不用运行日兜底。
+	srcDates := map[string]string{}
 	markSrc := func(name string, e error) {
 		if e != nil {
 			srcStatus[name] = StatusFailed // FAILED: 保留上次有效结果, 不伪装成 SUCCESS_EMPTY
@@ -418,7 +441,7 @@ func (g *Generator) Generate(ctx context.Context, manualSymbols []string, now ti
 	// 3.4.3 生产缺陷修复: PARTIAL/SUCCESS_EMPTY 携带的聚合错误仅供审计, 不得像
 	// FAILED 一样丢弃有效候选——旧实现以 err!=nil 一刀切跳过追加, 使"部分子请求
 	// 失败但已保留可用结果"的来源候选全部消失(SourceHit.PARTIAL 证据随之不可见)。
-	etfEntries, etfSt, err := g.genETFMomentum(ctx, now)
+	etfEntries, etfSt, etfSrcDate, err := g.genETFMomentum(ctx, now)
 	if err != nil && etfSt == StatusFailed {
 		warnings = append(warnings, "ETF_MOMENTUM 失败(已跳过): "+err.Error())
 	} else {
@@ -428,6 +451,9 @@ func (g *Generator) Generate(ctx context.Context, manualSymbols []string, now ti
 		raw = append(raw, etfEntries...)
 	}
 	markSrcStatus("ETF_MOMENTUM", etfSt, err)
+	if etfSrcDate != "" {
+		srcDates[sourceETF] = etfSrcDate // A.4: 真实日线截止日透传（SUCCESS_EMPTY 同样可证）
+	}
 
 	// ---- 来源 1: 行业龙头（行业资金流 Top N -> 板块成分股 Top K, 流动性门槛叠加）----
 	sectorEntries, sectorSt, err := g.genSectorLeaders(ctx, screenSet, liquidIdx)
@@ -440,9 +466,12 @@ func (g *Generator) Generate(ctx context.Context, manualSymbols []string, now ti
 		raw = append(raw, sectorEntries...)
 	}
 	markSrcStatus("SECTOR_LEADER", sectorSt, err)
+	// A.4: SECTOR_LEADER 当前上游接口没有可验证的业务日期字段——保持未知，
+	// **绝不**用运行日期/TradeDate/time.Now() 兜底登记进 srcDates。恢复资格
+	// 的前置条件见 docs/data_freshness_contract_3.4.5.md（来源级日期证据矩阵）。
 
 	// ---- 来源 3: 龙虎榜机构净买入（叠加流动性门槛）----
-	fundEntries, err := g.genDragonTiger(ctx, now, screenSet, liquidIdx)
+	fundEntries, fundSrcDateRaw, err := g.genDragonTiger(ctx, now, screenSet, liquidIdx)
 	if err != nil {
 		warnings = append(warnings, "FUND_FLOW 失败(已跳过): "+err.Error())
 	} else {
@@ -452,6 +481,10 @@ func (g *Generator) Generate(ctx context.Context, manualSymbols []string, now ti
 	if err == nil && len(fundEntries) == 0 {
 		srcStatus["FUND_FLOW"] = StatusSuccessEmpty
 	}
+	// A.4: InstitutionBuy.Date 的真实供应商语义（交易日归属/发布滞后口径）尚未
+	// 核实。原始值仅作为条目级审计信息保留在 Entry.SourceDate；来源级可信日期
+	// 资格冻结——不登记进 srcDates，source_run_status.AsOf 落 UNKNOWN。
+	_ = fundSrcDateRaw
 	markSrc("MANUAL", nil) // 人工来源无外部取数; 已保存的人工记录不因自动刷新清除(聚合层保证)
 
 	// ---- 持久层状态注入（黑名单事实位 + 既有生命周期锚点; nil-safe, 单测可不接 DB）----
@@ -482,7 +515,7 @@ func (g *Generator) Generate(ctx context.Context, manualSymbols []string, now ti
 		pool = g.refinePool(ctx, pool, &warnings, now)
 	}
 	// 阶段 4：流动性闸门（ADV20）与交易容量标注，在精筛之后、落库之前。
-	pool = g.liquidityGatePool(ctx, pool, &warnings, now)
+	pool = g.liquidityGatePool(ctx, pool, &warnings, tradeDate, srcDates)
 	// 阶段 7: ADV20 已由流动性闸门写入条目快照(AvgAmount20D), 用它对四因子评分做
 	// 最终精化(补 P(ADV20) 权重)并按 A→B→其余重排。弱依赖：无强度包时原样返回。
 	pool = g.RefineScores(pool, &warnings)
@@ -534,6 +567,7 @@ func (g *Generator) Generate(ctx context.Context, manualSymbols []string, now ti
 		AsOf:            tradeDate,
 		RunID:           g.runID,
 		SourceStatuses:  srcStatus,
+		SourceDates:     srcDates,
 		SourceErrors:    srcErrs,
 		ConfigHash:      g.cfg.Hash(),
 		StrategyVersion: g.cfg.StrategyVersion(),
@@ -780,10 +814,15 @@ func coreFailureError(subErrs map[string]error) error {
 // 核心必要请求 = FundList/FundBatchQuote(失败即 FAILED); K 线精算为逐候选子请求,
 // 部分失败且有可用结果 -> PARTIAL; 全部成功但合法无命中(如列表无 ETF)按现状契约
 // 维持 FAILED(空 ETF 列表视为上游异常, 本阶段不改该语义)。
-func (g *Generator) genETFMomentum(ctx context.Context, now time.Time) ([]Entry, SourceStatus, error) {
+// genETFMomentum ETF 动量来源。
+// 返回值第三项 srcDate（A.4 新鲜度合同）：本轮实际参与动量计算的最后有效日线
+// 截止日（经 normalizeBusinessDate 验证，不晚于本次评估时点）。SUCCESS_EMPTY
+// （全部 K 线取数成功但无候选过线）同样能给出该日期；任何无法证明的情形诚实
+// 返回 ""——由调用方保持来源日期未知，绝不用运行时刻兜底。
+func (g *Generator) genETFMomentum(ctx context.Context, now time.Time) ([]Entry, SourceStatus, string, error) {
 	codes, err := g.prov.FundList(ctx)
 	if err != nil {
-		return nil, StatusFailed, err // 核心请求失败
+		return nil, StatusFailed, "", err // 核心请求失败
 	}
 	etfCodes := make([]string, 0, len(codes)/2)
 	for _, c := range codes {
@@ -793,12 +832,12 @@ func (g *Generator) genETFMomentum(ctx context.Context, now time.Time) ([]Entry,
 		}
 	}
 	if len(etfCodes) == 0 {
-		return nil, StatusFailed, context.DeadlineExceeded
+		return nil, StatusFailed, "", context.DeadlineExceeded
 	}
 
 	snaps, err := g.prov.FundBatchQuote(ctx, etfCodes)
 	if err != nil {
-		return nil, StatusFailed, err // 核心请求失败
+		return nil, StatusFailed, "", err // 核心请求失败
 	}
 	// 剔除货币/债券/理财类（名称启发式, 与 Python 版一致）
 	badKW := []string{"货币", "现金", "债", "理财"}
@@ -820,7 +859,7 @@ func (g *Generator) genETFMomentum(ctx context.Context, now time.Time) ([]Entry,
 		sort.SliceStable(candidates, func(i, j int) bool { return candidates[i].Amount > candidates[j].Amount })
 	}
 	if len(candidates) == 0 {
-		return nil, StatusFailed, context.DeadlineExceeded // 全部为货币/债券类, 无候选
+		return nil, StatusFailed, "", context.DeadlineExceeded // 全部为货币/债券类, 无候选
 	}
 	if len(candidates) > g.cfg.ETFPreFilterN {
 		candidates = candidates[:g.cfg.ETFPreFilterN]
@@ -834,6 +873,11 @@ func (g *Generator) genETFMomentum(ctx context.Context, now time.Time) ([]Entry,
 	total := len(candidates)
 	okCount := 0
 	subErrs := map[string]error{}
+	// A.4 srcDate：本轮**实际参与动量计算**的最后有效日线日期。逐 ETF 独立提取、
+	// 独立验证后取最大值；任何一根未通过 normalizeBusinessDate（格式/真实日历/
+	// 未来边界）的 K 线都不参与该结论。与是否有命中无关——SUCCESS_EMPTY 时同样
+	// 是"完整精算到某日"的证据。
+	srcDate := ""
 	for _, s := range candidates {
 		dc, err := g.prov.ETFCloseSeries(ctx, s.Code, g.cfg.ETFLookback, now)
 		if err != nil || dc == nil {
@@ -846,21 +890,31 @@ func (g *Generator) genETFMomentum(ctx context.Context, now time.Time) ([]Entry,
 		}
 		okCount++
 		mom := momentumPct(dc.Closes, g.cfg.ETFMomWindow)
+		// A.4: 找到实际参与本次动量计算的最后一根有效 K 线的日期。
+		// momentumPct 丢弃 c<=0 的行，故从尾部回扫取最后一个 Close>0 的行。
+		lastValid := lastPositiveCloseDate(dc.Dates, dc.Closes)
+		d, dErr := normalizeBusinessDate(lastValid, tradeDateOf(now))
+		if dErr == nil && d > srcDate {
+			srcDate = d
+		}
 		if mom == nil {
 			continue // 成功但数据不足以计算动量: 计成功, 不计失败
 		}
 		e := g.entry(s.Code, s.Name, sourceETF, s.Name)
 		e.Momentum20DPct = mom
+		if dErr == nil {
+			e.SourceDate = d // 条目级审计透传（可信才写，非法保持空=未知）
+		}
 		ranked = append(ranked, scored{e: e, mom: *mom})
 	}
 	// 有可用结果 -> OK/PARTIAL; 无结果且存在子请求失败 -> FAILED(不伪装 SUCCESS_EMPTY);
 	// 无结果且全部成功 -> SUCCESS_EMPTY。
 	st, aggErr := deriveSourceStatus(total, okCount, subErrs, false, len(ranked) > 0)
 	if st == StatusSuccessEmpty {
-		return nil, st, nil // ranked 为空但候选 K 线全部成功: 合法无命中
+		return nil, st, srcDate, nil // ranked 为空但候选 K 线全部成功: 合法无命中（日期仍可证）
 	}
 	if len(ranked) == 0 && aggErr != nil {
-		return nil, st, aggErr
+		return nil, st, srcDate, aggErr
 	}
 	sort.SliceStable(ranked, func(i, j int) bool { return ranked[i].mom > ranked[j].mom })
 	// ETFTopM<=0 = 全量保留（遗留问题修复: 旧默认 8 使 ETF 恒为 8 条）。
@@ -876,7 +930,27 @@ func (g *Generator) genETFMomentum(ctx context.Context, now time.Time) ([]Entry,
 		}
 		out = append(out, r.e)
 	}
-	return out, st, aggErr
+	return out, st, srcDate, aggErr
+}
+
+// lastPositiveCloseDate 返回与 momentumPct 相同口径下"最后参与计算的有效 K 线"
+// 日期：从尾部回扫第一个 Close>0 的下标。序列长度不齐或找不到时诚实返回 ""。
+func lastPositiveCloseDate(dates []string, closes []float64) string {
+	if len(dates) != len(closes) {
+		return ""
+	}
+	for i := len(closes) - 1; i >= 0; i-- {
+		if closes[i] > 0 {
+			return dates[i]
+		}
+	}
+	return ""
+}
+
+// tradeDateOf 把运行时刻折算为评估日（Asia/Shanghai 口径的 YYYY-MM-DD），
+// 仅用作 normalizeBusinessDate 的未来边界上界，本身不构成任何来源日期证据。
+func tradeDateOf(t time.Time) string {
+	return t.In(shanghaiLoc).Format("2006-01-02")
 }
 
 // ---------------------------------------------------------------------------
