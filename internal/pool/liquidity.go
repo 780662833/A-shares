@@ -106,14 +106,19 @@ const (
 // 字段，round-trip 丢弃、不扩 schema）。任何一根未通过验证的行都不参与该结论；
 // 全部不可证时保持空串——诚实未知，绝不兜底成运行日。srcDates 当前仅作调用
 // 侧接线保留（来源级日期与本闸门的行级日期语义不同，不互相替代）。
-func (g *Generator) liquidityGatePool(ctx context.Context, pool []AggEntry, warnings *[]string, tradeDate string, srcDates map[string]string) []AggEntry {
+//
+// now 参数保留为调用方时钟口径（既有测试夹具与生成器共用同一签名风格）；
+// 本闸门内部的一切时间基准——未来边界上界、行情取数窗口——一律以上海时区
+// 折算为准（tradeDateOf / shanghaiLoc），绝不直接用传入的 UTC 时刻做比较，
+// 避免跨时区毫秒差导致合法样本被误判为"未来数据"。
+func (g *Generator) liquidityGatePool(ctx context.Context, pool []AggEntry, warnings *[]string, tradeDate string, srcDates map[string]string, now time.Time) []AggEntry {
 	if !g.cfg.LiquidityEnabled {
 		return pool
 	}
 	_ = srcDates // 接线保留：来源级可信日期映射不参与本闸门的行级日期判定。
 	bound := tradeDate
 	if _, err := time.Parse("2006-01-02", bound); err != nil {
-		bound = tradeDateOf(time.Now()) // 评估日非法时以上海时区当日为上界，仅用于未来边界校验
+		bound = tradeDateOf(now.In(shanghaiLoc)) // 评估日非法时以上海时区当日为上界，仅用于未来边界校验
 	}
 	type outcome struct {
 		res   AdvResult
@@ -126,7 +131,7 @@ func (g *Generator) liquidityGatePool(ctx context.Context, pool []AggEntry, warn
 	for i := range pool {
 		e := &pool[i]
 		isETF := e.PrimarySource == sourceETF || e.AssetType == "ETF"
-		rows, err := g.prov.StockAmounts(ctx, e.Symbol, advWindow, time.Now())
+		rows, err := g.prov.StockAmounts(ctx, e.Symbol, advWindow, now)
 		if err != nil || len(rows) == 0 {
 			e.Liquidity = LiqDataInsufficient
 			e.CapacityStatus = CapacityUnchecked

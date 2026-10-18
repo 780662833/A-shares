@@ -57,7 +57,7 @@ for _, e := range sectorEntries {
 fmt.Printf("  SEC RAW %s\n", e.Symbol)
 }
 raw = append(raw, sectorEntries...)
-fundEntries, _ := g.genDragonTiger(ctx, testNow, nil, liquidIdx)
+fundEntries, _, _ := g.genDragonTiger(ctx, testNow, nil, liquidIdx)
 raw = append(raw, fundEntries...)
 srcStatus := map[string]SourceStatus{"ETF_MOMENTUM": etfSt, "SECTOR_LEADER": sectorSt}
 for i := range raw {
@@ -70,7 +70,7 @@ dbgPrintPool("AGG", pool)
 
 pool = g.refinePool(ctx, pool, &warns, testNow)
 dbgPrintPool("REFINE", pool)
-pool = g.liquidityGatePool(ctx, pool, &warns, testNow)
+pool = g.liquidityGatePool(ctx, pool, &warns, "2026-10-12", nil, testNow)
 dbgPrintPool("LIQGATE", pool)
 pool = g.RefineScores(pool, &warns)
 dbgPrintPool("REFSCORES", pool)

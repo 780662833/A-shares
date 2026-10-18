@@ -23,7 +23,7 @@ sectorEntries, sectorSt, err := g.genSectorLeaders(context.Background(), nil, li
 fmt.Println("SECTOR st:", sectorSt, "err:", err)
 for _, e := range sectorEntries { fmt.Printf("  SEC RAW %s\n", e.Symbol) }
 raw = append(raw, sectorEntries...)
-fundEntries, _ := g.genDragonTiger(context.Background(), testNow, nil, liquidIdx)
+fundEntries, _, _ := g.genDragonTiger(context.Background(), testNow, nil, liquidIdx)
 raw = append(raw, fundEntries...)
 srcStatus := map[string]SourceStatus{"ETF_MOMENTUM": etfSt, "SECTOR_LEADER": sectorSt}
 for i := range raw {
