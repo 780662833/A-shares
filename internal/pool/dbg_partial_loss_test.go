@@ -17,7 +17,7 @@ warns := []string{}
 liquidSet, liquidIdx, _, _ := g.liquidityScreen(context.Background())
 fmt.Println("liquidSet:", liquidSet)
 var raw []Entry
-etfEntries, etfSt, err := g.genETFMomentum(context.Background(), testNow)
+etfEntries, etfSt, _, err := g.genETFMomentum(context.Background(), testNow)
 raw = append(raw, etfEntries...)
 sectorEntries, sectorSt, err := g.genSectorLeaders(context.Background(), nil, liquidIdx)
 fmt.Println("SECTOR st:", sectorSt, "err:", err)
