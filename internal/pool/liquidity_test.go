@@ -6,7 +6,6 @@ import (
 	"context"
 	"strings"
 	"testing"
-	"time"
 )
 
 func amtRows(v float64, n int) []DailyAmountRow {
@@ -58,7 +57,7 @@ func TestLiquidityDataInsufficientUnder20Samples(t *testing.T) {
 	g := NewGenerator(f, DefaultConfig())
 	pool := []AggEntry{{Symbol: "600519.SH", PrimarySource: sourceSector, SourceType: sourceSector}}
 	var warns []string
-	out := g.liquidityGatePool(context.Background(), pool, &warns, time.Now())
+	out := g.liquidityGatePool(context.Background(), pool, &warns, tradeDateOf(testNow), nil, testNow)
 	if len(out) != 1 {
 		t.Fatalf("DATA_INSUFFICIENT 不得剔除记录: len=%d", len(out))
 	}
@@ -86,7 +85,7 @@ func TestDualThresholdStockVsETF(t *testing.T) {
 		{Symbol: "600519.SH", PrimarySource: sourceSector, SourceType: sourceSector},
 	}
 	var warns []string
-	out := g.liquidityGatePool(context.Background(), pool, &warns, time.Now())
+	out := g.liquidityGatePool(context.Background(), pool, &warns, tradeDateOf(testNow), nil, testNow)
 	if len(out) != 1 || out[0].Symbol != "510300.SH" {
 		t.Fatalf("股票条目应按股票门槛被剔除, ETF 按自身门槛保留: %+v", out)
 	}
@@ -106,7 +105,7 @@ func TestLiqWarnNearThreshold(t *testing.T) {
 	g := NewGenerator(f, DefaultConfig())
 	pool := []AggEntry{{Symbol: "600519.SH", PrimarySource: sourceSector, SourceType: sourceSector}}
 	var warns []string
-	out := g.liquidityGatePool(context.Background(), pool, &warns, time.Now())
+	out := g.liquidityGatePool(context.Background(), pool, &warns, tradeDateOf(testNow), nil, testNow)
 	if len(out) != 1 || out[0].Liquidity != LiqWarn {
 		t.Fatalf("期望 WARN(余量<20%%), got %+v", out)
 	}
@@ -158,7 +157,7 @@ func TestCapacityGateMarksEntries(t *testing.T) {
 		{Symbol: "600002.SH", PrimarySource: sourceSector, SourceType: sourceSector},
 	}
 	var warns []string
-	out := g.liquidityGatePool(context.Background(), pool, &warns, time.Now())
+	out := g.liquidityGatePool(context.Background(), pool, &warns, tradeDateOf(testNow), nil, testNow)
 	bySym := map[string]AggEntry{}
 	for _, e := range out {
 		bySym[e.Symbol] = e
@@ -195,7 +194,7 @@ func TestManualNeverDroppedByLiquidity(t *testing.T) {
 		{Symbol: "600519.SH", PrimarySource: sourceManual, SourceType: sourceManual},
 	}
 	var warns []string
-	out := g.liquidityGatePool(context.Background(), pool, &warns, time.Now())
+	out := g.liquidityGatePool(context.Background(), pool, &warns, tradeDateOf(testNow), nil, testNow)
 	if len(out) != 1 {
 		t.Fatalf("MANUAL 条目不得被流动性剔除: %+v", out)
 	}
@@ -221,7 +220,7 @@ func TestLiquidityMassFailureDegenerates(t *testing.T) {
 		{Symbol: "600002.SH", PrimarySource: sourceFund, SourceType: sourceFund},
 	}
 	var warns []string
-	out := g.liquidityGatePool(context.Background(), pool, &warns, time.Now())
+	out := g.liquidityGatePool(context.Background(), pool, &warns, tradeDateOf(testNow), nil, testNow)
 	if len(out) != 2 {
 		t.Fatalf("全军覆没应视为数据事故退化放行: %+v", out)
 	}
@@ -243,7 +242,7 @@ func TestLiquidityDisabledPassthrough(t *testing.T) {
 	g := NewGenerator(f, cfg)
 	pool := []AggEntry{{Symbol: "600519.SH", PrimarySource: sourceSector, SourceType: sourceSector}}
 	var warns []string
-	out := g.liquidityGatePool(context.Background(), pool, &warns, time.Now())
+	out := g.liquidityGatePool(context.Background(), pool, &warns, tradeDateOf(testNow), nil, testNow)
 	if len(out) != 1 || out[0].Liquidity != "" {
 		t.Fatalf("关闭时应原样透传: %+v", out)
 	}
@@ -262,7 +261,7 @@ func TestYiUnitFlowsThroughGateAsYuan(t *testing.T) {
 	g := NewGenerator(f, DefaultConfig())
 	pool := []AggEntry{{Symbol: "600519.SH", PrimarySource: sourceSector, SourceType: sourceSector}}
 	var warns []string
-	out := g.liquidityGatePool(context.Background(), pool, &warns, time.Now())
+	out := g.liquidityGatePool(context.Background(), pool, &warns, tradeDateOf(testNow), nil, testNow)
 	if len(out) != 1 || out[0].Liquidity != LiqPass {
 		t.Fatalf("0.6亿(换算后 6e7 元) 应 PASS: %+v", out)
 	}

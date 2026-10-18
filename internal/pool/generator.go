@@ -515,7 +515,7 @@ func (g *Generator) Generate(ctx context.Context, manualSymbols []string, now ti
 		pool = g.refinePool(ctx, pool, &warnings, now)
 	}
 	// 阶段 4：流动性闸门（ADV20）与交易容量标注，在精筛之后、落库之前。
-	pool = g.liquidityGatePool(ctx, pool, &warnings, tradeDate, srcDates)
+	pool = g.liquidityGatePool(ctx, pool, &warnings, tradeDate, srcDates, now)
 	// 阶段 7: ADV20 已由流动性闸门写入条目快照(AvgAmount20D), 用它对四因子评分做
 	// 最终精化(补 P(ADV20) 权重)并按 A→B→其余重排。弱依赖：无强度包时原样返回。
 	pool = g.RefineScores(pool, &warnings)
