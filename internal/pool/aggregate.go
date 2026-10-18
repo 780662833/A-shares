@@ -113,6 +113,13 @@ type AggEntry struct {
 	ExpireDate      *time.Time `json:"expire_date,omitempty"` // MANUAL-only 条目为 nil（永不过期）
 	HitThisRun      bool       `json:"hit_this_run"`
 
+	// LifecycleAction: Transition() 对本条记录本轮的逐证券决策（TOUCH/KEEP/EXPIRE/
+	// MARK_STALE/PROTECT；空串 = 未参与状态机——持久层无该记录的池内新候选，或
+	// Generate 未接线 PersistentStatus 钩子）。补丁 A：必须与上面的时间锚点一起经
+	// ToGenData round-trip 传递到落库层，使 ApplyWatchlistPool 执行状态机决策而
+	// 不是自行重算。动作按证券逐条保存，不得提升为整池单一口径。
+	LifecycleAction LifeAction `json:"lifecycle_action,omitempty"`
+
 	Tradability string `json:"tradability_status"` // ELIGIBLE / BLOCKED / UNKNOWN（派生, 见 ComputeTradability）
 
 	// ---- 阶段 3: 证券资格硬条件明细（eligibility 与 tradability 分离建模）----
