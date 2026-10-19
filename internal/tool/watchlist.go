@@ -425,6 +425,14 @@ func ApplyWatchlistPool(gdb *gorm.DB, data *watchlistGenData, now time.Time, sou
 		if err != nil {
 			return res, fmt.Errorf("watchlist: query extra %s: %w", code, err)
 		}
+		// P1 护栏（ExtraDecisions 旁路）：与 Pool 主路径同一契约——MANUAL/BLACKLIST
+		// 受保护行在所有生命周期决策路径上统一计入 SkippedMan 并零写入。
+		// 动作解析与未知动作警告已在上方先行执行, 审计信号不丢失。
+		if existing.SourceType == model.WatchSourceManual ||
+			existing.Status == model.WatchStatusBlacklist {
+			res.SkippedMan++
+			continue
+		}
 		switch mode {
 		case applyModeProtect:
 			res.SkippedMan++
