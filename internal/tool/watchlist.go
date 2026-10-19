@@ -303,13 +303,23 @@ func ApplyWatchlistPool(gdb *gorm.DB, data *watchlistGenData, now time.Time, sou
 			return res, fmt.Errorf("watchlist: query %s: %w", code, err)
 		default:
 			// —— 补丁 A：按状态机动作决定写入，不再独立推算生命周期 ——
-			// 行级人工/黑名单护栏优先于一切动作（含载荷缺字段的旧链路）：
-			existingManual := existing.SourceType == model.WatchSourceManual
-			existingBlacklist := existing.Status == model.WatchStatusBlacklist
+			// P1（护栏）+ 审计顺序（本轮裁定）：先解析动作并记录未知动作警告
+			// （lifecycleActionContract 只做分类，不写数据库），再执行 MANUAL /
+			// BLACKLIST 行级护栏，最后才进入动作处理分支。这样既保留未知动作的
+			// 审计信号，又保证受保护行在**一切**动作（TOUCH/KEEP/MARK_STALE/
+			// EXPIRE/PROTECT/未知动作/空动作旧载荷）下零写入——包括 name、
+			// sector_name、生命周期锚点（last_seen_at/expire_date）、status 与
+			// source_type。旧实现只在 TOUCH 分支内做行级检查，KEEP/AUDIT_ONLY
+			// 仍会把元数据写进受保护行，属契约缺口；护栏位于 switch mode 及任何
+			// 数据库写入之前后，该路径不复存在。
 			mode, ok := lifecycleActionContract(e.LifecycleAction)
 			if !ok {
 				res.Warnings = append(res.Warnings,
 					fmt.Sprintf("watchlist: unknown lifecycle_action %q for %s (conservative keep)", e.LifecycleAction, code))
+			}
+			if existing.SourceType == model.WatchSourceManual || existing.Status == model.WatchStatusBlacklist {
+				res.SkippedMan++
+				continue
 			}
 			switch mode {
 			case applyModeProtect:
@@ -324,15 +334,17 @@ func ApplyWatchlistPool(gdb *gorm.DB, data *watchlistGenData, now time.Time, sou
 				res.Kept++
 				continue
 			case applyModeTouch:
-				if existingManual || existingBlacklist {
-					res.SkippedMan++ // 护栏：即便载荷带 TOUCH 也不得改写人工/黑名单意图
-					continue
-				}
-				if e.LifecycleAction != "" && e.LastSeenAt == nil {
-					// Go 原生链路的 TOUCH 必须携带状态机锚点；缺失 = 上游矛盾输入。
-					// 按裁定保守保留原时间字段并产生明确审计警告，绝不静默重算续期。
-					// （空动作走的是旧版 Python 兼容分支，沿用其"收到即命中 + now 续期"
-					// 既有契约，不受本校验约束——见 watchlist_apply_test 的分离测试。）
+				// P2（双锚点校验）：Go 原生链路的 TOUCH 必须同时携带有效的 LastSeenAt 与
+				// ExpireDateP——任一缺失或为零时间即上游矛盾输入，保守保留原时间字段并
+				// 产生明确审计警告，绝不半更新（只刷 last_seen_at 静默保留旧 expire_date
+				// 的旧路径已删除），也绝不静默重算续期。
+				// （空动作走的是旧版 Python 兼容分支，沿用其"收到即命中 + now 续期"
+				// 既有契约，不受本校验约束——见 watchlist_apply_test 的分离测试。）
+				if e.LifecycleAction != "" &&
+					(e.LastSeenAt == nil ||
+						e.LastSeenAt.IsZero() ||
+						e.ExpireDateP == nil ||
+						e.ExpireDateP.IsZero()) {
 					res.Warnings = append(res.Warnings,
 						fmt.Sprintf("watchlist: TOUCH without state-machine anchor for %s (conservative keep, no renewal)", code))
 					log.Printf("watchlist: lifecycle audit-only code=%s action=TOUCH(missing-anchor) reason=inconsistent input", code)
@@ -340,18 +352,24 @@ func ApplyWatchlistPool(gdb *gorm.DB, data *watchlistGenData, now time.Time, sou
 					continue
 				}
 				updates := map[string]any{"status": model.WatchStatusActive}
-				if e.LastSeenAt != nil {
+				// 执行顺序契约：上方双锚点校验先于本段运行——凡 LifecycleAction 非空
+				// 且缺任一有效锚点的 TOUCH 都已整体保守保留（continue），能走到这里的
+				// 只有两种形态：(a) Go 原生 TOUCH，双锚点齐备且非零；(b) 空动作旧载荷。
+				// 因此下述 else 分支只对旧载荷可达，非空 TOUCH 不存在"只刷一半锚点"
+				// 的半更新路径。
+				if e.LastSeenAt != nil && !e.LastSeenAt.IsZero() {
 					updates["last_seen_at"] = *e.LastSeenAt // 状态机传来的锚点（Go 链路必携带）
 				} else {
 					updates["last_seen_at"] = now // 仅旧载荷兼容分支可达：沿用既有"收到即命中"续期规则
 				}
 				if exp := anchorOrConservative(e, now); exp != nil {
 					updates["expire_date"] = *exp
-				} else if e.LastSeenAt == nil {
-					// 旧载荷兼容分支：Python 网关无 expire_date 字段，沿用既有续期口径。
+				} else {
+					// 旧载荷兼容分支（仅空动作可达）：Python 网关无 expire_date 字段，
+					// 沿用既有"收到即命中 + now 续期 WatchlistExpireDuration"口径。
 					exp := now.Add(WatchlistExpireDuration)
 					updates["expire_date"] = exp
-				} // Go 链路缺 expire_date 已在上方整体保守保留，不会到达此处补算路径
+				}
 				if e.Name != "" {
 					updates["name"] = e.Name
 				}
