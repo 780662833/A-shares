@@ -4,6 +4,7 @@ package tool
 
 import (
 	"encoding/json"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -76,11 +77,11 @@ func TestApplyWatchlistPool_Lifecycle(t *testing.T) {
 		TradeDate: "2026-10-12",
 		Pool: []WatchEntry{
 			entry("600519", "贵州茅台改名?", model.WatchSourceETF), // 已存在且为 MANUAL -> 跳过不覆盖
-			entry("300750", "宁德时代", model.WatchSourceETF),      // 新插入
-			entry("000888", "屏蔽票", model.WatchSourceSector),     // BLACKLIST 终态 -> 跳过
-			entry("123", "非法代码", model.WatchSourceFund),        // 非 6 位数字 -> 丢弃
-			entry("300750", "重复条目", model.WatchSourceFund),     // 同日重复 -> seen 双保险丢弃
-			entry("002594", "比亚迪", model.WatchSourceSector),     // 新插入
+			entry("300750", "宁德时代", model.WatchSourceETF),    // 新插入
+			entry("000888", "屏蔽票", model.WatchSourceSector),  // BLACKLIST 终态 -> 跳过
+			entry("123", "非法代码", model.WatchSourceFund),      // 非 6 位数字 -> 丢弃
+			entry("300750", "重复条目", model.WatchSourceFund),   // 同日重复 -> seen 双保险丢弃
+			entry("002594", "比亚迪", model.WatchSourceSector),  // 新插入
 			entry("688117", "刚入池又出池", model.WatchSourceFund), // 本轮命中 -> 应 ACTIVE+续期
 		},
 		Warnings: []string{"FUND_FLOW 失败(已跳过): mock"},
@@ -316,7 +317,6 @@ func ptrTime(t time.Time) *time.Time { return &t }
 // 不是映射函数返回值。
 // ---------------------------------------------------------------------------
 
-
 // sameTime 比较两个时间的"同一时刻"语义（忽略时区/表示差异），符合裁定：
 // 核对还原后的时间值，不要求 JSON 文本逐字节相同。
 func sameTime(a, b time.Time) bool {
@@ -342,7 +342,7 @@ func TestApplyLifecycleContract_FiveActions(t *testing.T) {
 	seed("600002", model.WatchSourceSector, model.WatchStatusActive, base, oldExp) // KEEP
 	seed("600003", model.WatchSourceSector, model.WatchStatusActive, base, oldExp) // MARK_STALE
 	seed("600004", model.WatchSourceSector, model.WatchStatusActive, base, oldExp) // EXPIRE
-	seed("600005", model.WatchSourceManual, model.WatchStatusActive, base, oldExp)       // PROTECT(人工)
+	seed("600005", model.WatchSourceManual, model.WatchStatusActive, base, oldExp) // PROTECT(人工)
 	seed("600006", model.WatchSourceSector, model.WatchStatusBlacklist, base, oldExp)
 	seed("600007", model.WatchSourceSector, model.WatchStatusActive, base, oldExp) // 未知动作
 	seed("600008", model.WatchSourceSector, model.WatchStatusActive, base, oldExp) // 空动作(旧载荷)
@@ -577,5 +577,227 @@ func TestApplyLifecycleContract_ExtraDecisionsAbsentCandidates(t *testing.T) {
 	}
 	if res.Inactivated != 0 {
 		t.Errorf("Inactivated=%d, F-2 冻结被破坏", res.Inactivated)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 补丁 A P5（专项测试增补）：
+//   A. MANUAL / BLACKLIST 受保护记录的动作矩阵 —— 任何生命周期动作（含空动作旧
+//      载荷与未知动作）都不得改写受保护行，读回断言六个字段原值不变；
+//   B. TOUCH 双锚点校验 —— 缺 LastSeenAt、缺 ExpireDateP、任一零时间三种形态
+//      都必须保守保留 + 告警 + AuditOnly 计数，禁止半更新；
+//   C. ExtraDecisions 旁路 EXPIRE 落库 —— F-2 冻结的直接数据库证据：审计动作
+//      不得把 ACTIVE 改成 INACTIVE，也不得改动锚点。
+// ---------------------------------------------------------------------------
+
+// TestApplyLifecycleContract_ProtectedRowActionMatrix —— P1 护栏前置的数据库级
+// 验证：TOUCH(带合法双锚点)/KEEP/EXPIRE/MARK_STALE/PROTECT/未知动作/空动作(旧载荷)
+// 七种输入分别作用于 MANUAL 行与 BLACKLIST 行，六字段必须逐一原值保持。
+func TestApplyLifecycleContract_ProtectedRowActionMatrix(t *testing.T) {
+	gdb := newWatchTestDB(t)
+	now := time.Date(2026, 10, 17, 15, 30, 45, 123456789, time.UTC)
+	base := now.AddDate(0, 0, -30)
+	oldExp := base.AddDate(0, 0, 7)
+	// 状态机口径的"合法" TOUCH 双锚点——即便载荷完全合规，受保护行也不得被写。
+	smSeen := now.Truncate(time.Second)
+	smExp := smSeen.AddDate(0, 0, 7)
+
+	actions := []string{"TOUCH", "KEEP", "EXPIRE", "MARK_STALE", "PROTECT", "TELEPORT", ""}
+	var pool []WatchEntry
+	seeded := map[string][2]string{} // code -> {protectedKind, action}
+	mkSeed := func(idx int, kind, status string) {
+		// MANUAL 组占 6001xx，BLACKLIST 组占 6002xx（idx 为 actions 下标 0..6）。
+		num := 100 + idx
+		if kind == "BLACKLIST" {
+			num = 200 + idx
+		}
+		code := fmt.Sprintf("60%04d", num)
+		it := model.WatchlistItem{Code: code, Name: "受保护旧名", SourceType: model.WatchSourceSector,
+			Status: status, SectorName: "旧板块", AddedDate: base,
+			LastSeenAt: ptrTime(base), ExpireDate: ptrTime(oldExp)}
+		if kind == "MANUAL" {
+			it.SourceType = model.WatchSourceManual
+		}
+		if err := gdb.Create(&it).Error; err != nil {
+			t.Fatalf("seed %s: %v", code, err)
+		}
+		seeded[code] = [2]string{kind, ""}
+		pool = append(pool, mkProtectedEntry(code, actions[idx], smSeen, smExp))
+		seeded[code] = [2]string{kind, actions[idx]}
+	}
+	for i, a := range actions {
+		mkSeed(i, "MANUAL", model.WatchStatusActive) // 600100..600106: MANUAL 行
+		mkSeed(i, "BLACKLIST", model.WatchStatusBlacklist)
+		_ = a // BLACKLIST 组由 mkSeed 内部映射到 600200..600206
+	}
+
+	res, err := ApplyWatchlistPool(gdb, &WatchlistGenData{Pool: pool}, now, map[string]string{"SECTOR_LEADER": "OK"})
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+
+	for code, meta := range seeded {
+		kind, action := meta[0], meta[1]
+		it := mustFind(t, gdb, code)
+		wantSrc := model.WatchSourceSector
+		if kind == "MANUAL" {
+			wantSrc = model.WatchSourceManual
+		}
+		wantStatus := model.WatchStatusActive
+		if kind == "BLACKLIST" {
+			wantStatus = model.WatchStatusBlacklist
+		}
+		// 六字段逐一原值断言：name / sector_name / last_seen_at / expire_date / status / source_type
+		if it.Name != "受保护旧名" {
+			t.Errorf("%s(%s, action=%q): name 被改写为 %q", code, kind, action, it.Name)
+		}
+		if it.SectorName != "旧板块" {
+			t.Errorf("%s(%s, action=%q): sector_name 被改写为 %q", code, kind, action, it.SectorName)
+		}
+		if it.LastSeenAt == nil || !sameTime(*it.LastSeenAt, base) {
+			t.Errorf("%s(%s, action=%q): last_seen_at 被改动: %v want %v", code, kind, action, it.LastSeenAt, base)
+		}
+		if it.ExpireDate == nil || !sameTime(*it.ExpireDate, oldExp) {
+			t.Errorf("%s(%s, action=%q): expire_date 被改动: %v want %v", code, kind, action, it.ExpireDate, oldExp)
+		}
+		if it.Status != wantStatus {
+			t.Errorf("%s(%s, action=%q): status 被改写: %s want %s", code, kind, action, it.Status, wantStatus)
+		}
+		if it.SourceType != wantSrc {
+			t.Errorf("%s(%s, action=%q): source_type 被改写: %s want %s", code, kind, action, it.SourceType, wantSrc)
+		}
+	}
+
+	// 计数断言：14 个受保护条目全部计入 SkippedMan（护栏先于一切动作分支），
+	// 且没有任何一条走成写入路径。
+	if res.SkippedMan != len(actions)*2 {
+		t.Errorf("SkippedMan=%d want %d（每个动作×每类保护对象都须计入）", res.SkippedMan, len(actions)*2)
+	}
+	if res.Updated != 0 || res.Kept != 0 || res.Inserted != 0 {
+		t.Errorf("受保护行不得产生任何写入计数: updated=%d kept=%d inserted=%d", res.Updated, res.Kept, res.Inserted)
+	}
+	// AuditOnly 只允许来自"非保护行的保守分支"——本测试全部条目受保护，应为 0。
+	if res.AuditOnly != 0 {
+		t.Errorf("AuditOnly=%d want 0（受保护行统一计 SkippedMan，不重复计入审计）", res.AuditOnly)
+	}
+	// 未知动作仍要留下警告（护栏跳过不吞掉契约违规信号）。
+	if !strings.Contains(strings.Join(res.Warnings, "|"), "unknown lifecycle_action") {
+		t.Errorf("未知动作缺少警告（护栏前置不得吞掉审计信号）: %v", res.Warnings)
+	}
+	if res.Inactivated != 0 {
+		t.Errorf("Inactivated=%d, F-2 冻结被破坏", res.Inactivated)
+	}
+}
+
+func mkProtectedEntry(sym, action string, smSeen, smExp time.Time) WatchEntry {
+	e := WatchEntry{Symbol: sym, Name: "自动新名", SourceType: string(model.WatchSourceETF),
+		SectorName: "自动新板块", LifecycleAction: action}
+	if action == "TOUCH" { // 只有 TOUCH 才携带合法双锚点（其余动作给空锚点也进不了写入）
+		e.LastSeenAt, e.ExpireDateP = ptrTime(smSeen), ptrTime(smExp)
+	}
+	return e
+}
+
+// TestApplyLifecycleContract_TouchDualAnchorMissing —— P2 双锚点校验的三种缺失
+// 形态：缺 LastSeenAt / 缺 ExpireDateP / 任一为零时间。每种都必须：整条保守保留
+// （两个时间字段都不动、status/name/sector/source_type 不写）、产生
+// "without state-machine anchor" 警告、计入 AuditOnly——绝不允许半更新。
+func TestApplyLifecycleContract_TouchDualAnchorMissing(t *testing.T) {
+	cases := []struct {
+		name string
+		ls   func() *time.Time
+		exp  func() *time.Time
+	}{
+		{"missing LastSeenAt", func() *time.Time { return nil }, func() *time.Time { x := time.Now().UTC(); return &x }},
+		{"missing ExpireDateP", func() *time.Time { x := time.Now().UTC(); return &x }, func() *time.Time { return nil }},
+		{"zero LastSeenAt", func() *time.Time { z := time.Time{}; return &z }, func() *time.Time { x := time.Now().UTC(); return &x }},
+		{"zero ExpireDateP", func() *time.Time { x := time.Now().UTC(); return &x }, func() *time.Time { z := time.Time{}; return &z }},
+		{"both zero", func() *time.Time { z := time.Time{}; return &z }, func() *time.Time { z := time.Time{}; return &z }},
+	}
+	for i, tc := range cases {
+		gdb := newWatchTestDB(t)
+		now := time.Date(2026, 10, 17, 15, 30, 45, 0, time.UTC).Add(time.Duration(i) * time.Hour)
+		base := now.AddDate(0, 0, -3)
+		oldExp := base.AddDate(0, 0, 7)
+		code := "600001"
+		if err := gdb.Create(&model.WatchlistItem{Code: code, Name: "旧名", SourceType: model.WatchSourceSector,
+			Status: model.WatchStatusActive, SectorName: "旧板块", AddedDate: base,
+			LastSeenAt: ptrTime(base), ExpireDate: ptrTime(oldExp)}).Error; err != nil {
+			t.Fatal(err)
+		}
+		e := WatchEntry{Symbol: code, Name: "新名", SourceType: string(model.WatchSourceETF),
+			SectorName: "新板块", LifecycleAction: "TOUCH", LastSeenAt: tc.ls(), ExpireDateP: tc.exp()}
+		res, err := ApplyWatchlistPool(gdb, &WatchlistGenData{Pool: []WatchEntry{e}}, now, nil)
+		if err != nil {
+			t.Fatalf("%s: apply: %v", tc.name, err)
+		}
+		it := mustFind(t, gdb, code)
+		if it.LastSeenAt == nil || !sameTime(*it.LastSeenAt, base) {
+			t.Errorf("%s: last_seen_at 被半更新: %v want %v", tc.name, it.LastSeenAt, base)
+		}
+		if it.ExpireDate == nil || !sameTime(*it.ExpireDate, oldExp) {
+			t.Errorf("%s: expire_date 被半更新: %v want %v", tc.name, it.ExpireDate, oldExp)
+		}
+		if it.Status != model.WatchStatusActive {
+			t.Errorf("%s: status 被改写: %s", tc.name, it.Status)
+		}
+		if it.Name != "旧名" || it.SectorName != "旧板块" || it.SourceType != model.WatchSourceSector {
+			t.Errorf("%s: 元数据/source_type 被改写: %+v", tc.name, it)
+		}
+		if !strings.Contains(strings.Join(res.Warnings, "|"), "without state-machine anchor") {
+			t.Errorf("%s: 缺少保守保留警告: %v", tc.name, res.Warnings)
+		}
+		if res.AuditOnly != 1 {
+			t.Errorf("%s: AuditOnly=%d want 1", tc.name, res.AuditOnly)
+		}
+		if res.Updated != 0 {
+			t.Errorf("%s: 缺锚点 TOUCH 不应计入 Updated: %d", tc.name, res.Updated)
+		}
+	}
+}
+
+// TestApplyLifecycleContract_ExtraExpireStaysActiveF2Frozen —— F-2 冻结的**落库**
+// 直接证据：ExtraDecisions 旁路的 EXPIRE 到达一个已超期的 ACTIVE 记录时，读回
+// DB 必须仍是 ACTIVE + 原锚点 + 原元数据（审计动作不得恢复自动失效），同时
+// Inactivated 恒为 0、AuditOnly 计数正确。此前该结论仅由代码注释推断，本用例
+// 用真实数据库行证伪/证实。
+func TestApplyLifecycleContract_ExtraExpireStaysActiveF2Frozen(t *testing.T) {
+	gdb := newWatchTestDB(t)
+	now := time.Date(2026, 10, 17, 15, 0, 0, 0, time.UTC)
+	base := now.AddDate(0, 0, -30)
+	oldExp := base.AddDate(0, 0, 7) // 已过期：expire_date < now
+	if err := gdb.Create(&model.WatchlistItem{Code: "600002", Name: "旧名", SourceType: model.WatchSourceSector,
+		Status: model.WatchStatusActive, SectorName: "旧板块", AddedDate: base,
+		LastSeenAt: ptrTime(base), ExpireDate: ptrTime(oldExp)}).Error; err != nil {
+		t.Fatal(err)
+	}
+	data := &WatchlistGenData{
+		Pool: []WatchEntry{{Symbol: "600003", Name: "本轮新候选", SourceType: "SECTOR_LEADER"}},
+		ExtraDecisions: map[string]json.RawMessage{
+			"600002": json.RawMessage(`{"lifecycle_action":"EXPIRE","last_seen_at":"` + base.Format(time.RFC3339Nano) + `","expire_date":"` + oldExp.Format(time.RFC3339Nano) + `"}`),
+		},
+	}
+	res, err := ApplyWatchlistPool(gdb, data, now, map[string]string{"SECTOR_LEADER": "OK", "ETF_MOMENTUM": "SUCCESS_EMPTY", "FUND_FLOW": "OK"})
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	it := mustFind(t, gdb, "600002")
+	if it.Status != model.WatchStatusActive {
+		t.Errorf("EXPIRE 审计动作恢复了自动失效: status=%s（F-2 冻结要求保持 ACTIVE）", it.Status)
+	}
+	if it.Status == model.WatchStatusInactive {
+		t.Errorf("EXPIRE 旁路把 ACTIVE 改成了 INACTIVE，直接违反 F-2 冻结")
+	}
+	if it.LastSeenAt == nil || !sameTime(*it.LastSeenAt, base) || it.ExpireDate == nil || !sameTime(*it.ExpireDate, oldExp) {
+		t.Errorf("EXPIRE 旁路改动了时间锚点: %v/%v", it.LastSeenAt, it.ExpireDate)
+	}
+	if it.Name != "旧名" || it.SectorName != "旧板块" {
+		t.Errorf("EXPIRE 旁路改动了元数据: %+v", it)
+	}
+	if res.Inactivated != 0 {
+		t.Errorf("Inactivated=%d want 0（F-2 冻结）", res.Inactivated)
+	}
+	if res.AuditOnly != 1 {
+		t.Errorf("AuditOnly=%d want 1（EXPIRE 旁路应计入保守审计）", res.AuditOnly)
 	}
 }

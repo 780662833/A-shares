@@ -564,16 +564,14 @@ func (g *Generator) Generate(ctx context.Context, manualSymbols []string, now ti
 			prev := statusOf(e.Symbol)
 			inPool[e.Symbol] = true
 			if prev == nil {
-				// 持久层无记录的新候选：不属于五动作迁移（无既有记录可迁移），但按
-				// 第 1 阶段裁定仍透传状态机口径的初始锚点——Transition 对全新记录的
-				// TOUCH 语义即"以本次运行时刻为新鲜度起点"。载荷缺失时写入层会保守
-				// 保留并告警，因此这里必须显式携带，不允许落库层重算。
-				next, act := Transition(*e, e.HitThisRun, worstRefreshStatus(e.Sources), autoExpireDaysForPool, now)
-				e.LifecycleAction = act
-				e.SourceLifecycle = next.SourceLifecycle
-				e.LastSeenAt = next.LastSeenAt
-				e.ExpireDate = next.ExpireDate
-				dec[e.Symbol] = *e
+				// P3（新候选动作口径）：持久层无记录的新候选**不属于**五动作状态机迁移
+				// ——没有既有记录可供 TOUCH/KEEP/EXPIRE/MARK_STALE/PROTECT 转移，把它包装
+				// 成"状态机已作出 TOUCH 决策"是对上游裁定（见 patch_a_propagation_test
+				// 第 1 阶段边界断言）的违背。LifecycleAction 保持空、不进入
+				// TransitionDecisions；FirstSeenAt/LastSeenAt/ExpireDate 等初始化锚点继续
+				// 由写入层（ApplyWatchlistPool）的插入路径按既有人工/自动语义负责，
+				// 生成侧不重算、不透传伪决策。
+				e.LifecycleAction = ""
 				continue
 			}
 			worst := worstRefreshStatus(e.Sources)
@@ -595,8 +593,14 @@ func (g *Generator) Generate(ctx context.Context, manualSymbols []string, now ti
 			dec[e.Symbol] = *e
 		}
 		// 持久层已知、本轮未出现在池中的旧记录：以持久层自身为 rec、
-		// persistedHit=false 走同一条 Transition 规则。worstRefreshStatus(nil)=
-		// FAILED（诚实"本轮无证据"，Transition 标 STALE，绝不误续期也绝不批量失效）。
+		// persistedHit=false 走同一条 Transition 规则。P4（缺席候选状态判定）：
+		// 本轮证据取自**显式定义的必需来源集合** requiredDiscoverySources（三个自动
+		// 发现来源 SECTOR_LEADER / ETF_MOMENTUM / FUND_FLOW），而不是把整张状态映射
+		// 混在一起判断，也不把缺失键默认为成功：
+		//   - 每个必需来源都必须**明确存在**且为 OK/SUCCESS_EMPTY，才允许按截止日
+		//     返回 KEEP（未过期）或 EXPIRE（已过期，F-2 冻结下写入层仅审计）；
+		//   - 任一必需来源为 PARTIAL/FAILED/STALE、状态缺失或不可识别时，保守返回
+		//     MARK_STALE——绝不在证据不完整时推进自然过期路径，也绝不批量失效。
 		// MANUAL/BLACKLIST 由 Transition 的 PROTECT 分支最先拦截。
 		for _, code := range knownCodes {
 			if inPool[code] {
@@ -607,7 +611,7 @@ func (g *Generator) Generate(ctx context.Context, manualSymbols []string, now ti
 				continue
 			}
 			rec := *prev
-			next, act := Transition(rec, false, worstRefreshStatus(nil), autoExpireDaysForPool, now)
+			next, act := Transition(rec, false, absentCandidateRefreshStatus(srcStatus), autoExpireDaysForPool, now)
 			rec.LifecycleAction = act
 			rec.SourceLifecycle = next.SourceLifecycle
 			rec.LastSeenAt = next.LastSeenAt
@@ -674,6 +678,36 @@ func worstRefreshStatus(hits []SourceHit) SourceStatus {
 		return StatusFailed
 	}
 	return worst
+}
+
+// requiredDiscoverySources 显式定义的候选发现**必需来源集合**（P4）：三个自动发现
+// 来源。缺席旧候选的本轮证据只按这个集合判定——不把 LIQUIDITY_SCREEN 等辅助键或
+// 映射中任意混入的其它状态项参与判定，也不因某个键缺失而默认整轮成功。
+var requiredDiscoverySources = []string{sourceSector, sourceETF, sourceFund}
+
+// absentCandidateRefreshStatus 为"持久层已知、本轮缺席"的旧候选推导 Transition 的
+// refreshStatus 输入（P4 统一口径）：
+//   - 每个必需来源都必须**明确存在**于本轮 srcStatus 且为 OK / SUCCESS_EMPTY，
+//     才返回 SUCCESS_EMPTY——即"本轮确认未命中"，允许 Transition 走唯一受控的
+//     自然截止日判定（未过期 KEEP / 已过期 EXPIRE；F-2 冻结下 EXPIRE 在写入层
+//     仍只是审计动作，不触发自动失效）；
+//   - 任一必需来源为 PARTIAL / FAILED / STALE、键缺失或状态不可识别时，返回
+//     FAILED——Transition 对缺席记录一律保守 MARK_STALE，绝不推进过期路径。
+//
+// 注意与旧实现的区别：旧实现对缺席记录固定传 worstRefreshStatus(nil)=FAILED，
+// 使 KEEP/EXPIRE 分支在生产链路上永远不可达；本函数把"证据是否完整成功"显式化，
+// 失败形态全部保持保守语义不变。
+func absentCandidateRefreshStatus(srcStatus map[string]SourceStatus) SourceStatus {
+	for _, name := range requiredDiscoverySources {
+		st, ok := srcStatus[name]
+		if !ok {
+			return StatusFailed // 状态缺失 ≠ 成功：保守降级
+		}
+		if st != StatusOK && st != StatusSuccessEmpty {
+			return StatusFailed // PARTIAL/FAILED/STALE/不可识别：保守降级
+		}
+	}
+	return StatusSuccessEmpty
 }
 
 // ---------------------------------------------------------------------------
