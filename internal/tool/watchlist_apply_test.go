@@ -468,6 +468,112 @@ func TestApplyLifecycleContract_FiveActions(t *testing.T) {
 	}
 }
 
+// TestApplyLifecycleContract_AuditOnlyZeroWrite —— 锁定 AUDIT_ONLY 零写入新契约：
+// MARK_STALE / EXPIRE / 未知动作（TELEPORT）代表保守审计，不是更新数据库记录的
+// 授权——即便是普通的非 MANUAL、非 BLACKLIST 自动来源记录，六个字段
+// （name / sector_name / last_seen_at / expire_date / status / source_type）
+// 也必须原值保持；旧实现允许该分支经 nonAnchorMeta 回写 name/sector_name/
+// source_type 的口径已废除。同时确认 KEEP 仍按原契约工作（锚点不动、元数据可更新），
+// TOUCH 仍正常续期，Inactivated 恒为 0（F-2 冻结）。
+func TestApplyLifecycleContract_AuditOnlyZeroWrite(t *testing.T) {
+	gdb := newWatchTestDB(t)
+	now := time.Date(2026, 10, 17, 15, 30, 45, 123456789, time.UTC)
+	base := now.AddDate(0, 0, -3)
+	oldExp := base.AddDate(0, 0, 7)
+	seed := func(code string) {
+		it := model.WatchlistItem{Code: code, Name: "旧名", SourceType: model.WatchSourceSector,
+			Status: model.WatchStatusActive, SectorName: "旧板块", AddedDate: base,
+			LastSeenAt: ptrTime(base), ExpireDate: ptrTime(oldExp)}
+		if err := gdb.Create(&it).Error; err != nil {
+			t.Fatalf("seed %s: %v", code, err)
+		}
+	}
+	for _, c := range []string{"600021", "600022", "600023", "600024", "600025"} {
+		seed(c)
+	}
+
+	smSeen := now.Truncate(time.Second)
+	smExp := smSeen.AddDate(0, 0, 7)
+	mk := func(sym, action string, ls, exp *time.Time) WatchEntry {
+		return WatchEntry{Symbol: sym, Name: "新名-" + sym, SectorName: "新板块",
+			SourceType: string(model.WatchSourceETF), LifecycleAction: action,
+			LastSeenAt: ls, ExpireDateP: exp}
+	}
+	data := &WatchlistGenData{Pool: []WatchEntry{
+		mk("600021", "MARK_STALE", nil, nil),
+		mk("600022", "EXPIRE", nil, nil),
+		mk("600023", "TELEPORT", nil, nil), // 未知动作 → 同一零写入审计分支
+		mk("600024", "KEEP", ptrTime(base), ptrTime(oldExp)),
+		mk("600025", "TOUCH", ptrTime(smSeen), ptrTime(smExp)),
+	}}
+	res, err := ApplyWatchlistPool(gdb, data, now, map[string]string{"SECTOR_LEADER": "OK"})
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+
+	// 1-3. AUDIT_ONLY 三形态：普通自动记录同样六字段零写入。
+	for _, pair := range []struct{ code, action string }{
+		{"600021", "MARK_STALE"}, {"600022", "EXPIRE"}, {"600023", "TELEPORT"},
+	} {
+		it := mustFind(t, gdb, pair.code)
+		if it.Name != "旧名" {
+			t.Errorf("%s(%s): name 被改写为 %q（审计分支不得回写元数据）", pair.code, pair.action, it.Name)
+		}
+		if it.SectorName != "旧板块" {
+			t.Errorf("%s(%s): sector_name 被改写为 %q", pair.code, pair.action, it.SectorName)
+		}
+		if it.LastSeenAt == nil || !sameTime(*it.LastSeenAt, base) {
+			t.Errorf("%s(%s): last_seen_at 被改动: %v want %v", pair.code, pair.action, it.LastSeenAt, base)
+		}
+		if it.ExpireDate == nil || !sameTime(*it.ExpireDate, oldExp) {
+			t.Errorf("%s(%s): expire_date 被改动: %v want %v", pair.code, pair.action, it.ExpireDate, oldExp)
+		}
+		if it.Status != model.WatchStatusActive {
+			t.Errorf("%s(%s): status 被改写: %s（禁止模型外枚举 / F-2 借道失效）", pair.code, pair.action, it.Status)
+		}
+		if it.SourceType != model.WatchSourceSector {
+			t.Errorf("%s(%s): source_type 被改写: %s want %s", pair.code, pair.action, it.SourceType, model.WatchSourceSector)
+		}
+	}
+
+	// 4. KEEP 仍按原契约：锚点不动，但非锚点元数据允许更新。
+	it := mustFind(t, gdb, "600024")
+	if it.LastSeenAt == nil || !sameTime(*it.LastSeenAt, base) {
+		t.Errorf("KEEP 锚点被刷新: %v", it.LastSeenAt)
+	}
+	if it.ExpireDate == nil || !sameTime(*it.ExpireDate, oldExp) {
+		t.Errorf("KEEP expire_date 被刷新: %v", it.ExpireDate)
+	}
+	if it.Name != "新名-600024" || it.SectorName != "新板块" {
+		t.Errorf("KEEP 元数据未按既有契约更新: name=%q sector=%q", it.Name, it.SectorName)
+	}
+
+	// 5. TOUCH 正常路径不受影响：使用透传锚点续期。
+	it = mustFind(t, gdb, "600025")
+	if it.LastSeenAt == nil || !sameTime(*it.LastSeenAt, smSeen) {
+		t.Errorf("TOUCH last_seen_at=%v want %v", it.LastSeenAt, smSeen)
+	}
+	if it.ExpireDate == nil || !sameTime(*it.ExpireDate, smExp) {
+		t.Errorf("TOUCH expire_date=%v want %v", it.ExpireDate, smExp)
+	}
+
+	// 计数：三个审计分支各计 AuditOnly=1；Updated 只来自 TOUCH 一次全字段更新，
+	// KEEP 的元数据更新计入 Kept 而不计入 Updated（既有口径）。
+	if res.AuditOnly != 3 {
+		t.Errorf("AuditOnly=%d want 3（MARK_STALE/EXPIRE/未知动作各一）", res.AuditOnly)
+	}
+	if res.Updated != 1 || res.Kept != 1 || res.Inserted != 0 || res.SkippedMan != 0 {
+		t.Errorf("计数不符: updated=%d kept=%d inserted=%d skippedMan=%d", res.Updated, res.Kept, res.Inserted, res.SkippedMan)
+	}
+	if res.Inactivated != 0 {
+		t.Errorf("Inactivated=%d, F-2 冻结被破坏", res.Inactivated)
+	}
+	// 未知动作警告仍在（护栏与分类顺序未被本测试前提破坏）。
+	if !strings.Contains(strings.Join(res.Warnings, "|"), "unknown lifecycle_action") {
+		t.Errorf("未知动作缺少警告: %v", res.Warnings)
+	}
+}
+
 func TestApplyLifecycleContract_TouchIdempotentNoDrift(t *testing.T) {
 	gdb := newWatchTestDB(t)
 	now := time.Date(2026, 10, 17, 15, 30, 45, 0, time.UTC)

@@ -162,9 +162,10 @@ func anchorOrConservative(e WatchEntry, now time.Time) *time.Time {
 	return nil
 }
 
-// nonAnchorMeta 提取 KEEP/AUDIT_ONLY 模式下允许更新的非生命周期元数据。
+// nonAnchorMeta 提取 KEEP 模式下允许更新的非生命周期元数据。
 // 绝不包含 last_seen_at / expire_date / status / source_type——这些只能由
-// TOUCH（或既有插入路径的人工语义）改写。
+// TOUCH（或既有插入路径的人工语义）改写。AUDIT_ONLY 分支已统一为零写入，
+// 不再使用本函数。
 func nonAnchorMeta(e WatchEntry) map[string]any {
 	meta := map[string]any{}
 	if e.Name != "" {
@@ -384,14 +385,11 @@ func ApplyWatchlistPool(gdb *gorm.DB, data *watchlistGenData, now time.Time, sou
 				}
 				res.Updated++
 			case applyModeAuditOnly:
-				// MARK_STALE / EXPIRE / 未知动作：保留原状态与原时间锚点，只允许非生命
-				// 周期元数据（名称/板块）更新；绝不写 STALE/EXPIRED 等模型外枚举，绝不
-				// 借道 status 恢复自动失效。
-				if meta := nonAnchorMeta(e); len(meta) > 0 {
-					if err := gdb.Model(&model.WatchlistItem{}).Where("id = ?", existing.ID).Updates(meta).Error; err != nil {
-						return res, fmt.Errorf("watchlist: audit-only %s metadata: %w", code, err)
-					}
-				}
+				// MARK_STALE / EXPIRE / 未知动作：零写入保守审计分支——保留原状态、原时间
+				// 锚点及全部字段（含 name/sector_name）不变，仅记录日志并计入 AuditOnly；
+				// 绝不写 STALE/EXPIRED 等模型外枚举，绝不借道 status 恢复自动失效（F-2 冻结）。
+				// （旧实现在此更新非锚点元数据，与 ExtraDecisions 旁路的同名分支不一致，构成
+				// "同一动作两条路径两种语义"的契约缺口；本轮统一为零写入。）
 				log.Printf("watchlist: lifecycle audit-only code=%s action=%s reason=%s",
 					code, contractActionLabel(e.LifecycleAction), expirySkipReason(sourceStatuses))
 				res.AuditOnly++
