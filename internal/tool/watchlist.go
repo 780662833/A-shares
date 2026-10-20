@@ -120,7 +120,9 @@ const (
 // lifecycleActionContract 把载荷中的动作字符串映射为写入模式。
 // 返回 ok=false 表示非空但不属于合法枚举 -> 调用方必须走保守保留（绝不误续期）。
 //   - 空串 = 旧版 Python 网关载荷（无该字段）：识别为兼容契约"收到即命中"，
-//     等价 TOUCH，但**仅限**行级非人工/非黑名单记录（护栏在调用点，先于本映射生效；
+//     等价 TOUCH，但**仅限**行级非人工/非黑名单记录。调用点顺序为：先经本映射
+//     解析动作并记录未知动作审计警告，再在动作分派和任何数据库写入之前执行
+//     MANUAL / BLACKLIST 行级护栏（本映射只做分类、不写库，故先分类不削弱保护；
 //     即便旧载荷把 MANUAL 票混进 Pool，也不会被自动续期改写）。
 //   - 大小写/空白宽容归一，与 normalizeSourceType 同风格。
 func lifecycleActionContract(action string) (applyMode, bool) {
