@@ -801,3 +801,99 @@ func TestApplyLifecycleContract_ExtraExpireStaysActiveF2Frozen(t *testing.T) {
 		t.Errorf("AuditOnly=%d want 1（EXPIRE 旁路应计入保守审计）", res.AuditOnly)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// 补丁 A P1 收尾（ExtraDecisions 旁路护栏）：受保护行在旁路决策路径上同样
+// 不得产生错误分类计数 —— MANUAL 收到 KEEP、BLACKLIST 收到 MARK_STALE/EXPIRE
+// 都必须统一计入 SkippedMan；未知动作的审计警告在护栏之前解析阶段仍须保留。
+// ---------------------------------------------------------------------------
+
+func TestApplyLifecycleContract_ExtraDecisionsProtectedRowsAreSkipped(t *testing.T) {
+	gdb := newWatchTestDB(t)
+	now := time.Date(2026, 10, 17, 16, 0, 0, 0, time.UTC)
+	base := now.AddDate(0, 0, -30)
+	oldSeen := base.AddDate(0, 0, 2)
+	oldExp := base.AddDate(0, 0, 7) // 未过期，避免混入 F-2 审计噪声
+
+	seed := func(code, name, sector, sourceType, status string) {
+		it := model.WatchlistItem{
+			Code: code, Name: name, SectorName: sector, SourceType: sourceType,
+			Status: status, AddedDate: base, LastSeenAt: ptrTime(oldSeen), ExpireDate: ptrTime(oldExp),
+		}
+		if err := gdb.Create(&it).Error; err != nil {
+			t.Fatalf("seed %s: %v", code, err)
+		}
+	}
+	seed("600301", "人工票", "人工板块", model.WatchSourceManual, model.WatchStatusActive)
+	seed("600302", "屏蔽票", "屏蔽板块", model.WatchSourceSector, model.WatchStatusBlacklist)
+	seed("600303", "屏蔽手工", "混合板块", model.WatchSourceManual, model.WatchStatusBlacklist)
+	// 未知动作行同样使用受保护行（MANUAL）：验证警告先于护栏产生、护栏统一计入 SkippedMan。
+	seed("600304", "未知动作票", "人工备用", model.WatchSourceManual, model.WatchStatusActive)
+
+	raw := func(s string) json.RawMessage { return json.RawMessage(s) }
+	data := &WatchlistGenData{
+		Pool: []WatchEntry{{Symbol: "600305", Name: "本轮新候选", SourceType: "SECTOR_LEADER"}},
+		ExtraDecisions: map[string]json.RawMessage{
+			// MANUAL 行收到 KEEP：修复前会计入 Kept，现必须计入 SkippedMan。
+			"600301": raw(`{"lifecycle_action":"KEEP","last_seen_at":"` + oldSeen.Format(time.RFC3339Nano) + `","expire_date":"` + oldExp.Format(time.RFC3339Nano) + `"}`),
+			// BLACKLIST 行收到 MARK_STALE / EXPIRE：修复前计入 AuditOnly，现必须计入 SkippedMan。
+			"600302": raw(`{"lifecycle_action":"MARK_STALE"}`),
+			"600303": raw(`{"lifecycle_action":"EXPIRE"}`),
+			// 非法动作落在受保护行：警告必须先于护栏产生，且仍零写入、计入 SkippedMan。
+			"600304": raw(`{"lifecycle_action":"TELEPORT"}`),
+		},
+	}
+	res, err := ApplyWatchlistPool(gdb, data, now, map[string]string{
+		"SECTOR_LEADER": "OK", "ETF_MOMENTUM": "SUCCESS_EMPTY", "FUND_FLOW": "OK",
+	})
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+
+	// 计数：4 个受保护旁路记录全部只贡献 SkippedMan；
+	// 非保护的新候选 600305 走插入路径（Inserted=1），不进入 Kept/AuditOnly。
+	if res.SkippedMan != 4 {
+		t.Errorf("SkippedMan=%d want 4（旁路受保护记录必须统一计入）", res.SkippedMan)
+	}
+	if res.Kept != 0 {
+		t.Errorf("Kept=%d want 0（MANUAL+KEEP 不得计为 Kept）", res.Kept)
+	}
+	if res.AuditOnly != 0 {
+		t.Errorf("AuditOnly=%d want 0（BLACKLIST+MARK_STALE/EXPIRE 不得计为 AuditOnly）", res.AuditOnly)
+	}
+	if res.Inserted != 1 || res.Updated != 0 || res.Inactivated != 0 {
+		t.Errorf("Inserted=%d Updated=%d Inactivated=%d want 1/0/0", res.Inserted, res.Updated, res.Inactivated)
+	}
+
+	// 未知动作警告不因护栏提前 continue 而丢失。
+	foundWarn := false
+	for _, w := range res.Warnings {
+		if strings.Contains(w, "unknown lifecycle_action") && strings.Contains(w, "600304") {
+			foundWarn = true
+		}
+	}
+	if !foundWarn {
+		t.Errorf("未知动作 TELEPORT 落在受保护行时警告丢失, warnings=%v", res.Warnings)
+	}
+
+	// 数据库读回：六个字段原值保持不变。
+	checkUnchanged := func(code, name, sector string, sourceType, status string) {
+		it := mustFind(t, gdb, code)
+		if it.Name != name || it.SectorName != sector {
+			t.Errorf("%s 元数据被改写: name=%q sector=%q", code, it.Name, it.SectorName)
+		}
+		if it.SourceType != sourceType || it.Status != status {
+			t.Errorf("%s 保护属性被改写: source_type=%q status=%q", code, it.SourceType, it.Status)
+		}
+		if it.LastSeenAt == nil || !sameTime(*it.LastSeenAt, oldSeen) {
+			t.Errorf("%s last_seen_at 被改写: %v", code, it.LastSeenAt)
+		}
+		if it.ExpireDate == nil || !sameTime(*it.ExpireDate, oldExp) {
+			t.Errorf("%s expire_date 被改写: %v", code, it.ExpireDate)
+		}
+	}
+	checkUnchanged("600301", "人工票", "人工板块", model.WatchSourceManual, model.WatchStatusActive)
+	checkUnchanged("600302", "屏蔽票", "屏蔽板块", model.WatchSourceSector, model.WatchStatusBlacklist)
+	checkUnchanged("600303", "屏蔽手工", "混合板块", model.WatchSourceManual, model.WatchStatusBlacklist)
+	checkUnchanged("600304", "未知动作票", "人工备用", model.WatchSourceManual, model.WatchStatusActive)
+}
