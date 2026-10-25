@@ -1,0 +1,65 @@
+name: Go validation
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '**.go'
+      - 'go.mod'
+      - 'go.sum'
+      - '.github/workflows/go-ci.yml'
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: go-validation-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  go-validation:
+    name: gofmt / build / vet / test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Go from go.mod
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Check gofmt
+        shell: bash
+        run: |
+          unformatted="$(git ls-files -z '*.go' | xargs -0 -r gofmt -l)"
+          if [[ -n "${unformatted}" ]]; then
+            printf 'These Go files are not formatted with gofmt:\n%s\n' "${unformatted}"
+            exit 1
+          fi
+
+      - name: Build all packages
+        run: go build ./...
+
+      - name: Vet lifecycle-critical packages
+        run: go vet ./internal/tool ./internal/pool
+
+      - name: Test Patch A lifecycle contracts (tool)
+        run: >-
+          go test ./internal/tool
+          -run '^(TestApplyLifecycleContract_(ProtectedRowActionMatrix|TouchDualAnchorMissing|ExtraExpireStaysActiveF2Frozen|ExtraDecisionsProtectedRowsAreSkipped|AuditOnlyZeroWrite))$'
+          -count=1
+
+      - name: Test Patch A lifecycle contracts (pool)
+        run: >-
+          go test ./internal/pool
+          -run '^(TestToGenData_PerSecurityActionAndAnchors|TestAbsentCandidate_ConservativeUnderFailedSources|TestAbsentCandidate_E2E_MarkStaleUnderEachFailedSource)$'
+          -count=1
+
+      - name: Test all packages
+        run: go test ./... -count=1
