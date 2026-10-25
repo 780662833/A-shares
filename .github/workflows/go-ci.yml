@@ -1,0 +1,89 @@
+name: Go validation
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '**.go'
+      - 'go.mod'
+      - 'go.sum'
+      - '.github/workflows/go-ci.yml'
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: go-validation-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  go-validation:
+    name: gofmt / build / vet / test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go from go.mod
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Check gofmt on changed Go files
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PUSH_SHA: ${{ github.sha }}
+        run: |
+          if [[ "${EVENT_NAME}" == "pull_request" ]]; then
+            changed_files="$(git diff --name-only --diff-filter=ACMRT "${PR_BASE_SHA}" "${PR_HEAD_SHA}" -- '*.go')"
+          elif [[ "${EVENT_NAME}" == "push" && -n "${PUSH_BEFORE}" && ! "${PUSH_BEFORE}" =~ ^0+$ ]]; then
+            changed_files="$(git diff --name-only --diff-filter=ACMRT "${PUSH_BEFORE}" "${PUSH_SHA}" -- '*.go')"
+          else
+            # workflow_dispatch and first push check the whole Go tree.
+            changed_files="$(git ls-files -- '*.go')"
+          fi
+
+          if [[ -z "${changed_files}" ]]; then
+            echo "No changed Go files to format-check."
+            exit 0
+          fi
+
+          unformatted="$(printf '%s\n' "${changed_files}" | while IFS= read -r file; do
+            [[ -f "${file}" ]] && gofmt -l "${file}"
+          done)"
+          if [[ -n "${unformatted}" ]]; then
+            printf 'These changed Go files are not formatted with gofmt:\n%s\n' "${unformatted}"
+            exit 1
+          fi
+
+      - name: Build all packages
+        run: go build ./...
+
+      - name: Vet lifecycle-critical packages
+        run: go vet ./internal/tool ./internal/pool
+
+      - name: Test Patch A lifecycle contracts (tool)
+        run: >-
+          go test ./internal/tool
+          -run '^(TestApplyLifecycleContract_(ProtectedRowActionMatrix|TouchDualAnchorMissing|ExtraExpireStaysActiveF2Frozen|ExtraDecisionsProtectedRowsAreSkipped|AuditOnlyZeroWrite))$'
+          -count=1
+
+      - name: Test Patch A lifecycle contracts (pool)
+        run: >-
+          go test ./internal/pool
+          -run '^(TestToGenData_PerSecurityActionAndAnchors|TestAbsentCandidate_ConservativeUnderFailedSources|TestAbsentCandidate_E2E_MarkStaleUnderEachFailedSource)$'
+          -count=1
+
+      - name: Test all packages
+        run: go test ./... -count=1
